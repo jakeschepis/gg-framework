@@ -1,6 +1,6 @@
 {
   "name": "@kenkaiiii/gg-agent",
-  "version": "4.1.1",
+  "version": "4.2.8",
   "type": "module",
   "description": "Agentic loop system with tool execution for LLMs",
   "license": "MIT",
@@ -11,13 +11,17 @@
   },
   "exports": {
     ".": {
+      "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
-      "types": "./dist/index.d.ts"
+      "require": "./dist/index.cjs"
     }
   },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
   "files": ["dist"],
   "scripts": {
-    "build": "tsc",
+    "build": "tsup",
     "check": "tsc --noEmit"
   },
   "dependencies": {

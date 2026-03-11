@@ -58,23 +58,16 @@ export function Banner({ version, model, cwd, taskCount }: BannerProps) {
           GG Coder
         </Text>
         <Text color={theme.textDim}> v{version}</Text>
-      </Box>
-      <Box>
-        <GradientText text={LOGO_LINES[1]} shift={shift} />
-        <Text>{GAP}</Text>
-        <Text color={theme.secondary}>{modelName}</Text>
         <Text color={theme.textDim}> · By </Text>
         <Text color={theme.text} bold>
           Ken Kai
         </Text>
       </Box>
       <Box>
-        <GradientText text={LOGO_LINES[2]} shift={shift} />
+        <GradientText text={LOGO_LINES[1]} shift={shift} />
         <Text>{GAP}</Text>
-        <Text color={theme.textDim}>
-          {displayPath}
-          {"  "}
-        </Text>
+        <Text color={theme.secondary}>{modelName}</Text>
+        <Text color={theme.textDim}>{"  "}</Text>
         <Text color={theme.primary}>Shift+`</Text>
         <Text color={theme.textDim}> tasks</Text>
         {taskCount !== undefined && taskCount > 0 && (
@@ -83,6 +76,11 @@ export function Banner({ version, model, cwd, taskCount }: BannerProps) {
         <Text color={theme.textDim}>{"  "}</Text>
         <Text color={theme.primary}>Shift+Tab</Text>
         <Text color={theme.textDim}> thinking</Text>
+      </Box>
+      <Box>
+        <GradientText text={LOGO_LINES[2]} shift={shift} />
+        <Text>{GAP}</Text>
+        <Text color={theme.textDim}>{displayPath}</Text>
       </Box>
     </Box>
   );

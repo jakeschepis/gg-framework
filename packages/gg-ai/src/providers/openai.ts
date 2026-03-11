@@ -22,10 +22,10 @@ async function runStream(options: StreamOptions, result: StreamResult): Promise<
     ...(options.baseUrl ? { baseURL: options.baseUrl } : {}),
   });
 
-  const messages = toOpenAIMessages(options.messages);
-
   // GLM and Moonshot use a custom `thinking` body param instead of `reasoning_effort`
   const usesThinkingParam = options.provider === "glm" || options.provider === "moonshot";
+
+  const messages = toOpenAIMessages(options.messages);
 
   const params: OpenAI.ChatCompletionCreateParams = {
     model: options.model,
@@ -46,6 +46,18 @@ async function runStream(options: StreamOptions, result: StreamResult): Promise<
       : {}),
     stream_options: { include_usage: true },
   };
+
+  // Inject provider-native web search tools (non-standard, bypass SDK types)
+  if (options.webSearch) {
+    if (options.provider === "moonshot") {
+      const raw = params as unknown as Record<string, unknown>;
+      const tools = ((raw.tools as unknown[]) ?? []).slice();
+      tools.push({ type: "builtin_function", function: { name: "$web_search" } });
+      raw.tools = tools;
+    }
+    // GLM (Z.AI): web search is provided via MCP servers, not inline tools
+    // OpenAI: Chat Completions API does not support web search
+  }
 
   // Inject custom thinking param for GLM/Moonshot (not part of OpenAI spec)
   if (usesThinkingParam) {
@@ -177,7 +189,14 @@ async function runStream(options: StreamOptions, result: StreamResult): Promise<
 
 function toError(err: unknown): ProviderError {
   if (err instanceof OpenAI.APIError) {
-    return new ProviderError("openai", err.message, {
+    // Include full error body for debugging — GLM/Moonshot use non-standard error shapes
+    let msg = err.message;
+    const body = err.error as Record<string, unknown> | undefined;
+    if (body) {
+      // Append raw error body so debug logs capture the exact API response
+      msg += ` | body: ${JSON.stringify(body)}`;
+    }
+    return new ProviderError("openai", msg, {
       statusCode: err.status,
       cause: err,
     });

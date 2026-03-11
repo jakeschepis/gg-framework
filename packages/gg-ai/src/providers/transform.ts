@@ -69,30 +69,37 @@ export function toAnthropicMessages(
       const content =
         typeof msg.content === "string"
           ? msg.content
-          : msg.content.map((part): Anthropic.ContentBlockParam => {
-              if (part.type === "text") return { type: "text", text: part.text };
-              if (part.type === "thinking")
-                return { type: "thinking", thinking: part.text, signature: part.signature ?? "" };
-              if (part.type === "tool_call")
-                return {
-                  type: "tool_use",
-                  id: part.id,
-                  name: part.name,
-                  input: part.args,
-                };
-              if (part.type === "server_tool_call")
-                return {
-                  type: "server_tool_use",
-                  id: part.id,
-                  name: part.name,
-                  input: part.input,
-                } as unknown as Anthropic.ContentBlockParam;
-              if (part.type === "server_tool_result")
-                return part.data as unknown as Anthropic.ContentBlockParam;
-              if (part.type === "raw") return part.data as unknown as Anthropic.ContentBlockParam;
-              // image content shouldn't appear in assistant messages
-              return { type: "text", text: "" };
-            });
+          : msg.content
+              .filter((part) => {
+                // Strip thinking blocks without a valid signature (e.g. from GLM/OpenAI)
+                // — Anthropic rejects empty signatures
+                if (part.type === "thinking" && !part.signature) return false;
+                return true;
+              })
+              .map((part): Anthropic.ContentBlockParam => {
+                if (part.type === "text") return { type: "text", text: part.text };
+                if (part.type === "thinking")
+                  return { type: "thinking", thinking: part.text, signature: part.signature! };
+                if (part.type === "tool_call")
+                  return {
+                    type: "tool_use",
+                    id: part.id,
+                    name: part.name,
+                    input: part.args,
+                  };
+                if (part.type === "server_tool_call")
+                  return {
+                    type: "server_tool_use",
+                    id: part.id,
+                    name: part.name,
+                    input: part.input,
+                  } as unknown as Anthropic.ContentBlockParam;
+                if (part.type === "server_tool_result")
+                  return part.data as unknown as Anthropic.ContentBlockParam;
+                if (part.type === "raw") return part.data as unknown as Anthropic.ContentBlockParam;
+                // image content shouldn't appear in assistant messages
+                return { type: "text", text: "" };
+              });
       out.push({ role: "assistant", content });
       continue;
     }
@@ -289,12 +296,15 @@ export function toOpenAIMessages(messages: Message[]): OpenAI.ChatCompletionMess
 
       const assistantMsg: OpenAI.ChatCompletionAssistantMessageParam = {
         role: "assistant",
-        content: parts ?? textParts ?? null,
+        content: parts || textParts || null,
         ...(toolCalls?.length ? { tool_calls: toolCalls } : {}),
       };
-      // Attach reasoning_content for multi-turn coherence (non-standard field)
-      if (thinkingParts) {
-        (assistantMsg as unknown as Record<string, unknown>).reasoning_content = thinkingParts;
+      // Attach reasoning_content for multi-turn coherence (non-standard field).
+      // Moonshot requires reasoning_content on ALL assistant messages with tool_calls
+      // when thinking is enabled — even if empty.
+      if (thinkingParts || toolCalls?.length) {
+        (assistantMsg as unknown as Record<string, unknown>).reasoning_content =
+          thinkingParts || " ";
       }
       out.push(assistantMsg);
       continue;

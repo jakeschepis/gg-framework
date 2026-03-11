@@ -42,7 +42,7 @@ Return a string, or a `{ content, details }` object for structured results. If `
 
 ### Safety
 
-- `maxTurns` (default: 40) prevents runaway loops
+- `maxTurns` (default: 100) prevents runaway loops
 - `AbortSignal` support for cancellation
 - Zod validation on tool args
 - `maxContinuations` (default: 5) caps consecutive `pause_turn` continuations
@@ -75,7 +75,7 @@ Return a string, or a `{ content, details }` object for structured results. If `
 | `system` | `string` | System prompt |
 | `tools` | `AgentTool[]` | Tools with Zod schemas and execute functions |
 | `serverTools` | `ServerToolDefinition[]` | Server-side tool definitions |
-| `maxTurns` | `number` | Max LLM calls (default: 40) |
+| `maxTurns` | `number` | Max LLM calls (default: 100) |
 | `maxTokens` | `number` | Max output tokens per turn |
 | `temperature` | `number` | Sampling temperature |
 | `thinking` | `"low" \| "medium" \| "high" \| "max"` | Extended thinking |

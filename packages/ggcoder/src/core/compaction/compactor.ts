@@ -291,6 +291,13 @@ export async function compact(
     ...recentMessages,
   ];
 
+  // Ensure the conversation doesn't end with an assistant message.
+  // Some models reject "assistant prefill" — the conversation must end
+  // with a user (or tool) message so the LLM can generate a fresh response.
+  while (newMessages.length > 1 && newMessages[newMessages.length - 1].role === "assistant") {
+    newMessages.pop();
+  }
+
   const tokensAfterEstimate = estimateConversationTokens(newMessages);
   const reduction = Math.round((1 - tokensAfterEstimate / tokensBeforeEstimate) * 100);
 

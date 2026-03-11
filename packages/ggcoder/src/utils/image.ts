@@ -3,6 +3,8 @@ import path from "node:path";
 import { execFile } from "node:child_process";
 
 const IMAGE_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]);
+const TEXT_EXTENSIONS = new Set([".md", ".txt"]);
+const ATTACHABLE_EXTENSIONS = new Set([...IMAGE_EXTENSIONS, ...TEXT_EXTENSIONS]);
 
 const MEDIA_TYPES: Record<string, string> = {
   ".png": "image/png",
@@ -14,16 +16,23 @@ const MEDIA_TYPES: Record<string, string> = {
 };
 
 export interface ImageAttachment {
+  kind: "image" | "text";
   fileName: string;
   filePath: string;
   mediaType: string;
-  data: string; // base64
+  data: string; // base64 for images, raw text for text files
 }
 
 /** Check if a file path points to an image based on extension. */
 export function isImagePath(filePath: string): boolean {
   const ext = path.extname(filePath).toLowerCase();
   return IMAGE_EXTENSIONS.has(ext);
+}
+
+/** Check if a file path points to an attachable file (image or text). */
+export function isAttachablePath(filePath: string): boolean {
+  const ext = path.extname(filePath).toLowerCase();
+  return ATTACHABLE_EXTENSIONS.has(ext);
 }
 
 function resolvePath(filePath: string, cwd: string): string {
@@ -39,6 +48,8 @@ function resolvePath(filePath: string, cwd: string): string {
   if (resolved.startsWith("file://")) {
     resolved = resolved.slice(7);
   }
+  // Unescape backslash-escaped characters (e.g. "\ " → " ")
+  resolved = resolved.replace(/\\(.)/g, "$1");
   // Resolve home dir
   if (resolved.startsWith("~/")) {
     resolved = path.join(process.env.HOME ?? "/", resolved.slice(2));
@@ -49,8 +60,26 @@ function resolvePath(filePath: string, cwd: string): string {
 }
 
 /**
- * Extract image file paths from input text by checking if tokens resolve
- * to existing image files on disk. Returns verified paths and the remaining text.
+ * Check if a token looks like an intentional file path rather than a bare filename
+ * mentioned in conversation. Bare names like "claude.md" should not be auto-attached;
+ * only explicit paths like "./claude.md", "/tmp/file.md", "~/notes.md", etc.
+ */
+function looksLikePath(token: string): boolean {
+  const stripped = token.replace(/^['"]|['"]$/g, "");
+  return (
+    stripped.includes("/") ||
+    stripped.includes("\\") ||
+    stripped.startsWith("~") ||
+    stripped.startsWith("file://")
+  );
+}
+
+/**
+ * Extract attachable file paths from input text by checking if tokens resolve
+ * to existing files on disk. Returns verified paths and the remaining text.
+ *
+ * Only tokens that look like explicit paths (contain `/`, `~`, `\`, or `file://`)
+ * are considered. Bare filenames like "readme.md" are left as text.
  */
 export async function extractImagePaths(
   text: string,
@@ -59,22 +88,26 @@ export async function extractImagePaths(
   const imagePaths: string[] = [];
   const cleanParts: string[] = [];
 
-  // Try the entire input as a single path first
-  const wholePath = resolvePath(text, cwd);
-  if (isImagePath(wholePath) && (await fileExists(wholePath))) {
-    return { imagePaths: [wholePath], cleanText: "" };
+  // Try the entire input as a single path first (only if it looks like a path)
+  if (looksLikePath(text)) {
+    const wholePath = resolvePath(text, cwd);
+    if (isAttachablePath(wholePath) && (await fileExists(wholePath))) {
+      return { imagePaths: [wholePath], cleanText: "" };
+    }
   }
 
-  // Split on whitespace and check each token
-  const tokens = text.split(/\s+/);
+  // Split on unescaped whitespace (respect backslash-escaped spaces like "file\ name.png")
+  const tokens = text.match(/(?:[^\s\\]|\\.)+/g) ?? [];
   for (const token of tokens) {
     if (!token) continue;
-    const resolved = resolvePath(token, cwd);
-    if (isImagePath(resolved) && (await fileExists(resolved))) {
-      imagePaths.push(resolved);
-    } else {
-      cleanParts.push(token);
+    if (looksLikePath(token)) {
+      const resolved = resolvePath(token, cwd);
+      if (isAttachablePath(resolved) && (await fileExists(resolved))) {
+        imagePaths.push(resolved);
+        continue;
+      }
     }
+    cleanParts.push(token);
   }
 
   return { imagePaths, cleanText: cleanParts.join(" ") };
@@ -89,13 +122,26 @@ async function fileExists(filePath: string): Promise<boolean> {
   }
 }
 
-/** Read an image file and return base64 data with media type. */
+/** Read a file and return an attachment (base64 for images, raw text for text files). */
 export async function readImageFile(filePath: string): Promise<ImageAttachment> {
   const ext = path.extname(filePath).toLowerCase();
+
+  if (TEXT_EXTENSIONS.has(ext)) {
+    const content = await fs.readFile(filePath, "utf-8");
+    return {
+      kind: "text",
+      fileName: path.basename(filePath),
+      filePath,
+      mediaType: "text/plain",
+      data: content,
+    };
+  }
+
   const mediaType = MEDIA_TYPES[ext] ?? "image/png";
   const buffer = await fs.readFile(filePath);
   const data = buffer.toString("base64");
   return {
+    kind: "image",
     fileName: path.basename(filePath),
     filePath,
     mediaType,
@@ -143,6 +189,7 @@ export function getClipboardImage(): Promise<ImageAttachment | null> {
           const buffer = await fs.readFile(tmpPath);
           await fs.unlink(tmpPath).catch(() => {});
           resolve({
+            kind: "image",
             fileName: `clipboard.${ext}`,
             filePath: tmpPath,
             mediaType,

@@ -1,13 +1,6 @@
 import { useState, useRef, useCallback, useEffect } from "react";
 import { agentLoop, type AgentEvent, type AgentTool } from "@kenkaiiii/gg-agent";
-import type {
-  Message,
-  Provider,
-  ServerToolDefinition,
-  ThinkingLevel,
-  TextContent,
-  ImageContent,
-} from "@kenkaiiii/gg-ai";
+import type { Message, Provider, ThinkingLevel, TextContent, ImageContent } from "@kenkaiiii/gg-ai";
 
 /** Rough token estimate from message content (~4 chars per token). */
 function estimateTokens(msgs: Message[]): number {
@@ -39,13 +32,16 @@ export interface AgentLoopOptions {
   provider: Provider;
   model: string;
   tools: AgentTool[];
-  serverTools?: ServerToolDefinition[];
+  webSearch?: boolean;
   maxTokens: number;
   thinking?: ThinkingLevel;
   apiKey?: string;
   baseUrl?: string;
   accountId?: string;
-  transformContext?: (messages: Message[]) => Message[] | Promise<Message[]>;
+  transformContext?: (
+    messages: Message[],
+    options?: { force?: boolean },
+  ) => Message[] | Promise<Message[]>;
 }
 
 export type ActivityPhase = "waiting" | "thinking" | "generating" | "tools" | "idle";
@@ -166,20 +162,27 @@ export function useAgentLoop(
       }
       emptyTicksRef.current = 0;
 
-      // Adaptive speed: reveal more chars when buffer is large.
-      // Aggressive catch-up prevents text from lagging behind the LLM.
-      // Tick interval is 33ms (~30fps), so chars per tick are scaled up
-      // compared to the previous 10ms interval to maintain the same
-      // visual speed while triggering 3x fewer React re-renders.
+      // Adaptive speed: continuous interpolation prevents jarring speed
+      // jumps at tier boundaries. Clamped to [12, 180] chars/tick at
+      // 33ms (~30fps) to balance smoothness vs catch-up speed.
       const buffered = pending.length;
-      let charsPerTick: number;
-      if (buffered > 500) charsPerTick = 180;
-      else if (buffered > 200) charsPerTick = 90;
-      else if (buffered > 50) charsPerTick = 36;
-      else charsPerTick = 12;
+      const charsPerTick = Math.max(12, Math.min(180, Math.ceil(buffered * 0.35)));
 
-      const reveal = pending.slice(0, charsPerTick);
-      textPendingRef.current = pending.slice(charsPerTick);
+      // Snap to a word boundary when possible so partial words don't
+      // flash on screen. Look back up to 20 chars for a natural break.
+      let endIndex = Math.min(charsPerTick, buffered);
+      if (endIndex < buffered) {
+        const breakChars = " \n.,;:`')]}>";
+        for (let i = endIndex; i >= Math.max(1, endIndex - 20); i--) {
+          if (breakChars.includes(pending[i])) {
+            endIndex = i + 1;
+            break;
+          }
+        }
+      }
+
+      const reveal = pending.slice(0, endIndex);
+      textPendingRef.current = pending.slice(endIndex);
       textVisibleRef.current += reveal;
       setStreamingText(textVisibleRef.current);
     }, 33);
@@ -276,7 +279,7 @@ export function useAgentLoop(
           provider: options.provider,
           model: options.model,
           tools: options.tools,
-          serverTools: options.serverTools,
+          webSearch: options.webSearch,
           maxTokens: options.maxTokens,
           thinking: options.thinking,
           apiKey: options.apiKey,

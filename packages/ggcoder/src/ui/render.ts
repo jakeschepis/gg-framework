@@ -1,17 +1,17 @@
 import React from "react";
 import { render } from "ink";
-import type { Message, Provider, ServerToolDefinition, ThinkingLevel } from "@kenkaiiii/gg-ai";
+import type { Message, Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import type { ProcessManager } from "../core/process-manager.js";
+import type { MCPClientManager } from "../core/mcp/index.js";
 import { App, type CompletedItem } from "./App.js";
-import { SplashScreen } from "./components/SplashScreen.js";
 import { ThemeContext, loadTheme } from "./theme/theme.js";
 
 export interface RenderAppConfig {
   provider: Provider;
   model: string;
   tools: AgentTool[];
-  serverTools?: ServerToolDefinition[];
+  webSearch?: boolean;
   messages: Message[];
   maxTokens: number;
   thinking?: ThinkingLevel;
@@ -31,37 +31,20 @@ export interface RenderAppConfig {
   sessionPath?: string;
   processManager?: ProcessManager;
   settingsFile?: string;
+  mcpManager?: MCPClientManager;
+  worktree?: {
+    path: string;
+    branchName: string;
+    repoRoot: string;
+    name: string;
+  };
 }
 
 export async function renderApp(config: RenderAppConfig): Promise<void> {
   const theme = loadTheme(config.theme ?? "dark");
 
-  const isRestoredSession = config.initialHistory && config.initialHistory.length > 0;
-
   // Clear screen
   process.stdout.write("\x1b[2J\x1b[H");
-
-  // Show animated splash screen for new sessions only (skip for restored sessions)
-  if (!isRestoredSession) {
-    await new Promise<void>((resolve) => {
-      const { unmount } = render(
-        React.createElement(
-          ThemeContext.Provider,
-          { value: theme },
-          React.createElement(SplashScreen, {
-            version: config.version,
-            onDone: () => {
-              unmount();
-              resolve();
-            },
-          }),
-        ),
-      );
-    });
-
-    // Clear screen for the main app
-    process.stdout.write("\x1b[2J\x1b[H");
-  }
 
   const { waitUntilExit, clear } = render(
     React.createElement(
@@ -71,7 +54,7 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
         provider: config.provider,
         model: config.model,
         tools: config.tools,
-        serverTools: config.serverTools,
+        webSearch: config.webSearch,
         messages: config.messages,
         maxTokens: config.maxTokens,
         thinking: config.thinking,
@@ -90,6 +73,8 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
         sessionPath: config.sessionPath,
         processManager: config.processManager,
         settingsFile: config.settingsFile,
+        mcpManager: config.mcpManager,
+        worktree: config.worktree,
       }),
     ),
     {

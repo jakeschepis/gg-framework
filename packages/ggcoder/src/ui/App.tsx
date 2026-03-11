@@ -1,23 +1,17 @@
 import React, { useState, useRef, useCallback, useEffect, useMemo } from "react";
-import { Box, Text, Static, useStdout } from "ink";
+import { Box, Text, Static, useStdout, useInput } from "ink";
 import { useTerminalSize } from "./hooks/useTerminalSize.js";
 import crypto, { createHash } from "node:crypto";
 import { readFileSync, writeFileSync } from "node:fs";
 import { homedir } from "node:os";
-import { join } from "node:path";
+import { join, basename } from "node:path";
 import { playNotificationSound } from "../utils/sound.js";
-import type {
-  Message,
-  Provider,
-  ServerToolDefinition,
-  ThinkingLevel,
-  TextContent,
-  ImageContent,
-} from "@kenkaiiii/gg-ai";
+import type { Message, Provider, ThinkingLevel, TextContent, ImageContent } from "@kenkaiiii/gg-ai";
 import { extractImagePaths, type ImageAttachment } from "../utils/image.js";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import { useAgentLoop, type ActivityPhase } from "./hooks/useAgentLoop.js";
 import { UserMessage } from "./components/UserMessage.js";
+import type { PasteInfo } from "./components/InputArea.js";
 import { AssistantMessage } from "./components/AssistantMessage.js";
 import { ToolExecution } from "./components/ToolExecution.js";
 import { ServerToolExecution } from "./components/ServerToolExecution.js";
@@ -45,7 +39,41 @@ import { shouldCompact, compact } from "../core/compaction/compactor.js";
 import { estimateConversationTokens } from "../core/compaction/token-estimator.js";
 import { PROMPT_COMMANDS, getPromptCommand } from "../core/prompt-commands.js";
 import { loadCustomCommands, type CustomCommand } from "../core/custom-commands.js";
+import type { MCPClientManager } from "../core/mcp/index.js";
+import { getMCPServers } from "../core/mcp/index.js";
+import { HookRunner, wrapToolsWithHooks } from "../core/hooks.js";
+import { isWorktreeDirty, removeWorktree } from "../core/worktree.js";
 import { pruneHistory, flushOnTurnText, flushOnTurnEnd } from "./live-item-flush.js";
+
+// ── Provider Error Hints ──────────────────────────────────
+
+/** Detect provider-side errors and return a user-facing hint. */
+function getProviderErrorHint(message: string): string | null {
+  const lower = message.toLowerCase();
+  if (lower.includes("overloaded") || lower.includes("engine_overloaded")) {
+    return "This is a provider-side issue — their servers are under heavy load. Try again in a moment.";
+  }
+  if (
+    lower.includes("rate limit") ||
+    lower.includes("too many requests") ||
+    lower.includes("429")
+  ) {
+    return "You've hit the provider's rate limit. Wait a moment before retrying.";
+  }
+  if (lower.includes("502") || lower.includes("bad gateway")) {
+    return "The provider returned a server error. This is not a ggcoder issue — try again shortly.";
+  }
+  if (lower.includes("503") || lower.includes("service unavailable")) {
+    return "The provider's service is temporarily unavailable. Try again in a moment.";
+  }
+  if (lower.includes("timeout") || lower.includes("timed out")) {
+    return "The request to the provider timed out. Their servers may be slow — try again.";
+  }
+  if (lower.includes("500") && lower.includes("internal server error")) {
+    return "The provider experienced an internal error. This is not a ggcoder issue.";
+  }
+  return null;
+}
 
 // ── Completed Item Types ───────────────────────────────────
 
@@ -53,6 +81,7 @@ interface UserItem {
   kind: "user";
   text: string;
   imageCount?: number;
+  pasteInfo?: PasteInfo;
   id: string;
 }
 
@@ -139,6 +168,7 @@ interface ServerToolStartItem {
   serverToolCallId: string;
   name: string;
   input: unknown;
+  startedAt: number;
   id: string;
 }
 
@@ -148,6 +178,7 @@ interface ServerToolDoneItem {
   input: unknown;
   resultType: string;
   data: unknown;
+  durationMs: number;
   id: string;
 }
 
@@ -298,7 +329,7 @@ export interface AppProps {
   provider: Provider;
   model: string;
   tools: AgentTool[];
-  serverTools?: ServerToolDefinition[];
+  webSearch?: boolean;
   messages: Message[];
   maxTokens: number;
   thinking?: ThinkingLevel;
@@ -317,6 +348,13 @@ export interface AppProps {
   sessionPath?: string;
   processManager?: ProcessManager;
   settingsFile?: string;
+  mcpManager?: MCPClientManager;
+  worktree?: {
+    path: string;
+    branchName: string;
+    repoRoot: string;
+    name: string;
+  };
 }
 
 // ── App Component ──────────────────────────────────────────
@@ -365,6 +403,7 @@ export function App(props: AppProps) {
   const [gitBranch, setGitBranch] = useState<string | null>(null);
   const [currentModel, setCurrentModel] = useState(props.model);
   const [currentProvider, setCurrentProvider] = useState(props.provider);
+  const [currentTools, setCurrentTools] = useState(props.tools);
   const [thinkingEnabled, setThinkingEnabled] = useState(!!props.thinking);
   const messagesRef = useRef<Message[]>(props.messages);
   const nextIdRef = useRef(0);
@@ -495,10 +534,15 @@ export function App(props: AppProps) {
    * Checks if auto-compaction is needed and runs it.
    */
   const transformContext = useCallback(
-    async (messages: Message[]): Promise<Message[]> => {
+    async (messages: Message[], options?: { force?: boolean }): Promise<Message[]> => {
       const settings = settingsRef.current;
       const autoCompact = settings?.get("autoCompact") ?? true;
       const threshold = settings?.get("compactThreshold") ?? 0.8;
+
+      // Force-compact on context overflow regardless of settings
+      if (options?.force) {
+        return compactConversation(messages);
+      }
 
       if (!autoCompact) return messages;
 
@@ -510,6 +554,130 @@ export function App(props: AppProps) {
     },
     [currentModel, compactConversation],
   );
+
+  // ── Hooks system ──────────────────────────────────────────
+  const [hookRunner, setHookRunner] = useState<HookRunner | null>(null);
+
+  useEffect(() => {
+    const sessionId = props.sessionPath
+      ? basename(props.sessionPath, ".json")
+      : crypto.randomUUID();
+    const runner = new HookRunner(props.cwd, sessionId);
+    const settingsPath = props.settingsFile ?? join(homedir(), ".gg", "settings.json");
+    runner
+      .loadConfig(settingsPath)
+      .then(() => {
+        setHookRunner(runner);
+        runner.runHooks("SessionStart").catch(() => {});
+      })
+      .catch(() => {});
+  }, []);
+
+  // Fire SessionEnd hook on unmount
+  const hookRunnerRef = useRef<HookRunner | null>(null);
+  hookRunnerRef.current = hookRunner;
+  useEffect(() => {
+    return () => {
+      hookRunnerRef.current?.runHooksSync("SessionEnd");
+    };
+  }, []);
+
+  // Wrap tools with PreToolUse/PostToolUse hooks
+  const hookedTools = useMemo(() => {
+    if (!hookRunner) return currentTools;
+    return wrapToolsWithHooks(currentTools, hookRunner);
+  }, [currentTools, hookRunner]);
+
+  // ── Worktree cleanup on exit ─────────────────────────────
+  const [worktreeCleanupState, setWorktreeCleanupState] = useState<
+    "idle" | "pending" | "prompting" | "done"
+  >("idle");
+  const [worktreeCleanupMsg, setWorktreeCleanupMsg] = useState<string | null>(null);
+
+  const initiateExit = useCallback(async () => {
+    if (!props.worktree) {
+      process.exit(0);
+      return;
+    }
+
+    // Guard against re-entrancy (rapid Ctrl+C)
+    if (worktreeCleanupState !== "idle") return;
+
+    setWorktreeCleanupState("pending");
+    try {
+      const dirty = await isWorktreeDirty(props.worktree.path);
+      if (!dirty) {
+        // Clean worktree — fire hook if configured, otherwise remove directly
+        const hookRan = hookRunner
+          ? await hookRunner.runWorktreeRemoveHook(props.worktree.path)
+          : false;
+        if (!hookRan) {
+          await removeWorktree({
+            repoRoot: props.worktree.repoRoot,
+            worktreePath: props.worktree.path,
+            branchName: props.worktree.branchName,
+          });
+        }
+        setWorktreeCleanupState("done");
+      } else {
+        // Dirty worktree — ask the user
+        setWorktreeCleanupState("prompting");
+      }
+    } catch {
+      // If check fails, preserve worktree and inform user
+      setWorktreeCleanupMsg(
+        `Could not verify worktree state — preserved on branch "${props.worktree.branchName}" at ${props.worktree.path}`,
+      );
+      setWorktreeCleanupState("done");
+    }
+  }, [props.worktree, worktreeCleanupState]);
+
+  // Handle Y/n input during worktree cleanup prompt
+  useInput(
+    (input, key) => {
+      if (worktreeCleanupState !== "prompting" || !props.worktree) return;
+
+      const lower = input.toLowerCase();
+      if (key.return || lower === "y") {
+        // Keep the worktree
+        setWorktreeCleanupMsg(
+          `Worktree preserved on branch "${props.worktree.branchName}" at ${props.worktree.path}`,
+        );
+        setWorktreeCleanupState("done");
+      } else if (lower === "n") {
+        // Remove the worktree — fire hook if configured, otherwise remove directly
+        (async () => {
+          try {
+            const hookRan = hookRunner
+              ? await hookRunner.runWorktreeRemoveHook(props.worktree!.path)
+              : false;
+            if (!hookRan) {
+              await removeWorktree({
+                repoRoot: props.worktree!.repoRoot,
+                worktreePath: props.worktree!.path,
+                branchName: props.worktree!.branchName,
+              });
+            }
+          } catch {
+            // Best-effort cleanup
+          }
+          setWorktreeCleanupState("done");
+        })();
+      }
+    },
+    { isActive: worktreeCleanupState === "prompting" },
+  );
+
+  // Exit once worktree cleanup is done (runs BEFORE SessionEnd unmount hook)
+  useEffect(() => {
+    if (worktreeCleanupState === "done") {
+      if (worktreeCleanupMsg) {
+        // Write message directly to stdout so it survives process exit
+        stdout?.write(`\n${worktreeCleanupMsg}\n`);
+      }
+      process.exit(0);
+    }
+  }, [worktreeCleanupState, worktreeCleanupMsg, stdout]);
 
   // ── Background task bar state ───────────────────────────
   const [bgTasks, setBgTasks] = useState<BackgroundProcess[]>([]);
@@ -579,8 +747,8 @@ export function App(props: AppProps) {
     {
       provider: currentProvider,
       model: currentModel,
-      tools: props.tools,
-      serverTools: props.serverTools,
+      tools: hookedTools,
+      webSearch: props.webSearch,
       maxTokens: props.maxTokens,
       thinking: thinkingEnabled ? (props.thinking ?? "medium") : undefined,
       apiKey: activeApiKey,
@@ -734,7 +902,14 @@ export function App(props: AppProps) {
         log("INFO", "server_tool", `Server tool call: ${name}`, { id });
         setLiveItems((prev) => [
           ...prev,
-          { kind: "server_tool_start", serverToolCallId: id, name, input, id: getId() },
+          {
+            kind: "server_tool_start",
+            serverToolCallId: id,
+            name,
+            input,
+            startedAt: Date.now(),
+            id: getId(),
+          },
         ]);
       }, []),
       onServerToolResult: useCallback((toolUseId: string, resultType: string, data: unknown) => {
@@ -751,6 +926,7 @@ export function App(props: AppProps) {
               input: startItem.input,
               resultType,
               data,
+              durationMs: Date.now() - startItem.startedAt,
               id: startItem.id,
             };
             const next = [...prev];
@@ -759,7 +935,15 @@ export function App(props: AppProps) {
           }
           return [
             ...prev,
-            { kind: "server_tool_done", name: "unknown", input: {}, resultType, data, id: getId() },
+            {
+              kind: "server_tool_done",
+              name: "unknown",
+              input: {},
+              resultType,
+              data,
+              durationMs: 0,
+              id: getId(),
+            },
           ];
         });
       }, []),
@@ -800,6 +984,7 @@ export function App(props: AppProps) {
         });
         setDoneStatus({ durationMs, toolsUsed, verb: pickDurationVerb(toolsUsed) });
         playNotificationSound();
+        hookRunnerRef.current?.runHooks("Stop").catch(() => {});
         // Two-phase flush to avoid Ink text clipping.
         // Phase 1 (here): clear the live area so Ink commits a render with
         // the smaller output and updates its internal line counter.
@@ -884,7 +1069,7 @@ export function App(props: AppProps) {
   }, [doneStatus]);
 
   const handleSubmit = useCallback(
-    async (input: string, inputImages: ImageAttachment[] = []) => {
+    async (input: string, inputImages: ImageAttachment[] = [], pasteInfo?: PasteInfo) => {
       const trimmed = input.trim();
 
       if (trimmed.startsWith("/")) {
@@ -916,7 +1101,8 @@ export function App(props: AppProps) {
 
       // Handle /quit — exit the agent
       if (trimmed === "/quit" || trimmed === "/q" || trimmed === "/exit") {
-        process.exit(0);
+        void initiateExit();
+        return;
       }
 
       // Handle /clear — reset session and clear terminal
@@ -1013,6 +1199,7 @@ export function App(props: AppProps) {
         kind: "user",
         text: displayText,
         imageCount: hasImages ? inputImages.length : undefined,
+        pasteInfo,
         id: getId(),
       };
       setLastUserMessage(input);
@@ -1020,6 +1207,8 @@ export function App(props: AppProps) {
       setLiveItems([userItem]);
 
       // Build user content — plain string or content array with images
+      const modelInfo = getModel(currentModel);
+      const modelSupportsImages = modelInfo?.supportsImages ?? true;
       let userContent: string | (TextContent | ImageContent)[];
       if (hasImages) {
         const parts: (TextContent | ImageContent)[] = [];
@@ -1027,9 +1216,33 @@ export function App(props: AppProps) {
           parts.push({ type: "text", text: trimmed });
         }
         for (const img of inputImages) {
-          parts.push({ type: "image", mediaType: img.mediaType, data: img.data });
+          if (img.kind === "text") {
+            parts.push({
+              type: "text",
+              text: `<file name="${img.fileName}">\n${img.data}\n</file>`,
+            });
+          } else if (modelSupportsImages) {
+            parts.push({ type: "image", mediaType: img.mediaType, data: img.data });
+          } else {
+            // GLM models: save image to temp file and instruct model to use vision MCP tool
+            const ext = img.mediaType.split("/")[1] ?? "png";
+            const tmpPath = `/tmp/ggcoder-img-${Date.now()}.${ext}`;
+            try {
+              writeFileSync(tmpPath, Buffer.from(img.data, "base64"));
+              parts.push({
+                type: "text",
+                text: `[User attached an image saved at: ${tmpPath} — use the image_analysis tool to view and analyze it]`,
+              });
+            } catch {
+              parts.push({
+                type: "text",
+                text: `[User attached an image but it could not be saved for analysis]`,
+              });
+            }
+          }
         }
-        userContent = parts;
+        // If only text parts remain after stripping images, simplify to plain string
+        userContent = parts.length === 1 && parts[0].type === "text" ? parts[0].text : parts;
       } else {
         userContent = input;
       }
@@ -1049,16 +1262,16 @@ export function App(props: AppProps) {
         ]);
       }
     },
-    [agentLoop, props.onSlashCommand, compactConversation],
+    [agentLoop, props.onSlashCommand, compactConversation, initiateExit],
   );
 
   const handleAbort = useCallback(() => {
     if (agentLoop.isRunning) {
       agentLoop.abort();
     } else {
-      process.exit(0);
+      void initiateExit();
     }
-  }, [agentLoop]);
+  }, [agentLoop, initiateExit]);
 
   const handleToggleThinking = useCallback(() => {
     setThinkingEnabled((prev) => {
@@ -1084,7 +1297,42 @@ export function App(props: AppProps) {
       const newProvider = value.slice(0, colonIdx) as Provider;
       const newModelId = value.slice(colonIdx + 1);
       log("INFO", "model", `Model changed`, { provider: newProvider, model: newModelId });
-      setCurrentProvider(newProvider);
+
+      // Reconnect MCP servers when provider changes
+      setCurrentProvider((prevProvider) => {
+        if (newProvider !== prevProvider && props.mcpManager) {
+          void (async () => {
+            // Disconnect old MCP servers
+            await props.mcpManager!.dispose();
+
+            // Remove old MCP tools, connect new ones
+            let apiKey: string | undefined;
+            if (newProvider === "glm") {
+              apiKey = props.credentialsByProvider?.["glm"]?.accessToken;
+            }
+            try {
+              const mcpTools = await props.mcpManager!.connectAll(
+                getMCPServers(newProvider, apiKey),
+              );
+              setCurrentTools((prev) => [
+                ...prev.filter((t) => !t.name.startsWith("mcp__")),
+                ...mcpTools,
+              ]);
+              log("INFO", "mcp", `MCP servers reconnected for provider ${newProvider}`);
+            } catch (err) {
+              log(
+                "WARN",
+                "mcp",
+                `MCP reconnection failed: ${err instanceof Error ? err.message : String(err)}`,
+              );
+              // Still remove old MCP tools even if reconnection fails
+              setCurrentTools((prev) => prev.filter((t) => !t.name.startsWith("mcp__")));
+            }
+          })();
+        }
+        return newProvider;
+      });
+
       setCurrentModel(newModelId);
       const modelInfo = getModel(newModelId);
       const displayName = modelInfo?.name ?? newModelId;
@@ -1102,7 +1350,7 @@ export function App(props: AppProps) {
         });
       }
     },
-    [props.settingsFile],
+    [props.settingsFile, props.mcpManager, props.credentialsByProvider],
   );
 
   // All available slash commands for the command palette
@@ -1140,7 +1388,14 @@ export function App(props: AppProps) {
           />
         );
       case "user":
-        return <UserMessage key={item.id} text={item.text} imageCount={item.imageCount} />;
+        return (
+          <UserMessage
+            key={item.id}
+            text={item.text}
+            imageCount={item.imageCount}
+            pasteInfo={item.pasteInfo}
+          />
+        );
       case "task":
         return (
           <Box key={item.id} marginTop={1}>
@@ -1191,13 +1446,23 @@ export function App(props: AppProps) {
             data={item.data}
           />
         );
-      case "error":
+      case "error": {
+        const providerHint = getProviderErrorHint(item.message);
         return (
-          <Box key={item.id} marginTop={1}>
-            <Text color={theme.error}>{"✗ "}</Text>
-            <Text color={theme.error}>{item.message}</Text>
+          <Box key={item.id} marginTop={1} flexDirection="column">
+            <Text color={theme.error}>
+              {"✗ "}
+              {item.message}
+            </Text>
+            {providerHint && (
+              <Text color={theme.textDim}>
+                {"  Hint: "}
+                {providerHint}
+              </Text>
+            )}
           </Box>
         );
+      }
       case "info":
         return (
           <Box key={item.id} marginTop={1}>
@@ -1298,7 +1563,11 @@ export function App(props: AppProps) {
         items={isTaskView ? [] : history}
         style={{ width: "100%" }}
       >
-        {(item) => renderItem(item)}
+        {(item) => (
+          <Box key={item.id} flexDirection="column" paddingRight={1}>
+            {renderItem(item)}
+          </Box>
+        )}
       </Static>
 
       {isTaskView ? (
@@ -1373,12 +1642,26 @@ export function App(props: AppProps) {
             )
           )}
 
+          {/* Worktree cleanup prompt */}
+          {worktreeCleanupState === "pending" && (
+            <Box marginTop={1}>
+              <Text color={theme.textDim}>Cleaning up worktree...</Text>
+            </Box>
+          )}
+          {worktreeCleanupState === "prompting" && (
+            <Box marginTop={1} flexDirection="column">
+              <Text color={theme.warning}>
+                Worktree has uncommitted changes. Keep for later? (Y/n)
+              </Text>
+            </Box>
+          )}
+
           {/* Input + Footer */}
           <InputArea
             onSubmit={handleSubmit}
             onAbort={handleAbort}
             disabled={agentLoop.isRunning}
-            isActive={!taskBarFocused}
+            isActive={!taskBarFocused && !overlay && worktreeCleanupState === "idle"}
             onDownAtEnd={handleFocusTaskBar}
             onShiftTab={handleToggleThinking}
             onToggleTasks={() => {

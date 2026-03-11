@@ -1,5 +1,5 @@
 import { agentLoop, type AgentEvent, type AgentTool } from "@kenkaiiii/gg-agent";
-import type { Message, Provider, ServerToolDefinition, ThinkingLevel } from "@kenkaiiii/gg-ai";
+import { ProviderError, type Message, type Provider, type ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { EventBus } from "./event-bus.js";
 import {
   SlashCommandRegistry,
@@ -17,7 +17,7 @@ import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
 import { buildSystemPrompt } from "../system-prompt.js";
 import { createTools, type ProcessManager } from "../tools/index.js";
-import { MCPClientManager, DEFAULT_MCP_SERVERS } from "./mcp/index.js";
+import { MCPClientManager, getMCPServers } from "./mcp/index.js";
 import { log } from "./logger.js";
 import crypto from "node:crypto";
 
@@ -120,7 +120,16 @@ export class AgentSession {
     // Connect MCP servers (non-blocking — failures are logged and skipped)
     this.mcpManager = new MCPClientManager();
     try {
-      const mcpTools = await this.mcpManager.connectAll(DEFAULT_MCP_SERVERS);
+      let apiKey: string | undefined;
+      if (this.provider === "glm") {
+        try {
+          const glmCreds = await this.authStorage.resolveCredentials("glm");
+          apiKey = glmCreds.accessToken;
+        } catch {
+          // GLM not configured — skip Z.AI MCP servers
+        }
+      }
+      const mcpTools = await this.mcpManager.connectAll(getMCPServers(this.provider, apiKey));
       this.tools.push(...mcpTools);
     } catch (err) {
       log(
@@ -207,32 +216,41 @@ export class AgentSession {
       }
     }
 
-    // Resolve OAuth credentials
-    const creds = await this.authStorage.resolveCredentials(this.provider);
+    // Resolve OAuth credentials and run agent loop.
+    // On 401, force-refresh the token and retry once — the provider may have
+    // revoked the token server-side before the stored expiry (e.g. after a restart).
+    let creds = await this.authStorage.resolveCredentials(this.provider);
 
-    // Server-side tools (Anthropic only)
-    const serverTools: ServerToolDefinition[] | undefined =
-      this.provider === "anthropic"
-        ? [{ type: "web_search_20250305", name: "web_search" }]
-        : undefined;
+    const runAgentLoop = async (apiKey: string, accountId?: string) => {
+      const generator = agentLoop(this.messages, {
+        provider: this.provider,
+        model: this.model,
+        tools: this.tools,
+        webSearch: true,
+        maxTokens: this.maxTokens,
+        thinking: this.thinkingLevel,
+        apiKey,
+        baseUrl: this.baseUrl,
+        signal: this.opts.signal,
+        accountId,
+        cacheRetention: "short",
+      });
 
-    // Run agent loop
-    const generator = agentLoop(this.messages, {
-      provider: this.provider,
-      model: this.model,
-      tools: this.tools,
-      serverTools,
-      maxTokens: this.maxTokens,
-      thinking: this.thinkingLevel,
-      apiKey: creds.accessToken,
-      baseUrl: this.baseUrl,
-      signal: this.opts.signal,
-      accountId: creds.accountId,
-      cacheRetention: "short",
-    });
+      for await (const event of generator as AsyncIterable<AgentEvent>) {
+        this.eventBus.forwardAgentEvent(event);
+      }
+    };
 
-    for await (const event of generator as AsyncIterable<AgentEvent>) {
-      this.eventBus.forwardAgentEvent(event);
+    try {
+      await runAgentLoop(creds.accessToken, creds.accountId);
+    } catch (err) {
+      if (err instanceof ProviderError && err.statusCode === 401) {
+        log("INFO", "auth", "Got 401, force-refreshing token and retrying");
+        creds = await this.authStorage.resolveCredentials(this.provider, { forceRefresh: true });
+        await runAgentLoop(creds.accessToken, creds.accountId);
+      } else {
+        throw err;
+      }
     }
 
     // Persist new messages
@@ -243,9 +261,40 @@ export class AgentSession {
   }
 
   async switchModel(provider: string, model: string): Promise<void> {
+    const prevProvider = this.provider;
     if (provider) this.provider = provider as Provider;
     this.model = model;
     this.eventBus.emit("model_change", { provider: this.provider, model: this.model });
+
+    // Reconnect MCP servers when provider changes (e.g. GLM needs Z.AI tools, others don't)
+    if (provider && provider !== prevProvider && this.mcpManager) {
+      // Remove old MCP tools
+      this.tools = this.tools.filter((t) => !t.name.startsWith("mcp__"));
+
+      // Disconnect old MCP servers
+      await this.mcpManager.dispose();
+
+      // Connect new MCP servers for the new provider
+      try {
+        let apiKey: string | undefined;
+        if (this.provider === "glm") {
+          try {
+            const glmCreds = await this.authStorage.resolveCredentials("glm");
+            apiKey = glmCreds.accessToken;
+          } catch {
+            // GLM not configured — skip Z.AI MCP servers
+          }
+        }
+        const mcpTools = await this.mcpManager.connectAll(getMCPServers(this.provider, apiKey));
+        this.tools.push(...mcpTools);
+      } catch (err) {
+        log(
+          "WARN",
+          "mcp",
+          `MCP reconnection failed: ${err instanceof Error ? err.message : String(err)}`,
+        );
+      }
+    }
   }
 
   async compact(): Promise<void> {

@@ -293,7 +293,7 @@ export function TaskOverlay({
     }
   });
 
-  const maxVisible = 10;
+  const maxVisible = 15;
   const startIdx = Math.max(0, selectedIndex - maxVisible + 1);
   const visibleTasks = tasks.slice(startIdx, startIdx + maxVisible);
 
@@ -370,24 +370,26 @@ export function TaskOverlay({
 
       {status && <Text color="#4ade80">{" " + status}</Text>}
 
-      <Text color={theme.textDim}>
-        <Text color={theme.primary}>↑↓</Text>
-        {" move · ("}
-        <Text color={theme.primary}>a</Text>
-        {")dd · ("}
-        <Text color={theme.primary}>e</Text>
-        {")dit · ("}
-        <Text color={theme.primary}>d</Text>
-        {")elete · ("}
-        <Text color={theme.primary}>t</Text>
-        {")oggle · "}
-        <Text color={theme.primary}>Enter</Text>
-        {" start · ("}
-        <Text color={theme.primary}>r</Text>
-        {")un all · "}
-        <Text color={theme.primary}>ESC</Text>
-        {" close"}
-      </Text>
+      <Box marginTop={1}>
+        <Text color={theme.textDim}>
+          <Text color={theme.primary}>↑↓</Text>
+          {" move · ("}
+          <Text color={theme.primary}>a</Text>
+          {")dd · ("}
+          <Text color={theme.primary}>e</Text>
+          {")dit · ("}
+          <Text color={theme.primary}>d</Text>
+          {")elete · ("}
+          <Text color={theme.primary}>t</Text>
+          {")oggle · "}
+          <Text color={theme.primary}>Enter</Text>
+          {" start · ("}
+          <Text color={theme.primary}>r</Text>
+          {")un all · "}
+          <Text color={theme.primary}>ESC</Text>
+          {" close"}
+        </Text>
+      </Box>
     </Box>
   );
 }

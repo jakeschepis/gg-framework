@@ -35,7 +35,9 @@ export function createBashTool(
   return {
     name: "bash",
     description:
-      "Execute a bash command. Returns exit code and combined stdout/stderr. " +
+      "Execute a bash command. The shell's working directory is already set to the project root — " +
+      "don't cd into it redundantly. Use cd only when you need a different directory. " +
+      "Returns exit code and combined stdout/stderr. " +
       "Commands run in a non-interactive bash shell with TERM=dumb. " +
       "Long output is truncated (tail kept). " +
       "Set run_in_background=true for long-running processes (dev servers, watchers). " +

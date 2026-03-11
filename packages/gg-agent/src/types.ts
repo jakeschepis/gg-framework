@@ -131,6 +131,8 @@ export interface AgentOptions {
   signal?: AbortSignal;
   accountId?: string;
   cacheRetention?: StreamOptions["cacheRetention"];
+  /** Enable provider-native web search. */
+  webSearch?: boolean;
   /** Enable server-side compaction (Anthropic only, beta). */
   compaction?: boolean;
   /** Max consecutive pause_turn continuations before stopping (default: 5).
@@ -140,8 +142,14 @@ export interface AgentOptions {
    * Called before each LLM call. Allows the caller to inspect and transform
    * the messages array (e.g. compaction, truncation). Return the same array
    * for no-op, or a new array to replace the conversation context.
+   *
+   * When `options.force` is true, the caller should compact unconditionally
+   * (e.g. after a context overflow error from the API).
    */
-  transformContext?: (messages: Message[]) => Message[] | Promise<Message[]>;
+  transformContext?: (
+    messages: Message[],
+    options?: { force?: boolean },
+  ) => Message[] | Promise<Message[]>;
 }
 
 // ── Agent Result ────────────────────────────────────────────

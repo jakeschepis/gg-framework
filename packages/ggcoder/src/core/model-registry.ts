@@ -7,6 +7,7 @@ export interface ModelInfo {
   contextWindow: number;
   maxOutputTokens: number;
   supportsThinking: boolean;
+  supportsImages: boolean;
   costTier: "low" | "medium" | "high";
 }
 
@@ -19,6 +20,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 200_000,
     maxOutputTokens: 128_000,
     supportsThinking: true,
+    supportsImages: true,
     costTier: "high",
   },
   {
@@ -28,6 +30,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 200_000,
     maxOutputTokens: 64_000,
     supportsThinking: true,
+    supportsImages: true,
     costTier: "medium",
   },
   {
@@ -37,6 +40,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 200_000,
     maxOutputTokens: 64_000,
     supportsThinking: true,
+    supportsImages: true,
     costTier: "low",
   },
   // ── OpenAI (Codex) ─────────────────────────────────────
@@ -47,6 +51,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 400_000,
     maxOutputTokens: 128_000,
     supportsThinking: true,
+    supportsImages: true,
     costTier: "high",
   },
   {
@@ -56,6 +61,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 200_000,
     maxOutputTokens: 100_000,
     supportsThinking: true,
+    supportsImages: true,
     costTier: "low",
   },
   // ── GLM (Z.AI) ───────────────────────────────────────────
@@ -66,6 +72,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 128_000,
     maxOutputTokens: 16_384,
     supportsThinking: true,
+    supportsImages: false,
     costTier: "medium",
   },
   {
@@ -75,6 +82,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 128_000,
     maxOutputTokens: 16_384,
     supportsThinking: true,
+    supportsImages: false,
     costTier: "low",
   },
   // ── Moonshot (Kimi) ──────────────────────────────────────
@@ -85,6 +93,7 @@ export const MODELS: ModelInfo[] = [
     contextWindow: 128_000,
     maxOutputTokens: 16_384,
     supportsThinking: true,
+    supportsImages: true,
     costTier: "medium",
   },
 ];

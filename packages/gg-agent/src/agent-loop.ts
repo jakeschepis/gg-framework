@@ -18,7 +18,7 @@ import type {
   StructuredToolResult,
 } from "./types.js";
 
-const DEFAULT_MAX_TURNS = 40;
+const DEFAULT_MAX_TURNS = 100;
 
 /**
  * Detect context window overflow errors from LLM providers.
@@ -36,6 +36,22 @@ export function isContextOverflow(err: unknown): boolean {
   );
 }
 
+/**
+ * Detect overloaded/rate-limit errors from LLM providers.
+ * HTTP 429 (rate limit) or 529/503 (overloaded).
+ */
+export function isOverloaded(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  return (
+    msg.includes("overloaded") ||
+    msg.includes("rate limit") ||
+    msg.includes("too many requests") ||
+    msg.includes("429") ||
+    msg.includes("529")
+  );
+}
+
 export async function* agentLoop(
   messages: Message[],
   options: AgentOptions,
@@ -47,7 +63,11 @@ export async function* agentLoop(
   const totalUsage: Usage = { inputTokens: 0, outputTokens: 0 };
   let turn = 0;
   let consecutivePauses = 0;
-  let overflowRetried = false;
+  let overflowRetries = 0;
+  let overloadRetries = 0;
+  const MAX_OVERFLOW_RETRIES = 3;
+  const MAX_OVERLOAD_RETRIES = 3;
+  const OVERLOAD_RETRY_DELAY_MS = 3_000;
 
   while (turn < maxTurns) {
     options.signal?.throwIfAborted();
@@ -71,6 +91,7 @@ export async function* agentLoop(
         messages,
         tools: options.tools,
         serverTools: options.serverTools,
+        webSearch: options.webSearch,
         maxTokens: options.maxTokens,
         temperature: options.temperature,
         thinking: options.thinking,
@@ -110,10 +131,14 @@ export async function* agentLoop(
 
       response = await result.response;
     } catch (err) {
-      // Context overflow: compact via transformContext and retry once
-      if (!overflowRetried && isContextOverflow(err) && options.transformContext) {
-        overflowRetried = true;
-        const transformed = await options.transformContext(messages);
+      // Context overflow: force-compact via transformContext and retry (up to 3 times)
+      if (
+        overflowRetries < MAX_OVERFLOW_RETRIES &&
+        isContextOverflow(err) &&
+        options.transformContext
+      ) {
+        overflowRetries++;
+        const transformed = await options.transformContext(messages, { force: true });
         if (transformed !== messages) {
           messages.length = 0;
           messages.push(...transformed);
@@ -121,11 +146,19 @@ export async function* agentLoop(
         turn--; // Don't count the failed turn
         continue;
       }
+      // Overloaded / rate-limited: wait 3s and retry (up to 3 times)
+      if (overloadRetries < MAX_OVERLOAD_RETRIES && isOverloaded(err)) {
+        overloadRetries++;
+        await new Promise((r) => setTimeout(r, OVERLOAD_RETRY_DELAY_MS));
+        turn--; // Don't count the failed turn
+        continue;
+      }
       throw err;
     }
 
-    // Reset overflow flag after successful call
-    overflowRetried = false;
+    // Reset retry counters after successful call
+    overflowRetries = 0;
+    overloadRetries = 0;
 
     // Accumulate usage
     totalUsage.inputTokens += response.usage.inputTokens;
@@ -173,9 +206,24 @@ export async function* agentLoop(
       };
     }
 
-    // Extract and execute tool calls in parallel
-    const toolCalls = extractToolCalls(response.message.content);
+    // Extract tool calls — separate client-executed from provider built-in (e.g. Moonshot $web_search)
+    const allToolCalls = extractToolCalls(response.message.content);
+    const toolCalls: ToolCall[] = [];
     const toolResults: ToolResult[] = [];
+
+    for (const tc of allToolCalls) {
+      if (tc.name.startsWith("$")) {
+        // Provider built-in tool (e.g. Moonshot $web_search) — not locally executed.
+        // Still needs a tool_result for the message history round-trip.
+        toolResults.push({
+          type: "tool_result",
+          toolCallId: tc.id,
+          content: JSON.stringify(tc.args),
+        });
+      } else {
+        toolCalls.push(tc);
+      }
+    }
     const eventStream = new EventStream<AgentEvent>();
 
     // Launch all tool calls in parallel
@@ -240,9 +288,15 @@ export async function* agentLoop(
     const abortHandler = () => eventStream.abort(new Error("aborted"));
     options.signal?.addEventListener("abort", abortHandler, { once: true });
 
-    // Close event stream when all tools complete
+    // Close event stream when all tools complete.
+    // Track whether the finally block has already consumed toolResults
+    // to prevent the race where .then() mutates toolResults after
+    // messages.push() has already captured the array by reference.
+    let toolResultsFinalized = false;
+
     Promise.all(executions)
       .then((results) => {
+        if (toolResultsFinalized) return;
         for (const tc of toolCalls) {
           const r = results.find((x) => x.toolCallId === tc.id)!;
           toolResults.push({
@@ -263,6 +317,10 @@ export async function* agentLoop(
       }
     } finally {
       options.signal?.removeEventListener("abort", abortHandler);
+
+      // Prevent the Promise.all .then() from mutating toolResults after
+      // we finalize and push them into messages.
+      toolResultsFinalized = true;
 
       // Ensure every tool_use has a matching tool_result, even on abort.
       // Without this, an aborted turn leaves an orphaned tool_use in the
