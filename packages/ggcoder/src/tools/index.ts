@@ -109,7 +109,7 @@ export function createTools(cwd: string, opts?: CreateToolsOptions): CreateTools
   }
 
   if (opts?.onEnterPlan) {
-    tools.push(createEnterPlanTool(opts.onEnterPlan));
+    tools.push(createEnterPlanTool(opts.onEnterPlan, opts.goalModeRef, opts.planModeRef));
   }
 
   if (opts?.onExitPlan) {

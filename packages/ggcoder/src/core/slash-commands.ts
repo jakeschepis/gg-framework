@@ -200,6 +200,29 @@ export function createBuiltinCommands(): SlashCommand[] {
       },
     },
     {
+      name: "plan",
+      aliases: ["p"],
+      description:
+        "Enter plan mode: research only, draft a plan in .gg/plans/, then get user approval to implement",
+      usage: "/plan [<objective>]",
+      execute(_args, _ctx) {
+        // Actual handling lives in App.tsx (needs React state to flip plan mode
+        // and rebuild the system prompt). The dispatcher short-circuits before
+        // reaching this registry, so this body is only a safety fallback for
+        // headless tests.
+        return "Plan mode must be entered from the interactive TUI.";
+      },
+    },
+    {
+      name: "plans",
+      aliases: [],
+      description: "Open the plan browser overlay to review past plans in .gg/plans/",
+      usage: "/plans",
+      execute(_args, _ctx) {
+        return "Plan browser must be opened from the interactive TUI.";
+      },
+    },
+    {
       name: "quit",
       aliases: ["q", "exit"],
       description: "Exit the agent",

@@ -224,6 +224,8 @@ function printHelp(): void {
   const slashCmds: [string, string][] = [
     ["/help", "Show available slash commands"],
     ["/model", "Switch AI model"],
+    ["/plan [task]", "Enter plan mode — research then implement"],
+    ["/plans", "Open the plan browser"],
     ["/goal", "Create a programmatic goal loop"],
     ["/goals", "Open the goal pane"],
     ["/compact", "Compact conversation context"],

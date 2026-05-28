@@ -28,6 +28,8 @@ interface PromptCommandSubmitOptions {
   messagesRef: React.MutableRefObject<Message[]>;
   goalSetupPanePendingRef: React.MutableRefObject<boolean>;
   goalModeStateRef: React.MutableRefObject<GoalMode>;
+  /** Used to refuse goal commands while plan mode is active (mutex). */
+  planModeStateRef: React.MutableRefObject<boolean>;
   goalAutoExpandRef: React.MutableRefObject<boolean>;
   setActiveGoalReferences: (references: readonly GoalReference[] | undefined) => void;
   setLastUserMessage: (message: string) => void;
@@ -54,6 +56,7 @@ export async function submitPromptCommand({
   messagesRef,
   goalSetupPanePendingRef,
   goalModeStateRef,
+  planModeStateRef,
   goalAutoExpandRef,
   setActiveGoalReferences,
   setLastUserMessage,
@@ -78,6 +81,19 @@ export async function submitPromptCommand({
 
   const hasImages = inputImages.length > 0;
   const isGoalSetupCommand = isGoalPromptCommandName(cmdName);
+  // Mutex: plan mode and goal mode are mutually exclusive. Refuse goal
+  // prompt commands when plan mode is active.
+  if (isGoalSetupCommand && planModeStateRef.current) {
+    setLiveItems((prev) => [
+      ...prev,
+      {
+        kind: "info",
+        text: "Cannot start a goal while in plan mode. Submit your plan via exit_plan (or run /clearplan) first.",
+        id: getId(),
+      },
+    ]);
+    return true;
+  }
   let promptForAgent = fullPrompt;
   if (isGoalSetupCommand) {
     const referenceContext = await buildGoalReferenceContext({

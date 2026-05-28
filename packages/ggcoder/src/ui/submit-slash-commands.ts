@@ -7,6 +7,10 @@ interface UiSlashCommandActions {
   toggleMarkdown: () => void;
   clearApprovedPlan: () => void;
   openGoalsPicker: () => void;
+  /** User-facing entry point to plan mode. Optional objective seeds the first agent turn. */
+  enterPlanMode: (objective: string) => Promise<void>;
+  /** Open the PlanOverlay browser for past plans in .gg/plans/. */
+  openPlanBrowser: () => void;
 }
 
 export async function handleUiSlashCommand(
@@ -50,6 +54,25 @@ export async function handleUiSlashCommand(
 
   if (trimmed === "/goals") {
     actions.openGoalsPicker();
+    return true;
+  }
+
+  // Open the read-only plan browser overlay.
+  if (trimmed === "/plans") {
+    actions.openPlanBrowser();
+    return true;
+  }
+
+  // Enter plan mode, with optional objective to seed the first turn.
+  // Matches exact "/plan", "/p", and the prefixed forms with an arg.
+  if (
+    trimmed === "/plan" ||
+    trimmed === "/p" ||
+    trimmed.startsWith("/plan ") ||
+    trimmed.startsWith("/p ")
+  ) {
+    const objective = trimmed.replace(/^\/p(lan)?\s*/, "").trim();
+    await actions.enterPlanMode(objective);
     return true;
   }
 

@@ -2234,8 +2234,47 @@ export function App(props: AppProps) {
             setLiveItems([{ kind: "plan_event", event: "dismissed", id: getId() }]);
           },
           openGoalsPicker: () => {
+            // Mutex: refuse the goal picker while plan mode is active — the two
+            // workflows are mutually exclusive (one drafts a single-turn plan,
+            // the other orchestrates durable multi-worker goals).
+            if (planModeStateRef.current) {
+              setLiveItems((prev) => [
+                ...prev,
+                {
+                  kind: "info",
+                  text: "Cannot open goals while plan mode is active. Submit your plan via exit_plan (or use /clearplan) first.",
+                  id: getId(),
+                },
+              ]);
+              return;
+            }
             taskPicker.close();
             goalPicker.openPicker();
+          },
+          enterPlanMode: async (objective: string) => {
+            // Mutex: refuse plan mode while any goal phase is active.
+            if (goalModeStateRef.current !== "off") {
+              setLiveItems((prev) => [
+                ...prev,
+                {
+                  kind: "info",
+                  text: `Cannot enter plan mode while a goal is active (goal mode: ${goalModeStateRef.current}). Complete or pause the goal first.`,
+                  id: getId(),
+                },
+              ]);
+              return;
+            }
+            await handleEnterPlanMode(objective || undefined);
+            if (objective) {
+              void agentLoop.run(objective).catch((err: unknown) => {
+                const errMsg = err instanceof Error ? err.message : String(err);
+                log("ERROR", "error", errMsg);
+                setLiveItems((prev) => [...prev, toErrorItem(err, getId())]);
+              });
+            }
+          },
+          openPlanBrowser: () => {
+            openOverlay("plan");
           },
         })
       ) {
@@ -2252,6 +2291,7 @@ export function App(props: AppProps) {
           messagesRef,
           goalSetupPanePendingRef,
           goalModeStateRef,
+          planModeStateRef,
           goalAutoExpandRef,
           setActiveGoalReferences,
           setLastUserMessage,

@@ -1,5 +1,10 @@
 import { z } from "zod";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
+import {
+  isGoalModeActive,
+  isPlanModeActive,
+  type GoalMode,
+} from "../core/runtime-mode.js";
 
 const EnterPlanParams = z.object({
   reason: z
@@ -10,6 +15,8 @@ const EnterPlanParams = z.object({
 
 export function createEnterPlanTool(
   onEnterPlan: (reason?: string) => void | Promise<void>,
+  goalModeRef?: { current: GoalMode },
+  planModeRef?: { current: boolean },
 ): AgentTool<typeof EnterPlanParams> {
   return {
     name: "enter_plan",
@@ -20,6 +27,15 @@ export function createEnterPlanTool(
     parameters: EnterPlanParams,
     executionMode: "sequential",
     async execute({ reason }) {
+      if (isGoalModeActive(goalModeRef)) {
+        return (
+          "Error: Cannot enter plan mode while a goal is active. " +
+          "Run `goals status` to see active goals, or complete/pause the goal first."
+        );
+      }
+      if (isPlanModeActive(planModeRef)) {
+        return "Already in plan mode — continue your research. Draft the plan in .gg/plans/<name>.md and call exit_plan when ready.";
+      }
       await onEnterPlan(reason);
       return (
         "Plan mode activated. You are now in read-only research mode.\n\n" +
