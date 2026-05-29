@@ -287,6 +287,32 @@ describe("streaming assistant spacing", () => {
     ).toBe(false);
   });
 
+  it("does not top-space streaming text after the submitted user row", () => {
+    expect(
+      shouldTopSpaceStreamingAssistant({
+        visibleStreamingText: "Answering right after the prompt.",
+        lastPendingHistoryItem: {
+          kind: "user",
+          id: "user-1",
+          text: "Please fix this.",
+        },
+      }),
+    ).toBe(false);
+  });
+
+  it("top-spaces streaming text after a live queued row", () => {
+    expect(
+      shouldTopSpaceStreamingAssistant({
+        visibleStreamingText: "Continuing the current response.",
+        lastLiveItem: {
+          kind: "queued",
+          id: "queued-1",
+          text: "next prompt",
+        },
+      }),
+    ).toBe(true);
+  });
+
   it("top-spaces streaming text after a finalized task row", () => {
     expect(
       shouldTopSpaceStreamingAssistant({

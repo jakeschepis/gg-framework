@@ -4,6 +4,8 @@ import {
   compact,
   estimateConversationTokens,
   getContextWindow,
+  getNextThinkingLevel,
+  isThinkingLevelSupported,
   shouldCompact,
 } from "@kenkaiiii/ggcoder";
 import {
@@ -40,6 +42,17 @@ const WATCHDOG_INTERVAL_MS = 30_000;
 const SILENT_THRESHOLD_SEC = 90;
 /** Running this long total → ping the boss even if events are still flowing. */
 const WORKING_THRESHOLD_SEC = 600;
+
+function normalizeBossThinkingLevel(
+  provider: Provider,
+  model: string,
+  level: ThinkingLevel | undefined,
+): ThinkingLevel | undefined {
+  if (!level) return undefined;
+  return isThinkingLevelSupported(provider, model, level)
+    ? level
+    : getNextThinkingLevel(provider, model, undefined);
+}
 
 export interface GGBossOptions {
   bossProvider: Provider;
@@ -122,7 +135,14 @@ export class GGBoss {
   private stuckPushedAt = new Map<string, number | null>();
 
   constructor(opts: GGBossOptions) {
-    this.opts = opts;
+    this.opts = {
+      ...opts,
+      bossThinkingLevel: normalizeBossThinkingLevel(
+        opts.bossProvider,
+        opts.bossModel,
+        opts.bossThinkingLevel,
+      ),
+    };
   }
 
   async initialize(): Promise<void> {
@@ -309,8 +329,10 @@ export class GGBoss {
     // Capture history minus the system message — Agent re-adds system from options.
     const oldMessages = this.bossAgent.getMessages().filter((m) => m.role !== "system");
 
+    const thinking = normalizeBossThinkingLevel(provider, model, this.opts.bossThinkingLevel);
     this.opts.bossProvider = provider;
     this.opts.bossModel = model;
+    this.opts.bossThinkingLevel = thinking;
 
     this.bossAgent = new Agent({
       provider,
@@ -322,12 +344,13 @@ export class GGBoss {
       signal: this.ac.signal,
       cacheRetention: "short",
       promptCacheKey: this.getBossPromptCacheKey(),
-      thinking: this.opts.bossThinkingLevel,
+      thinking,
       priorMessages: oldMessages,
     });
 
     bossStore.setBossModel(provider, model);
-    await saveSettings({ bossProvider: provider, bossModel: model });
+    bossStore.setBossThinking(thinking);
+    await saveSettings({ bossProvider: provider, bossModel: model, bossThinkingLevel: thinking });
   }
 
   /** Swap every worker's model. Workers keep their per-project sessions. */
@@ -441,7 +464,12 @@ export class GGBoss {
    * across restarts.
    */
   async setBossThinking(level: ThinkingLevel | undefined): Promise<void> {
-    this.opts.bossThinkingLevel = level;
+    const nextLevel = normalizeBossThinkingLevel(
+      this.opts.bossProvider,
+      this.opts.bossModel,
+      level,
+    );
+    this.opts.bossThinkingLevel = nextLevel;
     const tools = this.buildToolSet();
     const creds = await this.authStorage.resolveCredentials(this.opts.bossProvider);
     const oldMessages = this.bossAgent.getMessages().filter((m) => m.role !== "system");
@@ -455,11 +483,11 @@ export class GGBoss {
       signal: this.ac.signal,
       cacheRetention: "short",
       promptCacheKey: this.getBossPromptCacheKey(),
-      thinking: level,
+      thinking: nextLevel,
       priorMessages: oldMessages,
     });
-    bossStore.setBossThinking(level);
-    await saveSettings({ bossThinkingLevel: level });
+    bossStore.setBossThinking(nextLevel);
+    await saveSettings({ bossThinkingLevel: nextLevel });
   }
 
   /** Recreate bossAgent with a new message history (used by compact + /clear). */
@@ -697,7 +725,6 @@ export class GGBoss {
           bossStore.finishStreaming();
           return;
         }
-        bossStore.appendInfo("Interrupted by user.", "warning");
         bossStore.finishStreaming();
         await this.persistNewMessages();
         // Was `continue` to skip post-stream cleanup. Now we're inside

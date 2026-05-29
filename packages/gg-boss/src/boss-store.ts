@@ -10,6 +10,19 @@ import type {
   ToolResult,
 } from "@kenkaiiii/gg-ai";
 import type { WorkerStatus, WorkerTurnSummary } from "./types.js";
+import type {
+  BossAssistantItem,
+  BossDisplayItem,
+  BossInfoItem,
+  BossTaskDispatchItem,
+  BossToolDoneItem,
+  BossToolGroupItem,
+  BossToolGroupTool,
+  BossUserItem,
+  BossWorkerEventItem,
+  BossWorkerErrorItem,
+} from "./boss-ui-items.js";
+import { BOSS_AGGREGATABLE_TOOLS } from "./boss-tool-group-summary.js";
 
 let nextId = 1;
 const id = (): string => `i${nextId++}`;
@@ -30,7 +43,9 @@ let historyTrimmedUpTo = 0;
 
 function trimItemFields(item: HistoryItem): void {
   switch (item.kind) {
-    case "tool":
+    case "banner":
+      break;
+    case "tool_done":
       if (item.result.length > 200) item.result = HISTORY_TRIM_MARKER;
       // args and details can be large (full prompt_worker prompts, nested
       // objects) — release them entirely.
@@ -54,6 +69,13 @@ function trimItemFields(item: HistoryItem): void {
     case "info":
     case "update_notice":
       if (item.text.length > 400) item.text = item.text.slice(0, 400) + " " + HISTORY_TRIM_MARKER;
+      break;
+    case "tool_group":
+      // Same rationale as tool_done — release big results/args of grouped calls.
+      for (const tool of item.tools) {
+        if (tool.result && tool.result.length > 200) tool.result = HISTORY_TRIM_MARKER;
+        tool.args = {};
+      }
       break;
     case "user":
     case "task_dispatch":
@@ -107,59 +129,12 @@ function toolResultText(content: ToolResult["content"]): string {
 
 // ── History items (rendered in Ink Static) ─────────────────
 
-export interface UserItem {
-  kind: "user";
-  id: string;
-  text: string;
-  timestamp: number;
-}
-
-export interface AssistantItem {
-  kind: "assistant";
-  id: string;
-  text: string;
-  durationMs: number;
-  thinking?: string;
-  thinkingMs?: number;
-}
-
-export interface ToolItem {
-  kind: "tool";
-  id: string;
-  toolCallId: string;
-  name: string;
-  args: Record<string, unknown>;
-  isError: boolean;
-  durationMs: number;
-  result: string;
-  details?: unknown;
-}
-
-export interface WorkerEventItem {
-  kind: "worker_event";
-  id: string;
-  project: string;
-  status: WorkerStatus;
-  finalText: string;
-  toolsUsed: { name: string; ok: boolean }[];
-  turnIndex: number;
-  timestamp: string;
-}
-
-export interface WorkerErrorItem {
-  kind: "worker_error";
-  id: string;
-  project: string;
-  message: string;
-  timestamp: string;
-}
-
-export interface InfoItem {
-  kind: "info";
-  id: string;
-  text: string;
-  level?: "info" | "warning" | "error";
-}
+export type UserItem = BossUserItem;
+export type AssistantItem = BossAssistantItem;
+export type ToolItem = BossToolDoneItem;
+export type WorkerEventItem = BossWorkerEventItem;
+export type WorkerErrorItem = BossWorkerErrorItem;
+export type InfoItem = BossInfoItem;
 
 /**
  * Task-dispatch announcement. Rendered when the user (or boss) fires a batch
@@ -167,12 +142,7 @@ export interface InfoItem {
  * info text) so each project name can be drawn in its own projectColor() —
  * matching the WorkerStatusBar / WorkerEventRow / scope pill conventions.
  */
-export interface TaskDispatchItem {
-  kind: "task_dispatch";
-  id: string;
-  tasks: { project: string; title: string }[];
-  timestamp: number;
-}
+export type TaskDispatchItem = BossTaskDispatchItem;
 
 /**
  * Auto-update notice ("Ken just shipped 4.3.x!"). Distinct from a plain
@@ -180,21 +150,69 @@ export interface TaskDispatchItem {
  * ggcoder uses — without this, the update message renders in flat default
  * text and goes unnoticed amid worker chatter.
  */
-export interface UpdateNoticeItem {
-  kind: "update_notice";
-  id: string;
-  text: string;
+export type UpdateNoticeItem = BossDisplayItem & { kind: "update_notice" };
+
+export type HistoryItem = BossDisplayItem;
+
+/** A fully-resolved tool group is ready to leave the live area for history. */
+function isFullyDoneGroup(item: HistoryItem): item is BossToolGroupItem {
+  return item.kind === "tool_group" && item.tools.every((tool) => tool.status === "done");
 }
 
-export type HistoryItem =
-  | UserItem
-  | AssistantItem
-  | ToolItem
-  | WorkerEventItem
-  | WorkerErrorItem
-  | InfoItem
-  | TaskDispatchItem
-  | UpdateNoticeItem;
+/**
+ * Split live items into the ones that stay live and the fully-done tool groups
+ * that should be committed to history. Used whenever a different activity (a
+ * non-matching tool, or flushed assistant text) closes an open group, mirroring
+ * ggcoder's partitionCompleted/queueFlush for coalesced tools.
+ */
+function extractDoneGroups(items: HistoryItem[]): {
+  remaining: HistoryItem[];
+  flushed: HistoryItem[];
+} {
+  const remaining: HistoryItem[] = [];
+  const flushed: HistoryItem[] = [];
+  for (const item of items) {
+    if (isFullyDoneGroup(item)) flushed.push(item);
+    else remaining.push(item);
+  }
+  return { remaining, flushed };
+}
+
+/**
+ * Coalesce adjacent, same-name, error-free aggregatable tool_done items into
+ * tool_group items — the static-history equivalent of the live grouping in
+ * startTool/endTool. Used when rebuilding scrollback from a resumed session so
+ * restored bursts read the same as freshly-run ones. Intervening text, an
+ * error, or a different tool name breaks the run, exactly like the live path.
+ */
+function coalesceRestoredHistory(items: readonly HistoryItem[]): HistoryItem[] {
+  const out: HistoryItem[] = [];
+  for (const item of items) {
+    if (item.kind === "tool_done" && !item.isError && BOSS_AGGREGATABLE_TOOLS.has(item.name)) {
+      const groupTool: BossToolGroupTool = {
+        toolCallId: item.toolCallId ?? item.id,
+        name: item.name,
+        args: item.args,
+        status: "done",
+        result: item.result,
+        isError: false,
+      };
+      const prev = out[out.length - 1];
+      if (
+        prev &&
+        prev.kind === "tool_group" &&
+        prev.tools.every((t) => t.name === item.name && !t.isError)
+      ) {
+        prev.tools.push(groupTool);
+        continue;
+      }
+      out.push({ kind: "tool_group", id: item.id, tools: [groupTool] });
+      continue;
+    }
+    out.push(item);
+  }
+  return out;
+}
 
 // ── Streaming (current boss turn, rendered live above the input) ────
 
@@ -251,6 +269,7 @@ export interface BossUiState {
   /** Providers the user is logged in to — controls which models the picker offers. */
   loggedInProviders: Provider[];
   history: HistoryItem[];
+  liveItems: HistoryItem[];
   /**
    * Two-phase flush queue. Items here have already been REMOVED from the
    * streaming live-area (so it has shrunk) but not yet committed to history.
@@ -302,7 +321,8 @@ const initialState: BossUiState = {
   workerProvider: "anthropic",
   workerModel: "",
   loggedInProviders: [],
-  history: [],
+  history: [{ kind: "banner", id: "banner" }],
+  liveItems: [],
   pendingFlush: [],
   flushGeneration: 0,
   pendingEndOfTurnInfos: [],
@@ -401,10 +421,35 @@ export const bossStore = {
     notify();
   },
 
-  appendUser(text: string): void {
+  createUserItem(text: string): UserItem {
+    return { kind: "user", id: id(), text, timestamp: Date.now() };
+  },
+
+  queueSubmittedUserItem(item: UserItem): void {
     state = {
       ...state,
-      history: [...state.history, { kind: "user", id: id(), text, timestamp: Date.now() }],
+      pendingFlush: [...state.pendingFlush, item],
+      flushGeneration: state.flushGeneration + 1,
+    };
+    notify();
+  },
+
+  appendUser(text: string): void {
+    const item: UserItem = { kind: "user", id: id(), text, timestamp: Date.now() };
+    state = {
+      ...state,
+      history: [...state.history, item],
+    };
+    trimAgedHistory();
+    notify();
+  },
+
+  commitLiveItem(item: HistoryItem): void {
+    const exists = state.history.some((historyItem) => historyItem.id === item.id);
+    state = {
+      ...state,
+      liveItems: state.liveItems.filter((liveItem) => liveItem.id !== item.id),
+      history: exists ? state.history : [...state.history, item],
     };
     trimAgedHistory();
     notify();
@@ -412,23 +457,22 @@ export const bossStore = {
 
   appendTaskDispatch(tasks: { project: string; title: string }[]): void {
     if (tasks.length === 0) return;
+    const item: HistoryItem = { kind: "task_dispatch", id: id(), tasks, timestamp: Date.now() };
     state = {
       ...state,
-      history: [
-        ...state.history,
-        { kind: "task_dispatch", id: id(), tasks, timestamp: Date.now() },
-      ],
+      pendingFlush: [...state.pendingFlush, item],
+      flushGeneration: state.flushGeneration + 1,
     };
-    trimAgedHistory();
     notify();
   },
 
   appendInfo(text: string, level: InfoItem["level"] = "info"): void {
+    const item: HistoryItem = { kind: "info", id: id(), text, level };
     state = {
       ...state,
-      history: [...state.history, { kind: "info", id: id(), text, level }],
+      pendingFlush: [...state.pendingFlush, item],
+      flushGeneration: state.flushGeneration + 1,
     };
-    trimAgedHistory();
     notify();
   },
 
@@ -439,11 +483,12 @@ export const bossStore = {
    * worker chatter, this stands out.
    */
   appendUpdateNotice(text: string): void {
+    const item: HistoryItem = { kind: "update_notice", id: id(), text };
     state = {
       ...state,
-      history: [...state.history, { kind: "update_notice", id: id(), text }],
+      pendingFlush: [...state.pendingFlush, item],
+      flushGeneration: state.flushGeneration + 1,
     };
-    trimAgedHistory();
     notify();
   },
 
@@ -470,10 +515,10 @@ export const bossStore = {
     }));
     state = {
       ...state,
-      history: [...state.history, ...newRows],
+      pendingFlush: [...state.pendingFlush, ...newRows],
+      flushGeneration: state.flushGeneration + 1,
       pendingEndOfTurnInfos: [],
     };
-    trimAgedHistory();
     notify();
   },
 
@@ -557,21 +602,34 @@ export const bossStore = {
   },
 
   startCompaction(): void {
+    const compaction = {
+      state: "running" as const,
+      originalCount: 0,
+      newCount: 0,
+      tokensBefore: state.bossInputTokens,
+      tokensAfter: 0,
+    };
     state = {
       ...state,
-      compaction: {
-        state: "running",
-        originalCount: 0,
-        newCount: 0,
-        tokensBefore: state.bossInputTokens,
-        tokensAfter: 0,
-      },
+      compaction,
+      liveItems: [
+        ...state.liveItems.filter((item) => item.kind !== "compacting"),
+        { kind: "compacting", id: "boss-compacting" },
+      ],
     };
     notify();
   },
 
   endCompaction(originalCount: number, newCount: number): void {
     const before = state.compaction?.tokensBefore ?? state.bossInputTokens;
+    const item: HistoryItem = {
+      kind: "compacted",
+      id: id(),
+      originalCount,
+      newCount,
+      tokensBefore: before,
+      tokensAfter: state.bossInputTokens,
+    };
     state = {
       ...state,
       compaction: {
@@ -581,18 +639,29 @@ export const bossStore = {
         tokensBefore: before,
         tokensAfter: state.bossInputTokens,
       },
+      liveItems: state.liveItems.filter((liveItem) => liveItem.kind !== "compacting"),
+      pendingFlush: [...state.pendingFlush, item],
+      flushGeneration: state.flushGeneration + 1,
     };
     notify();
   },
 
   cancelCompaction(): void {
-    state = { ...state, compaction: null };
+    state = {
+      ...state,
+      compaction: null,
+      liveItems: state.liveItems.filter((item) => item.kind !== "compacting"),
+    };
     notify();
   },
 
   /** Read-only accessor for the orchestrator (which lives outside React). */
   getInputTokens(): number {
     return state.bossInputTokens;
+  },
+
+  getPhase(): BossUiState["phase"] {
+    return state.phase;
   },
 
   setBossInputTokens(tokens: number): void {
@@ -603,16 +672,72 @@ export const bossStore = {
 
   startTool(toolCallId: string, name: string, args: Record<string, unknown>): void {
     if (!state.streaming) return;
+    const startedAt = Date.now();
+    const animateUntil = startedAt + 1_000;
+
+    // Aggregatable read-only tools coalesce into a live tool_group, mirroring
+    // ggcoder's App.onToolStart. A same-name, error-free group absorbs the new
+    // call; otherwise any fully-done group is closed (flushed to history) and a
+    // fresh group is opened.
+    if (BOSS_AGGREGATABLE_TOOLS.has(name)) {
+      const groupIdx = state.liveItems.findIndex(
+        (item) =>
+          item.kind === "tool_group" && item.tools.every((t) => t.name === name && !t.isError),
+      );
+      if (groupIdx !== -1) {
+        const group = state.liveItems[groupIdx] as BossToolGroupItem;
+        const liveItems = [...state.liveItems];
+        liveItems[groupIdx] = {
+          ...group,
+          tools: [...group.tools, { toolCallId, name, args, status: "running", animateUntil }],
+        };
+        state = { ...state, liveItems };
+        notify();
+        return;
+      }
+      const { remaining, flushed } = extractDoneGroups(state.liveItems);
+      state = {
+        ...state,
+        liveItems: [
+          ...remaining,
+          {
+            kind: "tool_group",
+            id: toolCallId,
+            tools: [{ toolCallId, name, args, status: "running", animateUntil }],
+          },
+        ],
+        pendingFlush: flushed.length ? [...state.pendingFlush, ...flushed] : state.pendingFlush,
+        flushGeneration: flushed.length ? state.flushGeneration + 1 : state.flushGeneration,
+      };
+      notify();
+      return;
+    }
+
+    // Standalone tool — tracked in streaming.tools (for interrupt/finish) and
+    // shown as its own live row. Close any open group first so order is kept.
+    const { remaining, flushed } = extractDoneGroups(state.liveItems);
     const tool: StreamingTool = {
       toolCallId,
       name,
       args,
       status: "running",
-      startedAt: Date.now(),
+      startedAt,
+    };
+    const liveTool: HistoryItem = {
+      kind: "tool_start",
+      id: toolCallId,
+      toolCallId,
+      name,
+      args,
+      startedAt,
+      animateUntil,
     };
     state = {
       ...state,
       streaming: { ...state.streaming, tools: [...state.streaming.tools, tool] },
+      liveItems: [...remaining, liveTool],
+      pendingFlush: flushed.length ? [...state.pendingFlush, ...flushed] : state.pendingFlush,
+      flushGeneration: flushed.length ? state.flushGeneration + 1 : state.flushGeneration,
     };
     notify();
   },
@@ -625,6 +750,27 @@ export const bossStore = {
     details?: unknown,
   ): void {
     if (!state.streaming) return;
+
+    // Grouped tool — mark done inside its live group. The group stays live so
+    // sibling same-name calls keep coalescing; it flushes once a different
+    // activity or the turn closes it.
+    const groupIdx = state.liveItems.findIndex(
+      (item) => item.kind === "tool_group" && item.tools.some((t) => t.toolCallId === toolCallId),
+    );
+    if (groupIdx !== -1) {
+      const group = state.liveItems[groupIdx] as BossToolGroupItem;
+      const liveItems = [...state.liveItems];
+      liveItems[groupIdx] = {
+        ...group,
+        tools: group.tools.map((t) =>
+          t.toolCallId === toolCallId ? { ...t, status: "done" as const, result, isError } : t,
+        ),
+      };
+      state = { ...state, liveItems };
+      notify();
+      return;
+    }
+
     const tool = state.streaming.tools.find((t) => t.toolCallId === toolCallId);
     const remaining = state.streaming.tools.filter((t) => t.toolCallId !== toolCallId);
     if (!tool) {
@@ -632,7 +778,7 @@ export const bossStore = {
       return;
     }
     const historyItem: HistoryItem = {
-      kind: "tool",
+      kind: "tool_done",
       id: id(),
       toolCallId: tool.toolCallId,
       name: tool.name,
@@ -647,6 +793,7 @@ export const bossStore = {
     state = {
       ...state,
       streaming: { ...state.streaming, tools: remaining },
+      liveItems: state.liveItems.filter((item) => item.id !== toolCallId),
       pendingFlush: [...state.pendingFlush, historyItem],
       flushGeneration: state.flushGeneration + 1,
     };
@@ -672,6 +819,9 @@ export const bossStore = {
       thinking: thinking ? thinking : undefined,
       thinkingMs: thinking ? state.streaming.thinkingMs : undefined,
     };
+    // Committing text closes any open tool group so the group lands in history
+    // BEFORE this text (it ran earlier), avoiding an order inversion.
+    const { remaining, flushed } = extractDoneGroups(state.liveItems);
     state = {
       ...state,
       streaming: {
@@ -682,7 +832,8 @@ export const bossStore = {
         thinkingStartedAt: null,
         startedAt: Date.now(),
       },
-      pendingFlush: [...state.pendingFlush, item],
+      liveItems: flushed.length ? remaining : state.liveItems,
+      pendingFlush: [...state.pendingFlush, ...flushed, item],
       flushGeneration: state.flushGeneration + 1,
     };
     notify();
@@ -695,11 +846,20 @@ export const bossStore = {
    */
   commitPendingFlush(): void {
     if (state.pendingFlush.length === 0) return;
+    const pendingIds = new Set(state.pendingFlush.map((item) => item.id));
     state = {
       ...state,
       history: [...state.history, ...state.pendingFlush],
+      liveItems: state.liveItems.filter((item) => !pendingIds.has(item.id)),
       pendingFlush: [],
     };
+    trimAgedHistory();
+    notify();
+  },
+
+  clearPendingFlush(): void {
+    if (state.pendingFlush.length === 0) return;
+    state = { ...state, pendingFlush: [] };
     trimAgedHistory();
     notify();
   },
@@ -717,7 +877,7 @@ export const bossStore = {
     for (const t of state.streaming.tools) {
       if (t.status === "running") {
         stoppedItems.push({
-          kind: "tool",
+          kind: "tool_done",
           id: id(),
           toolCallId: t.toolCallId,
           name: t.name,
@@ -730,11 +890,39 @@ export const bossStore = {
         remainingTools.push(t);
       }
     }
-    if (stoppedItems.length === 0) return;
+    // Live tool groups — mark any running members as stopped errors and flush
+    // the whole group so an interrupted burst still shows what it completed.
+    const groupFlush: HistoryItem[] = [];
+    const stoppedStartIds = new Set(
+      stoppedItems.map((s) => (s.kind === "tool_done" ? s.toolCallId : undefined)),
+    );
+    const liveItems: HistoryItem[] = [];
+    for (const item of state.liveItems) {
+      if (item.kind === "tool_group") {
+        groupFlush.push({
+          ...item,
+          tools: item.tools.map((t) =>
+            t.status === "running"
+              ? { ...t, status: "done" as const, isError: true, result: "Stopped." }
+              : t,
+          ),
+        });
+        continue;
+      }
+      if (item.kind === "tool_start" && stoppedStartIds.has(item.toolCallId)) continue;
+      liveItems.push(item);
+    }
+    if (stoppedItems.length === 0 && groupFlush.length === 0) return;
     state = {
       ...state,
       streaming: { ...state.streaming, tools: remainingTools },
-      pendingFlush: [...state.pendingFlush, ...stoppedItems],
+      liveItems,
+      pendingFlush: [
+        ...state.pendingFlush,
+        ...groupFlush,
+        ...stoppedItems,
+        { kind: "stopped", id: id(), text: "Request was stopped." },
+      ],
       flushGeneration: state.flushGeneration + 1,
     };
     notify();
@@ -753,6 +941,15 @@ export const bossStore = {
       return;
     }
     const items: HistoryItem[] = [];
+    // Defensive: flush any live tool groups that never closed (normally closed
+    // by flushPendingText at turn_end). They ran before the trailing text.
+    for (const item of state.liveItems) {
+      if (item.kind !== "tool_group") continue;
+      items.push({
+        ...item,
+        tools: item.tools.map((t) => (t.status === "done" ? t : { ...t, status: "done" as const })),
+      });
+    }
     const tail = state.streaming.text.trim();
     if (tail) {
       const thinking = state.streaming.thinking.trim();
@@ -768,7 +965,7 @@ export const bossStore = {
     // Defensive: any running tools without a tool_call_end (shouldn't happen).
     for (const t of state.streaming.tools) {
       items.push({
-        kind: "tool",
+        kind: "tool_done",
         id: id(),
         toolCallId: t.toolCallId,
         name: t.name,
@@ -930,7 +1127,7 @@ export const bossStore = {
             const result = toolResults.get(p.id);
             const resultText = result ? toolResultText(result.content) : "";
             items.push({
-              kind: "tool",
+              kind: "tool_done",
               id: id(),
               toolCallId: p.id,
               name: p.name,
@@ -954,7 +1151,7 @@ export const bossStore = {
       // tool messages handled via the toolResults map above; skip.
     }
 
-    state = { ...state, history: [...state.history, ...items] };
+    state = { ...state, history: [...state.history, ...coalesceRestoredHistory(items)] };
     trimAgedHistory();
     notify();
   },
@@ -963,7 +1160,8 @@ export const bossStore = {
   clearHistory(): void {
     state = {
       ...state,
-      history: [],
+      history: [{ kind: "banner", id: "banner" }],
+      liveItems: [],
       pendingFlush: [],
       flushGeneration: state.flushGeneration + 1,
       streaming: null,

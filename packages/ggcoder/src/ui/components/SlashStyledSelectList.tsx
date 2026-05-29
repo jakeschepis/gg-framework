@@ -2,6 +2,7 @@ import React, { useMemo, useState } from "react";
 import { Box, Text, useInput } from "ink";
 import { useTerminalSize } from "../hooks/useTerminalSize.js";
 import { useTheme } from "../theme/theme.js";
+import { stripTerminalFocusSequences } from "../utils/terminal-input.js";
 
 export interface SlashStyledSelectListItem {
   label: string;
@@ -43,6 +44,10 @@ export function SlashStyledSelectList({
   }, [items, filter]);
 
   useInput((input, key) => {
+    const inputWithoutFocusReports = stripTerminalFocusSequences(input);
+    if (!inputWithoutFocusReports && input) return;
+    input = inputWithoutFocusReports;
+
     if (key.escape) {
       onCancel();
       return;

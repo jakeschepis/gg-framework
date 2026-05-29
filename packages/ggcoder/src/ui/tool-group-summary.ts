@@ -13,7 +13,7 @@ export interface SummarySegment {
   tone?: "read" | "search" | "write" | "run" | "web" | "agent" | "state" | "source" | "default";
 }
 
-type GroupRenderer = (
+export type GroupRenderer = (
   tools: readonly ToolGroupSummaryTool[],
   allDone: boolean,
 ) => SummarySegment[][];
@@ -22,11 +22,11 @@ const MAX_DETAIL_ITEMS = 2;
 const MAX_DETAIL_LENGTH = 28;
 const MAX_LONG_DETAIL_LENGTH = 20;
 
-function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
+export function plural(count: number, singular: string, pluralForm = `${singular}s`): string {
   return count === 1 ? singular : pluralForm;
 }
 
-function shortenValue(value: string, maxLength = MAX_DETAIL_LENGTH): string {
+export function shortenValue(value: string, maxLength = MAX_DETAIL_LENGTH): string {
   const normalized = value.replace(/\s+/g, " ").trim();
   if (normalized.length <= maxLength) return normalized;
 
@@ -56,7 +56,7 @@ function shortenValue(value: string, maxLength = MAX_DETAIL_LENGTH): string {
   return `${normalized.slice(0, headLength)}…${normalized.slice(-tailLength)}`;
 }
 
-function basename(path: string): string {
+export function basename(path: string): string {
   const trimmed = path.replace(/\/+$/u, "");
   return trimmed.split("/").filter(Boolean).at(-1) ?? trimmed;
 }
@@ -65,7 +65,7 @@ function uniqueValues(values: readonly string[]): string[] {
   return Array.from(new Set(values.filter((value) => value.length > 0)));
 }
 
-function detailSuffix(
+export function detailSuffix(
   values: readonly string[],
   options: { quote?: boolean; maxLength?: number } = {},
 ): string {
@@ -278,7 +278,9 @@ const GROUP_RENDERERS: Record<string, GroupRenderer> = {
 export function buildToolGroupSummary(
   tools: readonly ToolGroupSummaryTool[],
   allDone: boolean,
+  extraRenderers?: Record<string, GroupRenderer>,
 ): SummarySegment[] {
+  const renderers = extraRenderers ? { ...GROUP_RENDERERS, ...extraRenderers } : GROUP_RENDERERS;
   const byName: Record<string, ToolGroupSummaryTool[]> = {};
   for (const tool of tools) {
     (byName[tool.name] ??= []).push(tool);
@@ -286,7 +288,7 @@ export function buildToolGroupSummary(
 
   const parts: SummarySegment[][] = [];
   for (const [name, toolsOfType] of Object.entries(byName)) {
-    const renderer = GROUP_RENDERERS[name];
+    const renderer = renderers[name];
     if (renderer) {
       parts.push(...renderer(toolsOfType, allDone));
     }

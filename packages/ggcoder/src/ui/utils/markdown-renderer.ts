@@ -238,7 +238,7 @@ export function renderMarkdownToAnsiLines({
   const codeFenceRegex = /^ *(`{3,}|~{3,}) *([\w-]*?) *$/;
   const ulItemRegex = /^([ \t]*)([-*+]) +(.*)/;
   const olItemRegex = /^([ \t]*)(\d+)\. +(.*)/;
-  const hrRegex = /^ *([-*_] *){3,} *$/;
+  const hrRegex = /^ *(?:-{2,}|(?:[-*_] *){3,}) *$/;
   const tableRowRegex = /^\s*\|(.+)\|\s*$/;
   const tableSeparatorRegex = /^\s*\|?\s*(:?-+:?)\s*(\|\s*(:?-+:?)\s*)+\|?\s*$/;
 
@@ -357,7 +357,7 @@ export function renderMarkdownToAnsiLines({
       flushTable();
       if (line.trim().length > 0) addInlineLine(line);
     } else if (hrMatch) {
-      addLines([chalk.dim("---")]);
+      addLines([chalk.dim("─".repeat(Math.max(1, width)))]);
     } else if (headerMatch) {
       const level = headerMatch[1]?.length ?? 1;
       const headerText = headerMatch[2] ?? "";

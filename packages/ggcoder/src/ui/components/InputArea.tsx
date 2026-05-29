@@ -8,6 +8,7 @@ import type { ImageAttachment } from "../../utils/image.js";
 import { extractImagePaths, readImageFile, getClipboardImage } from "../../utils/image.js";
 import { SlashCommandMenu, filterCommands, type SlashCommandInfo } from "./SlashCommandMenu.js";
 import { TaskPickerMenu } from "./TaskPickerMenu.js";
+import { stripTerminalFocusSequences } from "../utils/terminal-input.js";
 import { GoalPickerMenu } from "./GoalPickerMenu.js";
 import type { TaskRecord } from "../../core/tasks-store.js";
 import type { GoalRun } from "../../core/goal-store.js";
@@ -47,10 +48,6 @@ const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1000l";
 // Some terminals or multiplexers send these even without mouse tracking enabled.
 function isMouseEscapeSequence(input: string): boolean {
   return input.includes("[<") && /\[<\d+;\d+;\d+[Mm]/.test(input);
-}
-
-function stripTerminalFocusSequences(input: string): string {
-  return input.replaceAll("\x1b[I", "").replaceAll("\x1b[O", "");
 }
 
 // Option+Arrow escape sequences — terminals send these as raw input strings

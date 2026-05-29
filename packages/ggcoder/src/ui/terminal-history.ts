@@ -11,7 +11,7 @@ import type { Theme } from "./theme/theme.js";
 import { getUserMessageDisplayParts } from "./utils/user-message-display.js";
 import { buildToolGroupSummary } from "./tool-group-summary.js";
 import { renderMarkdownToAnsiLines } from "./utils/markdown-renderer.js";
-import { isAgentSpacingKind } from "./terminal-history-spacing.js";
+import { shouldSeparateTranscriptItems } from "./transcript/spacing.js";
 import {
   MAX_OUTPUT_LINES,
   RESPONSE_LEFT_PADDING,
@@ -50,7 +50,6 @@ import {
   presentInfo,
   presentModelTransition,
   presentPlanEvent,
-  presentPlanTransition,
   presentQueued,
   presentStopped,
   presentTask,
@@ -59,6 +58,21 @@ import {
 import { toolTonePalette } from "./transcript/tool-presentation.js";
 
 const LOGO_LINES = [" ▄▀▀▀ ▄▀▀▀", " █ ▀█ █ ▀█", " ▀▄▄▀ ▀▄▄▀"];
+const PLAN_MODE_LOGO = [
+  "▗▄▄▖ ▗▖    ▗▄▖ ▗▖  ▗▖    ▗▖  ▗▖ ▗▄▖ ▗▄▄▄ ▗▄▄▄▖",
+  "▐▌ ▐▌▐▌   ▐▌ ▐▌▐▛▚▖▐▌    ▐▛▚▞▜▌▐▌ ▐▌▐▌  █▐▌",
+  "▐▛▀▘ ▐▌   ▐▛▀▜▌▐▌ ▝▜▌    ▐▌  ▐▌▐▌ ▐▌▐▌  █▐▛▀▀▘",
+  "▐▌   ▐▙▄▄▖▐▌ ▐▌▐▌  ▐▌    ▐▌  ▐▌▝▚▄▞▘▐▙▄▄▀▐▙▄▄▖",
+];
+const PLAN_MODE_GRADIENT = [
+  "#f59e0b",
+  "#fbbf24",
+  "#f59e0b",
+  "#d97706",
+  "#f59e0b",
+  "#fbbf24",
+  "#d97706",
+];
 const GRADIENT = [
   "#60a5fa",
   "#6da1f9",
@@ -117,13 +131,26 @@ export function createTerminalHistoryPrinter({
         if (!options?.force && printed.has(item.id)) continue;
         const output = serializeCompletedItemToTerminalHistory(item, context);
         const endsWithBlankLine = item.kind === "banner";
+        // A continuation assistant chunk is the next paragraph of a response
+        // whose earlier paragraphs were already flushed mid-stream. Re-insert
+        // the blank line that separated them so the reassembled scrollback
+        // matches the whole response (assistant→assistant is otherwise compact).
+        const isContinuationParagraph =
+          item.kind === "assistant" &&
+          item.continuation === true &&
+          previousPrintedKind === "assistant";
         const formatted = formatHistoryWrite(output, {
           leadingSeparator:
-            previousPrintedKind !== null &&
-            isAgentSpacingKind(previousPrintedKind) &&
-            isAgentSpacingKind(item.kind),
+            item.kind === "plan_transition"
+              ? false
+              : isContinuationParagraph
+                ? true
+                : shouldSeparateTranscriptItems({
+                    previousKind: previousPrintedKind ?? undefined,
+                    currentKind: item.kind,
+                  }),
           trailingBlankLine: endsWithBlankLine,
-          trailingNewlines: item.kind === "user" ? 0 : undefined,
+          trailingNewlines: item.kind === "user" ? 1 : undefined,
         });
         if (formatted.length === 0) continue;
         printed.add(item.id);
@@ -159,8 +186,10 @@ export function serializeCompletedItemToTerminalHistory(
     case "assistant":
       return renderAssistant(item.text, context, item.continuation);
     case "tool_start":
+      if (item.name === "enter_plan") return "";
       return renderToolStart(item.name, item.args, item.progressOutput, context);
     case "tool_done":
+      if (item.name === "enter_plan") return "";
       return renderToolDone(
         item.name,
         item.args,
@@ -229,16 +258,8 @@ export function serializeCompletedItemToTerminalHistory(
     }
     case "session_summary":
       return renderSessionSummary(item.summary, context);
-    case "plan_transition": {
-      const presentation = presentPlanTransition(item);
-      return renderStatusLine(
-        presentation.glyph.trim(),
-        presentation.text,
-        context,
-        context.theme.commandColor,
-        presentation.bold,
-      );
-    }
+    case "plan_transition":
+      return renderPlanModeLogo(context);
     case "goal_agent_transition": {
       const presentation = presentGoalAgentTransition(item);
       return renderStatusLine(
@@ -449,7 +470,11 @@ function renderAssistant(
         : prefixFirstLine(body, ` ${color(context.theme.primary, BLACK_CIRCLE)} `, "   "),
     );
   }
-  return block(lines);
+  return lines.join("\n");
+}
+
+function renderPlanModeLogo(_context: TerminalHistoryContext): string {
+  return PLAN_MODE_LOGO.map((line) => ` ${gradientLine(line, PLAN_MODE_GRADIENT)}`).join("\n");
 }
 
 function renderToolStart(

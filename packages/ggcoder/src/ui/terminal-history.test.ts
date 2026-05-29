@@ -404,7 +404,7 @@ describe("terminal history", () => {
     expect(rendered).not.toMatch(/toggle thinking\n\n\n▄+/);
   });
 
-  it("prints one leading separator and no trailing blank after finalized rows", () => {
+  it("prints one trailing newline after finalized assistant rows", () => {
     let output = "";
     const stream = {
       write(chunk: string) {
@@ -417,6 +417,144 @@ describe("terminal history", () => {
     printer.print([{ kind: "assistant", text: "last answer", id: "assistant-1" }], context);
 
     expect(stripAnsi(output)).toMatch(/^ [⏺●] last answer\n$/);
+  });
+
+  it("does not add a blank separator between a submitted user row and finalized assistant row", () => {
+    let output = "";
+    const stream = {
+      write(chunk: string) {
+        output += chunk;
+        return true;
+      },
+    } as NodeJS.WriteStream;
+    const printer = createTerminalHistoryPrinter({ stream });
+
+    printer.print(
+      [
+        { kind: "user", text: "Fix it", id: "user-1" },
+        { kind: "assistant", text: "Fixed.", id: "assistant-1" },
+      ],
+      context,
+    );
+
+    expect(stripAnsi(output)).toMatch(/▀+\n [⏺●] Fixed\./);
+    expect(stripAnsi(output)).not.toMatch(/▀+\n\n [⏺●] Fixed\./);
+  });
+
+  it("reinserts the paragraph break before an assistant continuation chunk", () => {
+    let output = "";
+    const stream = {
+      write(chunk: string) {
+        output += chunk;
+        return true;
+      },
+    } as NodeJS.WriteStream;
+    const printer = createTerminalHistoryPrinter({ stream });
+
+    printer.print(
+      [
+        { kind: "assistant", text: "First chunk.", id: "assistant-1" },
+        { kind: "assistant", text: "Second chunk.", continuation: true, id: "assistant-2" },
+      ],
+      context,
+    );
+
+    // A continuation chunk is the next paragraph of a progressively-flushed
+    // response, so the blank line that separated the paragraphs is restored —
+    // this keeps reassembled scrollback identical to the whole response.
+    expect(stripAnsi(output)).toContain(" ⏺ First chunk.\n\n   Second chunk.");
+  });
+
+  it("adds a blank separator between assistant and tool rows", () => {
+    let output = "";
+    const stream = {
+      write(chunk: string) {
+        output += chunk;
+        return true;
+      },
+    } as NodeJS.WriteStream;
+    const printer = createTerminalHistoryPrinter({ stream });
+
+    printer.print(
+      [
+        { kind: "assistant", text: "I’ll inspect the files.", id: "assistant-1" },
+        {
+          kind: "tool_group",
+          id: "tool-group-1",
+          tools: [
+            {
+              toolCallId: "read-1",
+              name: "read",
+              args: { file_path: "src/a.ts" },
+              status: "done",
+              result: "ok",
+            },
+          ],
+        },
+      ],
+      context,
+    );
+
+    expect(stripAnsi(output)).toMatch(new RegExp("inspect the files\\.\\n\\n [⏺●] Read"));
+  });
+
+  it("adds blank separators between consecutive tool rows", () => {
+    let output = "";
+    const stream = {
+      write(chunk: string) {
+        output += chunk;
+        return true;
+      },
+    } as NodeJS.WriteStream;
+    const printer = createTerminalHistoryPrinter({ stream });
+
+    printer.print(
+      [
+        {
+          kind: "tool_done",
+          id: "tool-1",
+          name: "read",
+          args: { file_path: "src/a.ts" },
+          result: "ok",
+          isError: false,
+          durationMs: 1,
+        },
+        {
+          kind: "tool_done",
+          id: "tool-2",
+          name: "grep",
+          args: { pattern: "needle" },
+          result: "src/a.ts:1:needle\n1 match found",
+          isError: false,
+          durationMs: 1,
+        },
+      ],
+      context,
+    );
+
+    expect(stripAnsi(output)).toMatch(new RegExp("Read src/a\\.ts\\n\\n [⏺●] Searched"));
+  });
+
+  it("does not add a blank separator above the next user row after an assistant", () => {
+    let output = "";
+    const stream = {
+      write(chunk: string) {
+        output += chunk;
+        return true;
+      },
+    } as NodeJS.WriteStream;
+    const printer = createTerminalHistoryPrinter({ stream });
+
+    printer.print(
+      [
+        { kind: "assistant", text: "Previous answer.", id: "assistant-1" },
+        { kind: "user", text: "Next prompt", id: "user-1" },
+      ],
+      context,
+    );
+
+    expect(stripAnsi(output)).toMatch(/Previous answer\.\n▄+/);
+    expect(stripAnsi(output)).not.toMatch(/Previous answer\.\n\n▄+/);
   });
 
   it("can intentionally clear printed ids for a fresh session", () => {

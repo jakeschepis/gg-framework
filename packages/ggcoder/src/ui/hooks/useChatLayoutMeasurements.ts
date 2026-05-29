@@ -119,7 +119,10 @@ export function useChatLayoutMeasurements({
     footerFitsOnOneLine,
   });
   const stableControlsRows = controlsHeight > 0 ? controlsHeight : chatControlsLayout.controlsRows;
-  const measuredLiveAreaRows = Math.max(MIN_LIVE_AREA_ROWS, rows - stableControlsRows - 1);
+  // Subtract a 2-row cushion (not 1) so the total live frame stays <= rows - 1
+  // even with rounding from the ResizeObserver-measured controlsHeight, keeping
+  // Ink out of its fullscreen clearTerminal path that snaps the controls upward.
+  const measuredLiveAreaRows = Math.max(MIN_LIVE_AREA_ROWS, rows - stableControlsRows - 2);
 
   return {
     footerStatusLayout,

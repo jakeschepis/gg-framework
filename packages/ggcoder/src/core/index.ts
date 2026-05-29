@@ -10,6 +10,11 @@ export {
   type ContextWindowOptions,
   type ModelInfo,
 } from "./model-registry.js";
+export {
+  getNextThinkingLevel,
+  getSupportedThinkingLevels,
+  isThinkingLevelSupported,
+} from "./thinking-level.js";
 export { AuthStorage, NotLoggedInError } from "./auth-storage.js";
 export { SettingsManager, DEFAULT_SETTINGS, type Settings } from "./settings-manager.js";
 export {

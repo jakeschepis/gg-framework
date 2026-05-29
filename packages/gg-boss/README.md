@@ -60,10 +60,10 @@ A few things make it feel like one conversation instead of N:
 
 Boss and workers run on **different models, on purpose**. Use a strong reasoning model (Opus, GPT-5) up top and a fast cheap model (Sonnet, Haiku) for the workers — or whatever combination fits the work.
 
-Defaults: `claude-opus-4-7` for the boss, `claude-sonnet-4-6` for the workers. Anthropic, OpenAI, GLM, and Moonshot are all supported (anything `ggcoder` supports). Swap mid-session with `/model-boss` and `/model-workers` — your choice persists across restarts.
+Defaults: `claude-opus-4-8` for the boss, `claude-sonnet-4-6` for the workers. Anthropic, OpenAI, GLM, and Moonshot are all supported (anything `ggcoder` supports). Swap mid-session with `/model-boss` and `/model-workers` — your choice persists across restarts.
 
 ```bash
-ggboss --boss-model claude-opus-4-7 --worker-model claude-sonnet-4-6
+ggboss --boss-model claude-opus-4-8 --worker-model claude-sonnet-4-6
 ggboss --project ../api --project ../web   # explicit project list
 ```
 
@@ -74,7 +74,7 @@ ggboss --project ../api --project ../web   # explicit project list
 | Key | What it does |
 |---|---|
 | <kbd>Tab</kbd> | Cycle the project scope pill (All / per-project) on your next message |
-| <kbd>Shift+Tab</kbd> | Toggle the boss's extended thinking |
+| <kbd>Shift+Tab</kbd> | Cycle the boss's thinking level (Anthropic/OpenAI tiers, then off) |
 | <kbd>Esc</kbd> | Interrupt the boss mid-turn (workers keep running) |
 | <kbd>Ctrl+T</kbd> | Open the Tasks pane |
 | <kbd>Ctrl+C</kbd> ×2 | Exit gg-boss |

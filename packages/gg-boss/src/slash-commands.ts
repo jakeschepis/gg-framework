@@ -9,7 +9,11 @@ import type { SlashCommandInfo } from "@kenkaiiii/ggcoder/ui";
  */
 export const BOSS_SLASH_COMMANDS: SlashCommandInfo[] = [
   { name: "help", aliases: ["?"], description: "Show available commands" },
-  { name: "model-boss", aliases: [], description: "Switch the orchestrator's model" },
+  {
+    name: "model-boss",
+    aliases: ["m", "model", "models"],
+    description: "Switch the orchestrator's model",
+  },
   { name: "model-workers", aliases: [], description: "Switch every worker's model" },
   { name: "compact", aliases: [], description: "Compact the boss's context now" },
   { name: "clear", aliases: [], description: "Clear chat history and terminal" },
@@ -55,7 +59,7 @@ export function buildHelpText(): string {
   lines.push("**Global keybindings**");
   lines.push("- `Ctrl+T` — open the Tasks pane");
   lines.push("- `Tab` — switch project scope (All / per-project pill in the input)");
-  lines.push("- `Shift+Tab` — toggle the boss's extended thinking on/off");
+  lines.push("- `Shift+Tab` — cycle the boss's thinking level, then off");
   lines.push("- `Esc` — interrupt the boss while it's running");
   lines.push("- `Ctrl+C` (twice) — exit");
   lines.push("");
@@ -65,7 +69,7 @@ export function buildHelpText(): string {
   lines.push("- `d` — delete the selected task");
   lines.push("- `Esc` — close the Tasks pane");
   lines.push("");
-  lines.push("**Inside model pickers (`/model-boss`, `/model-workers`)**");
+  lines.push("**Inside model pickers (`/model`, `/models`, `/model-boss`, `/model-workers`)**");
   lines.push("- `↑` / `↓` — navigate models");
   lines.push("- `Enter` — select");
   lines.push("- `Esc` — cancel");

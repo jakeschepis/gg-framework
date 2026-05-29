@@ -1,6 +1,6 @@
 {
   "name": "@kenkaiiii/ggcoder",
-  "version": "4.3.221-plan-mode.dev",
+  "version": "4.3.226-plan-mode.dev",
   "type": "module",
   "description": "CLI coding agent with OAuth authentication for Anthropic, OpenAI, and Gemini",
   "license": "MIT",
@@ -40,6 +40,34 @@
     "./ui/hooks/double-press": {
       "import": "./dist/ui/hooks/useDoublePress.js",
       "types": "./dist/ui/hooks/useDoublePress.d.ts"
+    },
+    "./ui/hooks/transcript-history": {
+      "import": "./dist/ui/hooks/useTranscriptHistory.js",
+      "types": "./dist/ui/hooks/useTranscriptHistory.d.ts"
+    },
+    "./ui/transcript/spacing": {
+      "import": "./dist/ui/transcript/spacing.js",
+      "types": "./dist/ui/transcript/spacing.d.ts"
+    },
+    "./ui/transcript/frame": {
+      "import": "./dist/ui/transcript/TranscriptItemFrame.js",
+      "types": "./dist/ui/transcript/TranscriptItemFrame.d.ts"
+    },
+    "./ui/terminal-history": {
+      "import": "./dist/ui/terminal-history.js",
+      "types": "./dist/ui/terminal-history.d.ts"
+    },
+    "./ui/tool-group-summary": {
+      "import": "./dist/ui/tool-group-summary.js",
+      "types": "./dist/ui/tool-group-summary.d.ts"
+    },
+    "./ui/transcript/tool-presentation": {
+      "import": "./dist/ui/transcript/tool-presentation.js",
+      "types": "./dist/ui/transcript/tool-presentation.d.ts"
+    },
+    "./ui/terminal-history-format": {
+      "import": "./dist/ui/terminal-history-format.js",
+      "types": "./dist/ui/terminal-history-format.d.ts"
     },
     "./ui/login": {
       "import": "./dist/ui/login.js",

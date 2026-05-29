@@ -13,6 +13,9 @@ import { loadTheme, ThemeContext } from "./theme/theme.js";
 import { TerminalSizeProvider } from "./hooks/useTerminalSize.js";
 import type { Theme } from "./theme/theme.js";
 import { Text, Box } from "ink";
+import { ChatLivePane } from "./components/ChatLivePane.js";
+import { AssistantMessage } from "./components/AssistantMessage.js";
+import { QueuedRow } from "./transcript/MiscRows.js";
 
 const TERMINAL_COLUMNS = 68;
 const theme = loadTheme("dark");
@@ -65,6 +68,12 @@ function cleanLines(value: string): string[] {
 
 function rawLines(value: string): string[] {
   return stripAnsi(value).replace(/\r/g, "\n").split("\n");
+}
+
+function trimTrailingEmptyLines(lines: string[]): string[] {
+  const next = [...lines];
+  while (next.at(-1) === "") next.pop();
+  return next;
 }
 
 function renderLiveQueuedLines(item: Extract<CompletedItem, { kind: "queued" }>): string[] {
@@ -143,6 +152,67 @@ describe("queued message UI invariants", () => {
     expect(isActiveItem(queuedItem())).toBe(true);
   });
 
+  it("keeps queued lifecycle spacing stable across pending, started, and finalized states", () => {
+    const renderItem = (item: CompletedItem) => {
+      if (item.kind === "queued") return <QueuedRow item={item} />;
+      if (item.kind === "assistant") return <AssistantMessage text={item.text} />;
+      return null;
+    };
+    const pendingRendered = renderToString(
+      <ThemeContext.Provider value={theme}>
+        <TerminalSizeProvider>
+          <ChatLivePane
+            liveItems={[queuedItem({ text: "queued while busy" })]}
+            renderItem={renderItem}
+            isRunning
+            visibleStreamingText="Still answering the current prompt."
+            streamingThinking=""
+            thinkingMs={0}
+            reserveStreamingSpacing={false}
+            renderMarkdown
+            measuredLiveAreaRows={20}
+            assistantMarginTop={1}
+            streamingContinuation={false}
+          />
+        </TerminalSizeProvider>
+      </ThemeContext.Provider>,
+      { columns: TERMINAL_COLUMNS },
+    );
+
+    expect(trimTrailingEmptyLines(rawLines(pendingRendered))).toEqual([
+      " • Queued: queued while busy",
+      "",
+      " ⏺ Still answering the current prompt.",
+    ]);
+
+    let output = "";
+    const stream = {
+      write(chunk: string) {
+        output += chunk;
+        return true;
+      },
+    } as NodeJS.WriteStream;
+
+    createTerminalHistoryPrinter({ stream }).print(
+      [
+        { kind: "user", id: "user-1", text: "queued while busy" },
+        queuedItem({ id: "queued-1", text: "queued while busy" }),
+        { kind: "assistant", id: "assistant-1", text: "Now handling queued prompt." },
+      ],
+      context,
+    );
+
+    const finalizedLines = trimTrailingEmptyLines(rawLines(output));
+    const bottomBorderIndex = finalizedLines.findIndex((line) => line.startsWith("▀"));
+    expect(bottomBorderIndex).toBeGreaterThanOrEqual(0);
+    expect(finalizedLines.slice(bottomBorderIndex, bottomBorderIndex + 4)).toEqual([
+      finalizedLines[bottomBorderIndex]!,
+      " • Queued: queued while busy",
+      "",
+      " ⏺ Now handling queued prompt.",
+    ]);
+  });
+
   it("spaces queued rows like other agent chat rows when printed between agent items", () => {
     let output = "";
     const stream = {
@@ -154,7 +224,7 @@ describe("queued message UI invariants", () => {
 
     createTerminalHistoryPrinter({ stream }).print(
       [
-        { kind: "assistant", id: "assistant-1", text: "First response." },
+        { kind: "user", id: "user-1", text: "next prompt" },
         queuedItem({ id: "queued-1", text: "next prompt" }),
         { kind: "assistant", id: "assistant-2", text: "Second response." },
       ],
@@ -162,9 +232,14 @@ describe("queued message UI invariants", () => {
     );
 
     const rendered = stripAnsi(output);
-    expect(rendered).toContain(" • Queued: next prompt");
-    expect(rendered).toContain(
-      " ⏺ First response.\n\n • Queued: next prompt\n\n ⏺ Second response.",
-    );
+    const lines = trimTrailingEmptyLines(rawLines(rendered));
+    const bottomBorderIndex = lines.findIndex((line) => line.startsWith("▀"));
+    expect(bottomBorderIndex).toBeGreaterThanOrEqual(0);
+    expect(lines.slice(bottomBorderIndex, bottomBorderIndex + 4)).toEqual([
+      lines[bottomBorderIndex]!,
+      " • Queued: next prompt",
+      "",
+      " ⏺ Second response.",
+    ]);
   });
 });

@@ -23,13 +23,13 @@ import {
   presentInfo,
   presentModelTransition,
   presentPlanEvent,
-  presentPlanTransition,
   presentStopped,
   presentTask,
   presentThemeTransition,
 } from "./presentation.js";
 import { StatusRow } from "./StatusRow.js";
 import { SessionSummaryDisplay } from "../components/SessionSummary.js";
+import { PlanModeLogo } from "../components/PlanModeLogo.js";
 import {
   ServerToolDoneRow,
   ServerToolStartRow,
@@ -113,7 +113,17 @@ export function renderTranscriptItem({
       return withTranscriptSpacing(<StylePackRow item={item} />);
     case "setup_hint":
       return withTranscriptSpacing(<SetupHintRow item={item} />);
-    case "assistant":
+    case "assistant": {
+      // Reserve the rows that render OUTSIDE the markdown body so the whole
+      // finalized assistant frame stays within `measuredLiveAreaRows`:
+      //   1. the transcript top-spacing margin (`transcriptMarginTop`), and
+      //   2. the collapsed thinking header (header line + `marginBottom:1`).
+      // Keep THINKING_HEADER_ROWS in sync with ThinkingBlock's collapsed layout.
+      const THINKING_HEADER_ROWS = 2;
+      const assistantLiveBudget = Math.max(
+        1,
+        measuredLiveAreaRows - transcriptMarginTop - (item.thinking ? THINKING_HEADER_ROWS : 0),
+      );
       return withTranscriptSpacing(
         <AssistantMessage
           key={item.id}
@@ -121,9 +131,10 @@ export function renderTranscriptItem({
           thinking={item.thinking}
           thinkingMs={item.thinkingMs}
           renderMarkdown={renderMarkdown}
-          availableTerminalHeight={measuredLiveAreaRows}
+          availableTerminalHeight={assistantLiveBudget}
         />,
       );
+    }
     case "tool_start":
       return withTranscriptSpacing(<ToolStartRow item={item} />);
     case "tool_done":
@@ -141,9 +152,8 @@ export function renderTranscriptItem({
     case "update_notice":
       return withTranscriptSpacing(<UpdateNoticeRow item={item} />);
     case "plan_transition":
-      return withTranscriptSpacing(
-        <StatusRow id={item.id} presentation={presentPlanTransition(item)} />,
-      );
+      if (item.active) return withTranscriptSpacing(<PlanModeLogo key={item.id} />);
+      return null;
     case "goal_agent_transition":
       return withTranscriptSpacing(
         <StatusRow id={item.id} presentation={presentGoalAgentTransition(item)} />,

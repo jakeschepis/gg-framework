@@ -1,5 +1,12 @@
 import type { CompletedItem } from "../app-items.js";
 
+export interface TranscriptSpacingItem {
+  id: string;
+  kind: string;
+  text?: string;
+  tools?: unknown;
+}
+
 export const TRANSCRIPT_SPACING_KINDS = [
   "user",
   "assistant",
@@ -30,25 +37,57 @@ export const TRANSCRIPT_SPACING_KINDS = [
   "setup_hint",
 ] as const satisfies readonly CompletedItem["kind"][];
 
-const TRANSCRIPT_SPACING_KIND_SET = new Set<CompletedItem["kind"]>(TRANSCRIPT_SPACING_KINDS);
+export const DEFAULT_TRANSCRIPT_SPACING_KINDS = TRANSCRIPT_SPACING_KINDS;
 
-const LIVE_ASSISTANT_BOUNDARY_KINDS = new Set<CompletedItem["kind"]>([
-  "goal_progress",
-  "tool_start",
-  "tool_done",
-  "tool_group",
-  "server_tool_start",
-  "server_tool_done",
-  "subagent_group",
-  "plan_transition",
-  "goal_agent_transition",
+const TRANSCRIPT_SPACING_KIND_SET = new Set<string>(TRANSCRIPT_SPACING_KINDS);
+
+const COMPACT_TRANSCRIPT_BOUNDARIES = new Set<string>([
+  "user→assistant",
+  "assistant→user",
+  "user→queued",
+  "assistant→assistant",
 ]);
 
-export function isTranscriptSpacingKind(kind: CompletedItem["kind"]): boolean {
+export function shouldSeparateTranscriptItems({
+  previousKind,
+  currentKind,
+  spacingKinds,
+  compactBoundaries,
+}: {
+  previousKind?: string;
+  currentKind: string;
+  spacingKinds?: ReadonlySet<string>;
+  compactBoundaries?: ReadonlySet<string>;
+}): boolean {
+  return shouldSeparateTranscriptItemKinds({
+    previousKind,
+    currentKind,
+    spacingKinds,
+    compactBoundaries,
+  });
+}
+
+export function shouldSeparateTranscriptItemKinds({
+  previousKind,
+  currentKind,
+  spacingKinds = TRANSCRIPT_SPACING_KIND_SET,
+  compactBoundaries = COMPACT_TRANSCRIPT_BOUNDARIES,
+}: {
+  previousKind?: string;
+  currentKind: string;
+  spacingKinds?: ReadonlySet<string>;
+  compactBoundaries?: ReadonlySet<string>;
+}): boolean {
+  if (previousKind === undefined) return false;
+  if (!spacingKinds.has(previousKind) || !spacingKinds.has(currentKind)) return false;
+  return !compactBoundaries.has(`${previousKind}→${currentKind}`);
+}
+
+export function isTranscriptSpacingKind(kind: string): boolean {
   return TRANSCRIPT_SPACING_KIND_SET.has(kind);
 }
 
-export function isTranscriptSpacingItem(item: CompletedItem): boolean {
+export function isTranscriptSpacingItem(item: TranscriptSpacingItem): boolean {
   return isTranscriptSpacingKind(item.kind);
 }
 
@@ -57,16 +96,24 @@ export function shouldTopSpaceAfterPrintedTranscriptBoundary({
   previousLiveItem,
   lastPendingHistoryItem,
   lastHistoryItem,
+  spacingKinds,
+  compactBoundaries,
 }: {
-  currentKind: CompletedItem["kind"];
-  previousLiveItem?: CompletedItem;
-  lastPendingHistoryItem?: CompletedItem;
-  lastHistoryItem?: CompletedItem;
+  currentKind: string;
+  previousLiveItem?: TranscriptSpacingItem;
+  lastPendingHistoryItem?: TranscriptSpacingItem;
+  lastHistoryItem?: TranscriptSpacingItem;
+  spacingKinds?: ReadonlySet<string>;
+  compactBoundaries?: ReadonlySet<string>;
 }): boolean {
-  if (!isTranscriptSpacingKind(currentKind)) return false;
   if (previousLiveItem !== undefined) return false;
   const previousKind = lastPendingHistoryItem?.kind ?? lastHistoryItem?.kind;
-  return previousKind !== undefined && isTranscriptSpacingKind(previousKind);
+  return shouldSeparateTranscriptItems({
+    previousKind,
+    currentKind,
+    spacingKinds,
+    compactBoundaries,
+  });
 }
 
 export function shouldTopSpaceAssistantAfterToolBoundary({
@@ -74,25 +121,25 @@ export function shouldTopSpaceAssistantAfterToolBoundary({
   previousLiveItem,
   lastPendingHistoryItem,
   lastHistoryItem,
+  spacingKinds,
+  compactBoundaries,
 }: {
   text: string;
-  previousLiveItem?: CompletedItem;
-  lastPendingHistoryItem?: CompletedItem;
-  lastHistoryItem?: CompletedItem;
+  previousLiveItem?: TranscriptSpacingItem;
+  lastPendingHistoryItem?: TranscriptSpacingItem;
+  lastHistoryItem?: TranscriptSpacingItem;
+  spacingKinds?: ReadonlySet<string>;
+  compactBoundaries?: ReadonlySet<string>;
 }): boolean {
   if (text.trim().length === 0) return false;
-  if (
-    shouldTopSpaceAfterPrintedTranscriptBoundary({
-      currentKind: "assistant",
-      previousLiveItem,
-      lastPendingHistoryItem,
-      lastHistoryItem,
-    })
-  ) {
-    return true;
-  }
-  const previousKind = previousLiveItem?.kind;
-  return previousKind !== undefined && LIVE_ASSISTANT_BOUNDARY_KINDS.has(previousKind);
+  const previousKind =
+    previousLiveItem?.kind ?? lastPendingHistoryItem?.kind ?? lastHistoryItem?.kind;
+  return shouldSeparateTranscriptItems({
+    previousKind,
+    currentKind: "assistant",
+    spacingKinds,
+    compactBoundaries,
+  });
 }
 
 export function getTranscriptItemMarginTop({
@@ -100,23 +147,39 @@ export function getTranscriptItemMarginTop({
   previousLiveItem,
   lastPendingHistoryItem,
   lastHistoryItem,
+  spacingKinds,
+  compactBoundaries,
 }: {
-  item: CompletedItem;
-  previousLiveItem?: CompletedItem;
-  lastPendingHistoryItem?: CompletedItem;
-  lastHistoryItem?: CompletedItem;
+  item: TranscriptSpacingItem;
+  previousLiveItem?: TranscriptSpacingItem;
+  lastPendingHistoryItem?: TranscriptSpacingItem;
+  lastHistoryItem?: TranscriptSpacingItem;
+  spacingKinds?: ReadonlySet<string>;
+  compactBoundaries?: ReadonlySet<string>;
 }): number {
+  const previousKind =
+    previousLiveItem?.kind ?? lastPendingHistoryItem?.kind ?? lastHistoryItem?.kind;
   if (item.kind === "assistant") {
     return shouldTopSpaceAssistantAfterToolBoundary({
-      text: item.text,
+      text: typeof item.text === "string" ? item.text : "",
       previousLiveItem,
       lastPendingHistoryItem,
       lastHistoryItem,
+      spacingKinds,
+      compactBoundaries,
     })
       ? 1
       : 0;
   }
-  return isTranscriptSpacingItem(item) ? 1 : 0;
+  if (item.kind === "plan_transition") return 0;
+  return shouldSeparateTranscriptItems({
+    previousKind,
+    currentKind: item.kind,
+    spacingKinds,
+    compactBoundaries,
+  })
+    ? 1
+    : 0;
 }
 
 export function shouldTopSpaceStreamingAssistant({
@@ -124,16 +187,22 @@ export function shouldTopSpaceStreamingAssistant({
   lastLiveItem,
   lastPendingHistoryItem,
   lastHistoryItem,
+  spacingKinds,
+  compactBoundaries,
 }: {
   visibleStreamingText: string;
-  lastLiveItem?: CompletedItem;
-  lastPendingHistoryItem?: CompletedItem;
-  lastHistoryItem?: CompletedItem;
+  lastLiveItem?: TranscriptSpacingItem;
+  lastPendingHistoryItem?: TranscriptSpacingItem;
+  lastHistoryItem?: TranscriptSpacingItem;
+  spacingKinds?: ReadonlySet<string>;
+  compactBoundaries?: ReadonlySet<string>;
 }): boolean {
   return shouldTopSpaceAssistantAfterToolBoundary({
     text: visibleStreamingText,
     previousLiveItem: lastLiveItem,
     lastPendingHistoryItem,
     lastHistoryItem,
+    spacingKinds,
+    compactBoundaries,
   });
 }

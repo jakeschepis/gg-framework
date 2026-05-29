@@ -23,11 +23,17 @@ export const ROUND_BORDER = {
 
 export function formatHistoryWrite(
   output: string,
-  options: { leadingSeparator: boolean; trailingBlankLine: boolean; trailingNewlines?: number },
+  options: {
+    leadingSeparator: boolean;
+    trailingBlankLine: boolean;
+    trailingNewlines?: number;
+    leadingNewlines?: number;
+  },
 ): string {
   const trimmed = output.replace(/\n+$/u, "");
   if (trimmed.length === 0) return "";
-  const leading = options.leadingSeparator ? "\n" : "";
+  const leadingCount = options.leadingNewlines ?? (options.leadingSeparator ? 1 : 0);
+  const leading = "\n".repeat(leadingCount);
   const trailingCount = options.trailingNewlines ?? (options.trailingBlankLine ? 2 : 1);
   const trailing = "\n".repeat(trailingCount);
   return `${leading}${trimmed}${trailing}`;

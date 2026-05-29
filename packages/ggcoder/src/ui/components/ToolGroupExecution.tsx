@@ -2,9 +2,13 @@ import React, { useMemo } from "react";
 import { Text, Box } from "ink";
 import { ToolUseLoader } from "./ToolUseLoader.js";
 import { Spinner } from "./Spinner.js";
-import type { ToolGroupItem } from "../App.js";
+import type { ToolGroupItem } from "../app-items.js";
 import { useTheme } from "../theme/theme.js";
-import { buildToolGroupSummary, type SummarySegment } from "../tool-group-summary.js";
+import {
+  buildToolGroupSummary,
+  type GroupRenderer,
+  type SummarySegment,
+} from "../tool-group-summary.js";
 import { toolTonePalette } from "../transcript/tool-presentation.js";
 
 type ToolGroupTool = ToolGroupItem["tools"][number];
@@ -32,16 +36,25 @@ function SummaryText({ segments, color }: { segments: SummarySegment[]; color: s
 interface ToolGroupExecutionProps {
   tools: ToolGroupTool[];
   marginTop?: number;
+  /** Domain-specific group summary renderers, merged over the built-ins. */
+  summaryRenderers?: Record<string, GroupRenderer>;
 }
 
-export function ToolGroupExecution({ tools, marginTop = 0 }: ToolGroupExecutionProps) {
+export function ToolGroupExecution({
+  tools,
+  marginTop = 0,
+  summaryRenderers,
+}: ToolGroupExecutionProps) {
   const theme = useTheme();
   const allDone = tools.every((t) => t.status === "done");
   const hasError = tools.some((t) => t.isError);
   const status = allDone ? (hasError ? "error" : "done") : "running";
   const staticDisplay = status !== "running";
 
-  const segments = useMemo(() => buildToolGroupSummary(tools, allDone), [tools, allDone]);
+  const segments = useMemo(
+    () => buildToolGroupSummary(tools, allDone, summaryRenderers),
+    [tools, allDone, summaryRenderers],
+  );
   const labelColor =
     status === "error" ? theme.error : status === "done" ? theme.success : theme.toolName;
 

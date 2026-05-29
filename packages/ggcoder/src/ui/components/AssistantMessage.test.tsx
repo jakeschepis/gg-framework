@@ -51,10 +51,12 @@ const MIXED_MARKDOWN_TEXT =
   LONG_TABLE_TEXT +
   "\n\n```ts\nconst answer = 42;\nconsole.log(answer);\n```";
 
+function rawLinesOf(text: string): string[] {
+  return stripAnsi(text).split("\n");
+}
+
 function linesOf(text: string): string[] {
-  return stripAnsi(text)
-    .split("\n")
-    .filter((line) => line.length > 0);
+  return rawLinesOf(text).filter((line) => line.length > 0);
 }
 
 function renderWithTerminal(element: React.ReactElement): string[] {
@@ -78,20 +80,22 @@ function renderAssistantFrame(streaming: boolean, text = LONG_STREAMING_TEXT): s
   return renderWithTerminal(<AssistantMessage text={text} streaming={streaming} />);
 }
 
-function renderTerminalHistoryAssistantFrame(text = LONG_STREAMING_TEXT): string[] {
-  return linesOf(
-    serializeCompletedItemToTerminalHistory(
-      { kind: "assistant", text, id: "assistant-1" },
-      {
-        theme: loadTheme("dark"),
-        columns: TERMINAL_COLUMNS,
-        version: "test",
-        model: "test-model",
-        provider: "anthropic",
-        cwd: "/tmp/test",
-      },
-    ),
+function renderTerminalHistoryAssistantText(text = LONG_STREAMING_TEXT): string {
+  return serializeCompletedItemToTerminalHistory(
+    { kind: "assistant", text, id: "assistant-1" },
+    {
+      theme: loadTheme("dark"),
+      columns: TERMINAL_COLUMNS,
+      version: "test",
+      model: "test-model",
+      provider: "anthropic",
+      cwd: "/tmp/test",
+    },
   );
+}
+
+function renderTerminalHistoryAssistantFrame(text = LONG_STREAMING_TEXT): string[] {
+  return linesOf(renderTerminalHistoryAssistantText(text));
 }
 
 async function renderInteractiveStreamingFrame(): Promise<string[]> {
@@ -308,6 +312,7 @@ describe("AssistantMessage live layout", () => {
       MIXED_MARKDOWN_TEXT,
       "Inline **bold**, *italic*, ~~strike~~, <u>under</u>, [docs](https://example.com), and `code`.",
       "## List check\n- alpha **one**\n- beta `two`\n1. first\n2. second",
+      "Dr. Jones reviewed it.\n--\nThe next paragraph renders below a divider.",
       "```ts\nconst answer = 42;\nconsole.log(answer);\n```",
     ];
 
@@ -322,6 +327,37 @@ describe("AssistantMessage live layout", () => {
         expect(stringWidth(line), `${text}\n${line}`).toBeLessThanOrEqual(TERMINAL_COLUMNS);
       }
     }
+  });
+
+  it("keeps title abbreviations with the following name", () => {
+    const streamingLines = renderAssistantFrame(true, "Dr. Jones reviewed it.");
+    const historyLines = renderTerminalHistoryAssistantFrame("Dr. Jones reviewed it.");
+
+    expect(streamingLines).toContain(" ⏺ Dr. Jones reviewed it.");
+    expect(historyLines).toEqual(streamingLines);
+  });
+
+  it("preserves assistant paragraph breaks exactly in terminal history", () => {
+    const text = "First paragraph.\n\nSecond paragraph.\n\nThird paragraph.";
+    const historyLines = rawLinesOf(renderTerminalHistoryAssistantText(text));
+
+    expect(historyLines).toEqual([
+      " ⏺ First paragraph.",
+      "",
+      "   Second paragraph.",
+      "",
+      "   Third paragraph.",
+    ]);
+  });
+
+  it("renders double-hyphen markdown dividers across live and history output", () => {
+    const streamingLines = renderAssistantFrame(true, "before\n--\nafter");
+    const historyLines = renderTerminalHistoryAssistantFrame("before\n--\nafter");
+    const dividerLine = streamingLines.find((line) => line.includes("─"));
+
+    expect(dividerLine).toBeDefined();
+    expect(dividerLine).not.toContain("--");
+    expect(historyLines).toEqual(streamingLines);
   });
 
   it("keeps every streaming physical line within the terminal width", () => {

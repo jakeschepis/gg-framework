@@ -1,6 +1,7 @@
 import React, { useState, useMemo } from "react";
 import { Box, Text, useInput } from "ink";
 import { useTheme } from "../theme/theme.js";
+import { stripTerminalFocusSequences } from "../utils/terminal-input.js";
 
 interface SelectListItem {
   label: string;
@@ -38,6 +39,10 @@ export function SelectList({
   }, [items, filter]);
 
   useInput((input, key) => {
+    const inputWithoutFocusReports = stripTerminalFocusSequences(input);
+    if (!inputWithoutFocusReports && input) return;
+    input = inputWithoutFocusReports;
+
     if (key.escape) {
       onCancel();
       return;

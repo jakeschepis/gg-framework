@@ -8,6 +8,13 @@ interface ChatLayoutProps {
 
 interface ChatLiveAreaProps {
   children: React.ReactNode;
+  /**
+   * When set, hard-cap the live area to this many rows, anchoring content to
+   * the bottom (newest visible) and clipping the overflow at the top. Leave
+   * undefined so the area stays compact (sized to its content) when it fits —
+   * a fixed height would otherwise reserve blank rows above short output.
+   */
+  clampRows?: number;
 }
 
 interface ChatControlsProps {
@@ -28,9 +35,17 @@ export function ChatLayout({ columns, children }: ChatLayoutProps) {
   );
 }
 
-export function ChatLiveArea({ children }: ChatLiveAreaProps) {
+export function ChatLiveArea({ children, clampRows }: ChatLiveAreaProps) {
   return (
-    <Box flexDirection="column" flexGrow={0} flexShrink={1} overflowY="hidden">
+    <Box
+      flexDirection="column"
+      flexGrow={0}
+      flexShrink={1}
+      overflowY="hidden"
+      {...(clampRows !== undefined
+        ? { height: clampRows, justifyContent: "flex-end" as const }
+        : {})}
+    >
       {children}
     </Box>
   );

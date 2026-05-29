@@ -1,4 +1,6 @@
 import React from "react";
+import { useTerminalSize } from "../hooks/useTerminalSize.js";
+import { getLiveAreaClampRows } from "../live-area-height.js";
 import type { CompletedItem } from "../app-items.js";
 import { ChatLiveArea } from "./ChatLayout.js";
 import { StreamingArea } from "./StreamingArea.js";
@@ -30,9 +32,23 @@ export function ChatLivePane({
   assistantMarginTop,
   streamingContinuation,
 }: ChatLivePaneProps) {
+  const { columns } = useTerminalSize();
+  // Bound the WHOLE live area, not just each item: individual assistant blocks
+  // truncate to the budget, but multiple stacked blocks (accumulated turns,
+  // pinned text + streaming) can still sum past the terminal height. When that
+  // happens, clamp the area so Ink's rendered frame stays below the terminal
+  // height and never trips its fullscreen redraw (the "jump to top").
+  const clampRows = getLiveAreaClampRows({
+    liveItems,
+    streamingText: visibleStreamingText,
+    columns,
+    liveAreaBudget: measuredLiveAreaRows,
+  });
   return (
-    <ChatLiveArea>
-      {liveItems.map((item, index, items) => renderItem(item, index, items))}
+    <ChatLiveArea clampRows={clampRows}>
+      {liveItems.map((item, index, items) => (
+        <React.Fragment key={item.id}>{renderItem(item, index, items)}</React.Fragment>
+      ))}
       <StreamingArea
         isRunning={isRunning}
         streamingText={visibleStreamingText}
