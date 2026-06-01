@@ -15,6 +15,7 @@ export interface AppPaths {
   authFile: string;
   telegramFile: string;
   agentHomeFile: string;
+  mcpFile: string;
   logFile: string;
   skillsDir: string;
   extensionsDir: string;
@@ -30,6 +31,7 @@ export function getAppPaths(): AppPaths {
     authFile: path.join(agentDir, "auth.json"),
     telegramFile: path.join(agentDir, "telegram.json"),
     agentHomeFile: path.join(agentDir, "agent-home.json"),
+    mcpFile: path.join(agentDir, "mcp.json"),
     logFile: path.join(agentDir, "debug.log"),
     skillsDir: path.join(agentDir, "skills"),
     extensionsDir: path.join(agentDir, "extensions"),
@@ -55,6 +57,7 @@ export interface SavedSettings {
   thinkingEnabled: boolean;
   thinkingLevel?: ThinkingLevel;
   theme: "auto" | ThemeName;
+  idealReviewEnabled: boolean;
 }
 
 const VALID_PROVIDERS = new Set<Provider>([
@@ -76,7 +79,11 @@ function isValidProvider(value: unknown): value is Provider {
 /** Load saved settings from the settings file. Returns defaults on missing/invalid file. */
 export function loadSavedSettings(settingsFilePath?: string): SavedSettings {
   const filePath = settingsFilePath ?? getAppPaths().settingsFile;
-  const result: SavedSettings = { thinkingEnabled: false, theme: "auto" };
+  const result: SavedSettings = {
+    thinkingEnabled: false,
+    theme: "auto",
+    idealReviewEnabled: true,
+  };
   try {
     const raw = JSON.parse(fsSync.readFileSync(filePath, "utf-8"));
     // Only accept providers the current build actually supports. A stale
@@ -91,6 +98,7 @@ export function loadSavedSettings(settingsFilePath?: string): SavedSettings {
     if (raw.thinkingEnabled === true) result.thinkingEnabled = true;
     if (isValidThinkingLevel(raw.thinkingLevel)) result.thinkingLevel = raw.thinkingLevel;
     if (typeof raw.theme === "string" && isValidThemeSetting(raw.theme)) result.theme = raw.theme;
+    if (raw.idealReviewEnabled === false) result.idealReviewEnabled = false;
   } catch {
     // No settings file or invalid JSON — use defaults
   }

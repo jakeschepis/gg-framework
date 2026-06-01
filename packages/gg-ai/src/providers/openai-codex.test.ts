@@ -228,6 +228,105 @@ describe("streamOpenAICodex", () => {
     });
   });
 
+  it("maps a ChatGPT usage-limit 429 to a usage-limit error with reset time", async () => {
+    const resetsAt = Math.floor(Date.now() / 1000) + 7200;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                type: "usage_limit_reached",
+                message: "You've hit your usage limit.",
+                plan_type: "plus",
+                resets_at: resetsAt,
+              },
+            }),
+            {
+              status: 429,
+              headers: { "content-type": "application/json", "x-request-id": "req_usage" },
+            },
+          ),
+      ),
+    );
+
+    const result = streamOpenAICodex({
+      provider: "openai",
+      model: "gpt-5.5",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "token",
+      accountId: "acct",
+    });
+
+    await expect(result.response).rejects.toMatchObject({
+      provider: "openai",
+      statusCode: 429,
+      message: "ChatGPT usage limit reached",
+      resetsAt,
+    });
+  });
+
+  it("reads the usage reset time from a nested rate_limits snapshot", async () => {
+    const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(
+            JSON.stringify({
+              error: {
+                type: "rate_limit_exceeded",
+                message: "Rate limit reached.",
+                rate_limits: { primary: { resets_at: resetsAt } },
+              },
+            }),
+            { status: 429, headers: { "content-type": "application/json" } },
+          ),
+      ),
+    );
+
+    const result = streamOpenAICodex({
+      provider: "openai",
+      model: "gpt-5.5",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "token",
+      accountId: "acct",
+    });
+
+    await expect(result.response).rejects.toMatchObject({
+      message: "ChatGPT usage limit reached",
+      statusCode: 429,
+      resetsAt,
+    });
+  });
+
+  it("leaves a bare transient 429 (no reset info) as a retriable error", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(
+        async () =>
+          new Response(JSON.stringify({ error: { message: "Too Many Requests" } }), {
+            status: 429,
+            headers: { "content-type": "application/json" },
+          }),
+      ),
+    );
+
+    const result = streamOpenAICodex({
+      provider: "openai",
+      model: "gpt-5.5",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "token",
+      accountId: "acct",
+    });
+
+    await expect(result.response).rejects.toMatchObject({
+      message: "Too Many Requests",
+      statusCode: 429,
+    });
+  });
+
   it("requests no reasoning and suppresses reasoning events when thinking is off", async () => {
     vi.stubGlobal(
       "fetch",

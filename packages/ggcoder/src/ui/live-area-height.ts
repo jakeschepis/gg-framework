@@ -1,5 +1,6 @@
 import stringWidth from "string-width";
 import type { CompletedItem } from "./app-items.js";
+import { isPanelReplacedToolItem } from "./app-items.js";
 
 /**
  * Width the assistant/streaming markdown body wraps to, mirroring
@@ -56,7 +57,13 @@ export function estimateLiveAreaRows({
       const textRows = item.text.trim().length > 0 ? estimateWrappedRows(item.text, columns) : 0;
       const thinkingRows = item.thinking ? THINKING_HEADER_ROWS : 0;
       rows += Math.min(textRows, perItemBudget) + thinkingRows + BLOCK_OVERHEAD_ROWS;
-    } else if (item.kind === "tombstone" || item.kind === "banner") {
+    } else if (
+      item.kind === "tombstone" ||
+      item.kind === "banner" ||
+      isPanelReplacedToolItem(item)
+    ) {
+      // Tool rows render in the pinned LiveToolPanel, not the live area — they
+      // contribute zero rows here.
       continue;
     } else {
       rows += NON_TEXT_ROW_ESTIMATE;

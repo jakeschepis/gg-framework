@@ -4,13 +4,19 @@ import wrapAnsi from "wrap-ansi";
 import type { Provider } from "@kenkaiiii/gg-ai";
 import { getModel } from "../core/model-registry.js";
 import type { CompletedItem } from "./App.js";
+import { isPanelReplacedToolItem } from "./app-items.js";
 import type { PasteInfo } from "./components/InputArea.js";
 import { BLACK_CIRCLE, RETURN_SYMBOL } from "./constants/figures.js";
 import { SPINNER_FRAMES } from "./spinner-frames.js";
 import type { Theme } from "./theme/theme.js";
 import { getUserMessageDisplayParts } from "./utils/user-message-display.js";
 import { buildToolGroupSummary } from "./tool-group-summary.js";
+import path from "node:path";
+import { pathToFileURL } from "node:url";
 import { renderMarkdownToAnsiLines } from "./utils/markdown-renderer.js";
+import { detectGraphicsProtocol, encodeInlineImage } from "./utils/terminal-graphics.js";
+import { createHyperlink } from "./utils/hyperlink.js";
+import { supportsHyperlinks } from "./utils/supports-hyperlinks.js";
 import { shouldSeparateTranscriptItems } from "./transcript/spacing.js";
 import {
   MAX_OUTPUT_LINES,
@@ -37,7 +43,6 @@ import {
   renderCompacted,
   renderCompacting,
   renderError,
-  renderGoal,
   renderSetupHint,
   renderStatusLine,
   renderStepDone,
@@ -46,7 +51,6 @@ import {
 } from "./terminal-history-status-renderers.js";
 import {
   presentDuration,
-  presentGoalAgentTransition,
   presentInfo,
   presentModelTransition,
   presentPlanEvent,
@@ -91,7 +95,7 @@ const GAP = "   ";
 const LOGO_WIDTH = 9;
 const SIDE_BY_SIDE_MIN = LOGO_WIDTH + GAP.length + 62;
 const COMPACT_TOOLS = new Set(["read", "grep", "find", "ls", "source_path"]);
-const STATE_TOOLS = new Set(["tasks", "goals"]);
+const STATE_TOOLS = new Set(["tasks"]);
 const SERVER_STYLE_TOOLS = new Set(["web_search"]);
 
 export interface TerminalHistoryPrinter {
@@ -118,17 +122,50 @@ export interface TerminalHistoryContext {
   cwd: string;
 }
 
+// How many recent assistant fingerprints to remember for retry de-dup. A
+// stream retry re-emits the SAME leading paragraphs it just flushed, always
+// adjacent in print order — so a small recency window catches retries while
+// still allowing a genuinely repeated short phrase (e.g. "Done.") to reappear
+// many turns later.
+const ASSISTANT_FINGERPRINT_WINDOW = 16;
+
 export function createTerminalHistoryPrinter({
   stream = process.stdout,
 }: TerminalHistoryPrinterOptions = {}): TerminalHistoryPrinter {
   const printed = new Set<string>();
+  // Ordered ring of recently printed assistant text fingerprints. The printer
+  // dedupes by item id, but progressive mid-stream flushing assigns a FRESH id
+  // to each flushed paragraph. On a stream stall/overload the agent loop emits
+  // a `retry`, the provider re-streams from scratch, and those same paragraphs
+  // get re-flushed under new ids — so id-dedup alone lets the identical text
+  // print again (N retries => N+1 stacked copies). Fingerprinting the content
+  // suppresses those re-emissions regardless of id.
+  const recentAssistantFingerprints: string[] = [];
   let previousPrintedKind: CompletedItem["kind"] | null = null;
+
+  const fingerprintOf = (item: CompletedItem): string | null => {
+    if (item.kind !== "assistant") return null;
+    const normalized = item.text.replace(/\s+/g, " ").trim();
+    return normalized.length > 0 ? normalized : null;
+  };
 
   return {
     print(items, context, options) {
       const writeOutput = options?.write ?? ((data: string) => void stream.write(data));
       for (const item of items) {
         if (!options?.force && printed.has(item.id)) continue;
+        // Tool activity is shown live in the pinned LiveToolPanel, not the
+        // scrollback transcript. Skip without touching spacing state so the
+        // surrounding non-tool rows keep their separators.
+        if (isPanelReplacedToolItem(item)) continue;
+        // Retry-driven duplicate: identical assistant text re-flushed under a
+        // new id after a stream restart. Mark the id printed so a later flush of
+        // the same item is a cheap id hit, then skip without writing.
+        const fingerprint = options?.force ? null : fingerprintOf(item);
+        if (fingerprint !== null && recentAssistantFingerprints.includes(fingerprint)) {
+          printed.add(item.id);
+          continue;
+        }
         const output = serializeCompletedItemToTerminalHistory(item, context);
         const endsWithBlankLine = item.kind === "banner";
         // A continuation assistant chunk is the next paragraph of a response
@@ -154,16 +191,53 @@ export function createTerminalHistoryPrinter({
         });
         if (formatted.length === 0) continue;
         printed.add(item.id);
+        if (fingerprint !== null) {
+          recentAssistantFingerprints.push(fingerprint);
+          if (recentAssistantFingerprints.length > ASSISTANT_FINGERPRINT_WINDOW) {
+            recentAssistantFingerprints.shift();
+          }
+        }
         writeOutput(formatted);
+        // Inline image previews render in the Static scrollback region (straight
+        // to the stream, above Ink's live frame). Only emit graphics escapes on
+        // terminals that support them; everything else keeps the text-only line.
+        const previews =
+          (item.kind === "tool_done" || item.kind === "user") && item.imagePreviews
+            ? item.imagePreviews
+            : undefined;
+        if (previews && previews.length > 0) {
+          const protocol = detectGraphicsProtocol();
+          // Indent the image to the message text column (after the `⏺ ` dot),
+          // matching assistant/tool label alignment. Graphics protocols anchor
+          // the image at the cursor column, so leading spaces shift it right.
+          const imageLeftPad = "   ";
+          const canLink = supportsHyperlinks();
+          for (const preview of previews) {
+            if (protocol !== "none") {
+              writeOutput(`\n${imageLeftPad}${encodeInlineImage(preview.base64, protocol)}\n`);
+            }
+            // Clickable "open" affordance — Cmd/Ctrl-click opens the file in the
+            // OS default viewer. The pixels themselves aren't clickable, so the
+            // path is the open handle.
+            if (preview.path && canLink) {
+              const fileUrl = pathToFileURL(preview.path).href;
+              const linkLabel = `↗ ${path.basename(preview.path)}`;
+              const lead = protocol === "none" ? "\n" : "";
+              writeOutput(`${lead}${imageLeftPad}${createHyperlink(fileUrl, linkLabel)}\n`);
+            }
+          }
+        }
         previousPrintedKind = item.kind;
       }
     },
     clear() {
       printed.clear();
+      recentAssistantFingerprints.length = 0;
       previousPrintedKind = null;
     },
     resetPrinted() {
       printed.clear();
+      recentAssistantFingerprints.length = 0;
       previousPrintedKind = null;
     },
     get printedIds() {
@@ -185,6 +259,8 @@ export function serializeCompletedItemToTerminalHistory(
       return renderQueued(item.text, item.imageCount, context);
     case "assistant":
       return renderAssistant(item.text, context, item.continuation);
+    case "ideal_hook":
+      return renderIdealHook(item.text, context);
     case "tool_start":
       if (item.name === "enter_plan") return "";
       return renderToolStart(item.name, item.args, item.progressOutput, context);
@@ -206,8 +282,6 @@ export function serializeCompletedItemToTerminalHistory(
       return renderServerToolDone(item.name, item.input, item.resultType, item.durationMs, context);
     case "subagent_group":
       return renderSubAgentGroup(item.agents, item.aborted, context);
-    case "goal":
-      return renderGoal(item.title, item.workerId, context);
     case "task": {
       const presentation = presentTask(item);
       return renderStatusLine(
@@ -219,8 +293,6 @@ export function serializeCompletedItemToTerminalHistory(
         true,
       );
     }
-    case "goal_progress":
-      return renderGoalProgress(item, context);
     case "error":
       return renderError(item.headline, item.message, item.guidance, context);
     case "info": {
@@ -260,16 +332,6 @@ export function serializeCompletedItemToTerminalHistory(
       return renderSessionSummary(item.summary, context);
     case "plan_transition":
       return renderPlanModeLogo(context);
-    case "goal_agent_transition": {
-      const presentation = presentGoalAgentTransition(item);
-      return renderStatusLine(
-        presentation.glyph.trim(),
-        presentation.text,
-        context,
-        context.theme.commandColor,
-        presentation.bold,
-      );
-    }
     case "model_transition": {
       const presentation = presentModelTransition(item);
       return renderStatusLine(
@@ -369,7 +431,7 @@ function renderBanner(context: TerminalHistoryContext): string {
     home && context.cwd.startsWith(home) ? `~${context.cwd.slice(home.length)}` : context.cwd;
   const logo = LOGO_LINES.map((lineText) => gradientLine(lineText, GRADIENT));
 
-  const shortcuts = `${color(context.theme.primary, "/goal")} ${dim(context, "start goal · ")}${color(context.theme.primary, "Ctrl+T")} ${dim(context, "tasks · ")}${color(context.theme.primary, "Shift+Tab")} ${dim(context, "toggle thinking")}`;
+  const shortcuts = `${color(context.theme.primary, "Ctrl+T")} ${dim(context, "tasks · ")}${color(context.theme.primary, "Ctrl+S")} ${dim(context, "skills · ")}${color(context.theme.primary, "Shift+Tab")} ${dim(context, "toggle thinking")}`;
 
   if (context.columns < SIDE_BY_SIDE_MIN) {
     return block([
@@ -473,6 +535,13 @@ function renderAssistant(
   return lines.join("\n");
 }
 
+function renderIdealHook(text: string, context: TerminalHistoryContext): string {
+  // Same dot prefix + indent as an assistant row, but in the secondary color
+  // (bold) so the ideal-review hook visibly stands apart from normal output.
+  const body = color(context.theme.secondary, text, true);
+  return prefixFirstLine(body, ` ${color(context.theme.secondary, BLACK_CIRCLE)} `, "   ");
+}
+
 function renderPlanModeLogo(_context: TerminalHistoryContext): string {
   return PLAN_MODE_LOGO.map((line) => ` ${gradientLine(line, PLAN_MODE_GRADIENT)}`).join("\n");
 }
@@ -526,6 +595,14 @@ function renderToolDone(
 
   if (COMPACT_TOOLS.has(name) && !isError) {
     return toolHeader("done", getCompactDoneLabel(name, args, result), "", context);
+  }
+
+  // Screenshot collapses to a single header line, e.g. `Screenshot (image/png)`.
+  // The inline image is appended separately by the printer; the multi-line
+  // "Captured …" text would be redundant above it.
+  if (name === "screenshot" && !isError) {
+    const mediaType = result.match(/\[(image\/[a-z0-9.+-]+)\]/i)?.[1] ?? "image";
+    return toolHeader("done", "Screenshot", mediaType, context);
   }
 
   if (STATE_TOOLS.has(name)) {
@@ -636,51 +713,6 @@ function renderSubAgentGroup(
     );
   });
   return block(lines);
-}
-
-function renderGoalProgress(
-  item: Extract<CompletedItem, { kind: "goal_progress" }>,
-  context: TerminalHistoryContext,
-): string {
-  const isError = item.status === "failed" || item.status === "fail" || item.status === "blocked";
-  const status = isError
-    ? "error"
-    : item.phase === "worker_finished" ||
-        item.phase === "verifier_finished" ||
-        item.phase === "terminal"
-      ? "done"
-      : "running";
-  const labelColor = isError
-    ? context.theme.error
-    : item.phase === "worker_finished" || item.phase === "terminal"
-      ? context.theme.success
-      : item.phase === "verifier_finished" || item.phase === "verifier_started"
-        ? context.theme.accent
-        : item.phase === "orchestrator_reviewing" || item.phase === "orchestrator_working"
-          ? context.theme.secondary
-          : item.phase === "continuing"
-            ? context.theme.warning
-            : context.theme.primary;
-  const header = `${toolHeader(status, color(labelColor, item.title, true), "", context, {
-    dotColor: labelColor,
-    indicator: BLACK_CIRCLE,
-  })}${item.workerId ? dim(context, ` · worker ${item.workerId}`) : ""}`;
-  const bodyLines: string[] = [];
-  if (item.detail) {
-    bodyLines.push(dim(context, wrapPlain(item.detail, context.columns - 8)));
-  }
-  for (const row of item.summaryRows ?? []) {
-    bodyLines.push(
-      `${dim(context, row.label.padEnd(12))}${color(context.theme.text, row.value)}${row.detail ? dim(context, ` · ${row.detail}`) : ""}`,
-    );
-  }
-  for (const section of item.summarySections ?? []) {
-    bodyLines.push(dim(context, section.title));
-    for (const sectionLine of section.lines) {
-      bodyLines.push(`${color(context.theme.text, "• ")}${color(context.theme.text, sectionLine)}`);
-    }
-  }
-  return block([header, ...messageResponse(bodyLines, context)]);
 }
 
 function renderServerStyleToolDone(
@@ -924,7 +956,6 @@ function getToolHeaderParts(
       return { label: displayName, detail: url.length > 60 ? `${url.slice(0, 57)}…` : url };
     }
     case "tasks":
-    case "goals":
       return { label: displayName, detail: String(args.action ?? "") };
     default:
       return { label: displayName, detail: name.startsWith("mcp__") ? getMCPDetailArg(args) : "" };
@@ -967,8 +998,6 @@ function toolDisplayName(name: string): string {
       return "Source";
     case "tasks":
       return "Task";
-    case "goals":
-      return "Goal";
     default:
       return snakeToTitle(name);
   }
@@ -1079,8 +1108,7 @@ function getInlineSummary(name: string, result: string, isError: boolean): strin
       return extractSourcePath(result) ? shortenPath(extractSourcePath(result) ?? "") : "resolved";
     case "task_stop":
       return result.split("\n")[0] ?? "stopped";
-    case "tasks":
-    case "goals": {
+    case "tasks": {
       const quoted = result.match(/"([^"]+)"/)?.[1];
       if (quoted) return quoted.length > 50 ? `${quoted.slice(0, 47)}…` : quoted;
       const firstLine = result.split("\n")[0] ?? "";

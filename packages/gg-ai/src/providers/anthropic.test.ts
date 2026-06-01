@@ -153,6 +153,89 @@ describe("streamAnthropic error normalization", () => {
     } satisfies Partial<ProviderError>);
   });
 
+  it("maps an OAuth usage-window 429 to a usage-limit error with reset time", async () => {
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
+    const AnthropicMock = Anthropic as unknown as {
+      APIError: new (
+        status: number | undefined,
+        error: unknown,
+        message: string,
+        requestID?: string | null,
+        type?: string | null,
+      ) => Error;
+      nextError: Error | null;
+      nextEvents: unknown[] | null;
+    };
+    AnthropicMock.nextEvents = null;
+    const resetsAt = Math.floor(Date.now() / 1000) + 3600;
+    const err = new AnthropicMock.APIError(
+      429,
+      { type: "error", error: { type: "rate_limit_error", message: "Rate limited." } },
+      "429 Too Many Requests",
+      "req_usage_limit",
+      "rate_limit_error",
+    );
+    Object.assign(err, {
+      headers: new Headers({
+        "anthropic-ratelimit-unified-status": "rejected",
+        "anthropic-ratelimit-unified-reset": String(resetsAt),
+      }),
+    });
+    AnthropicMock.nextError = err;
+
+    const result = streamAnthropic({
+      provider: "anthropic",
+      model: "claude-test",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "sk-ant-oat-test",
+    });
+
+    await expect(result.response).rejects.toMatchObject({
+      provider: "anthropic",
+      statusCode: 429,
+      message: "Claude usage limit reached",
+      resetsAt,
+    } satisfies Partial<ProviderError>);
+  });
+
+  it("treats a 429 without unified-rejected headers as a plain provider error", async () => {
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
+    const AnthropicMock = Anthropic as unknown as {
+      APIError: new (
+        status: number | undefined,
+        error: unknown,
+        message: string,
+        requestID?: string | null,
+        type?: string | null,
+      ) => Error;
+      nextError: Error | null;
+      nextEvents: unknown[] | null;
+    };
+    AnthropicMock.nextEvents = null;
+    const err = new AnthropicMock.APIError(
+      429,
+      { type: "error", error: { type: "rate_limit_error", message: "Rate limited." } },
+      "429 Too Many Requests",
+      "req_throttle",
+      "rate_limit_error",
+    );
+    Object.assign(err, { headers: new Headers({ "retry-after": "5" }) });
+    AnthropicMock.nextError = err;
+
+    const result = streamAnthropic({
+      provider: "anthropic",
+      model: "claude-test",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "sk-ant-oat-test",
+    });
+
+    await expect(result.response).rejects.toMatchObject({
+      provider: "anthropic",
+      statusCode: 429,
+      message: "rate_limit_error: Rate limited.",
+    } satisfies Partial<ProviderError>);
+  });
+
   it("preserves tool arguments carried on the streamed content block start", async () => {
     const { default: Anthropic } = await import("@anthropic-ai/sdk");
     const AnthropicMock = Anthropic as unknown as {

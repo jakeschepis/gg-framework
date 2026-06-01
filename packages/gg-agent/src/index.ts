@@ -5,6 +5,7 @@ export {
   isAbortError,
   isContextOverflow,
   isBillingError,
+  isUsageLimitError,
   setStreamDiagnostic,
 } from "./agent-loop.js";
 export type { StreamDiagnosticFn } from "./agent-loop.js";

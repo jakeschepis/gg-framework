@@ -2,6 +2,7 @@ import { useState, useRef, useCallback, useEffect } from "react";
 import { agentLoop, type AgentEvent, type AgentTool } from "@kenkaiiii/gg-agent";
 import { ProviderError } from "@kenkaiiii/gg-ai";
 import type { Message, Provider, ThinkingLevel, TextContent, ImageContent } from "@kenkaiiii/gg-ai";
+import type { IdealReviewStats } from "../../core/ideal-review.js";
 import { getClaudeCliUserAgent } from "../../core/claude-code-version.js";
 import { log } from "../../core/logger.js";
 
@@ -49,6 +50,15 @@ function mergeUserContent(items: UserContent[]): UserContent {
   return parts;
 }
 
+/** Extract the plain-text portion of a UserContent value (drops images). */
+function textFromUserContent(content: UserContent): string {
+  if (typeof content === "string") return content;
+  return content
+    .filter((part): part is TextContent => part.type === "text")
+    .map((part) => part.text)
+    .join("");
+}
+
 export function shouldRetainThinkingDelta(): boolean {
   return false;
 }
@@ -81,6 +91,7 @@ export interface AgentLoopOptions {
     messages: Message[],
     options?: { force?: boolean },
   ) => Message[] | Promise<Message[]>;
+  getIdealReviewMessage?: (stats: IdealReviewStats) => Message | null;
 }
 
 export type ActivityPhase = "waiting" | "thinking" | "generating" | "tools" | "retrying" | "idle";
@@ -110,12 +121,18 @@ export interface UseAgentLoopReturn {
   run: (userContent: UserContent) => Promise<void>;
   abort: () => void;
   reset: () => void;
-  /** Queue a message to be processed after the current run completes. */
-  queueMessage: (content: UserContent) => void;
+  /** Queue a message to be processed after the current run completes.
+   *  `text` is the original typed text, retained so it can be restored to the
+   *  composer if the run is interrupted before the queue drains. */
+  queueMessage: (content: UserContent, text?: string) => void;
   /** Number of messages currently waiting in the queue. */
   queuedCount: number;
   /** Clear all queued messages. */
   clearQueue: () => void;
+  /** Pop every queued message, clear the queue, and return the combined
+   *  original text (joined with blank lines). Empty string when nothing was
+   *  queued. Used to restore unsent input to the composer on interrupt. */
+  drainQueuedText: () => string;
   isRunning: boolean;
   streamingText: string;
   streamingThinking: string;
@@ -218,7 +235,7 @@ export function useAgentLoop(
   const [linesChanged, setLinesChanged] = useState({ added: 0, removed: 0 });
 
   const abortRef = useRef<AbortController | null>(null);
-  const queueRef = useRef<UserContent[]>([]);
+  const queueRef = useRef<{ content: UserContent; text: string }[]>([]);
   const [queuedCount, setQueuedCount] = useState(0);
   const activeToolCallsRef = useRef<ActiveToolCall[]>([]);
   const textVisibleRef = useRef("");
@@ -226,6 +243,16 @@ export function useAgentLoop(
   const thinkingVisibleRef = useRef("");
   const runStartRef = useRef(0);
   const toolsUsedRef = useRef<Set<string>>(new Set());
+  const idealReviewStatsRef = useRef<IdealReviewStats>({
+    changedLines: 0,
+    toolCalls: 0,
+    toolFailures: 0,
+    turns: 0,
+    writeCalls: 0,
+    editCalls: 0,
+    bashCalls: 0,
+  });
+  const idealReviewInjectedRef = useRef(false);
   const phaseRef = useRef<ActivityPhase>("idle");
   const thinkingStartRef = useRef<number | null>(null);
   const thinkingAccumRef = useRef(0);
@@ -286,14 +313,25 @@ export function useAgentLoop(
     setQueuedCount(0);
   }, []);
 
-  const queueMessage = useCallback((content: UserContent) => {
-    queueRef.current.push(content);
+  const queueMessage = useCallback((content: UserContent, text?: string) => {
+    queueRef.current.push({ content, text: text ?? textFromUserContent(content) });
     setQueuedCount(queueRef.current.length);
   }, []);
 
   const clearQueue = useCallback(() => {
     queueRef.current = [];
     setQueuedCount(0);
+  }, []);
+
+  const drainQueuedText = useCallback((): string => {
+    if (queueRef.current.length === 0) return "";
+    const text = queueRef.current
+      .map((q) => q.text)
+      .filter((t) => t.length > 0)
+      .join("\n\n");
+    queueRef.current = [];
+    setQueuedCount(0);
+    return text;
   }, []);
 
   const run = useCallback(
@@ -371,6 +409,16 @@ export function useAgentLoop(
           messages: String(messages.current.length),
         });
         toolsUsedRef.current = new Set();
+        idealReviewStatsRef.current = {
+          changedLines: 0,
+          toolCalls: 0,
+          toolFailures: 0,
+          turns: 0,
+          writeCalls: 0,
+          editCalls: 0,
+          bashCalls: 0,
+        };
+        idealReviewInjectedRef.current = false;
         charCountRef.current = 0;
         realTokensAccumRef.current = 0;
         thinkingAccumRef.current = 0;
@@ -471,14 +519,24 @@ export function useAgentLoop(
               if (queueRef.current.length === 0) return null;
               const batch = queueRef.current.splice(0);
               setQueuedCount(0);
-              const merged = mergeUserContent(batch);
+              const merged = mergeUserContent(batch.map((q) => q.content));
               onQueuedStart?.(merged);
               return [{ role: "user" as const, content: merged }];
             },
             // Polled when the agent would otherwise stop — used to inject
             // "continue with the next plan step" when an approved plan still
             // has incomplete steps. See App.tsx for the implementation.
-            getFollowUpMessages: getFollowUpMessages,
+            getFollowUpMessages: async () => {
+              const followUp = (await getFollowUpMessages?.()) ?? null;
+              if (followUp && followUp.length > 0) return followUp;
+              if (idealReviewInjectedRef.current || !options.getIdealReviewMessage) return null;
+              const idealReviewMessage = options.getIdealReviewMessage({
+                ...idealReviewStatsRef.current,
+              });
+              if (!idealReviewMessage) return null;
+              idealReviewInjectedRef.current = true;
+              return [idealReviewMessage];
+            },
             // clearToolUses disabled — causes model to output unsolicited context
             // summaries ("KEY CONTEXT TO REMEMBER") when it sees gaps from stripped
             // tool blocks. Normal client-side compaction handles context management.
@@ -616,6 +674,11 @@ export function useAgentLoop(
                   event.details,
                   tc?.args,
                 );
+                idealReviewStatsRef.current.toolCalls += 1;
+                if (event.isError) idealReviewStatsRef.current.toolFailures += 1;
+                if (toolName === "write") idealReviewStatsRef.current.writeCalls += 1;
+                if (toolName === "edit") idealReviewStatsRef.current.editCalls += 1;
+                if (toolName === "bash") idealReviewStatsRef.current.bashCalls += 1;
                 // Track lines changed for edit tools
                 if (toolName === "edit" && !event.isError) {
                   const diff =
@@ -623,6 +686,7 @@ export function useAgentLoop(
                   const addedLines = (diff.match(/^\+[^+]/gm) ?? []).length;
                   const removedLines = (diff.match(/^-[^-]/gm) ?? []).length;
                   if (addedLines > 0 || removedLines > 0) {
+                    idealReviewStatsRef.current.changedLines += addedLines + removedLines;
                     setLinesChanged((prev) => ({
                       added: prev.added + addedLines,
                       removed: prev.removed + removedLines,
@@ -701,6 +765,7 @@ export function useAgentLoop(
                 }
                 flushStreamState();
                 setRetryInfo(null);
+                idealReviewStatsRef.current.turns = event.turn;
                 onTurnEnd?.(event.turn, event.stopReason, event.usage);
                 setCurrentTurn(event.turn);
                 setTotalTokens((prev) => ({
@@ -834,7 +899,7 @@ export function useAgentLoop(
       if (!aborted && queueRef.current.length > 0) {
         const batch = queueRef.current.splice(0);
         setQueuedCount(0);
-        const merged = mergeUserContent(batch);
+        const merged = mergeUserContent(batch.map((q) => q.content));
         // Let React process the onDone state updates before starting next run
         await new Promise((r) => setTimeout(r, 100));
         onQueuedStart?.(merged);
@@ -877,6 +942,7 @@ export function useAgentLoop(
     queueMessage,
     queuedCount,
     clearQueue,
+    drainQueuedText,
     isRunning,
     streamingText,
     streamingThinking,

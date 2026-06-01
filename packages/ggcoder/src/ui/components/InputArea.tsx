@@ -9,9 +9,7 @@ import { extractImagePaths, readImageFile, getClipboardImage } from "../../utils
 import { SlashCommandMenu, filterCommands, type SlashCommandInfo } from "./SlashCommandMenu.js";
 import { TaskPickerMenu } from "./TaskPickerMenu.js";
 import { stripTerminalFocusSequences } from "../utils/terminal-input.js";
-import { GoalPickerMenu } from "./GoalPickerMenu.js";
 import type { TaskRecord } from "../../core/tasks-store.js";
-import type { GoalRun } from "../../core/goal-store.js";
 import { log } from "../../core/logger.js";
 import { homedir } from "node:os";
 import { join } from "node:path";
@@ -43,6 +41,16 @@ const SGR_MOUSE_RE_G = /\x1b\[<(\d+);(\d+);(\d+)([Mm])/g;
 // ?1000h = basic click tracking, ?1006h = SGR extended mode (supports coords > 223).
 const ENABLE_MOUSE = "\x1b[?1000h\x1b[?1006h";
 const DISABLE_MOUSE = "\x1b[?1006l\x1b[?1000l";
+
+// Idle window (ms) for the legacy scroll-passthrough release: a short pause
+// reliably spans a wheel gesture before tracking re-arms.
+const SCROLL_PAUSE_MS = 300;
+// Safety net only. In fullscreen, native text selection releases the mouse with
+// NO active timer — the wheel re-arms on the next keystroke instead, so a slow
+// drag is never cut short. This long timer only fires if the user never presses
+// a key afterward (e.g. copies text and switches apps), so the mouse doesn't
+// stay captured forever in that edge case.
+const NATIVE_INTERACTION_SAFETY_MS = 60_000;
 
 // Guard against stray SGR mouse sequences leaking into text input.
 // Some terminals or multiplexers send these even without mouse tracking enabled.
@@ -203,6 +211,12 @@ export interface PasteInfo {
 interface InputAreaProps {
   onSubmit: (value: string, images: ImageAttachment[], paste?: PasteInfo) => void;
   onAbort: () => void;
+  /**
+   * Text to push into the composer from outside (e.g. queued messages restored
+   * after an interrupt). Bumping `nonce` re-triggers injection even when the
+   * text is unchanged. Injected text is appended after any existing draft.
+   */
+  injectText?: { text: string; nonce: number } | null;
   disabled?: boolean;
   isActive?: boolean;
   onDownAtEnd?: () => void;
@@ -214,13 +228,6 @@ interface InputAreaProps {
   onStartTask?: (task: TaskRecord) => void;
   onRunAllTasks?: (task?: TaskRecord) => void;
   onDeleteTask?: (task: TaskRecord) => void;
-  goalPickerOpen?: boolean;
-  goals?: readonly GoalRun[];
-  onCloseGoalPicker?: () => void;
-  onRunGoal?: (goal: GoalRun) => void;
-  onDeleteGoal?: (goal: GoalRun) => void;
-  onPauseGoal?: (goal: GoalRun) => void;
-  onToggleGoal?: () => void;
   onToggleSkills?: () => void;
   onTogglePixel?: () => void;
   onToggleMarkdown?: () => void;
@@ -248,7 +255,22 @@ interface InputAreaProps {
    * downstream tools (gg-boss) to cycle the scope badge.
    */
   onTab?: () => void;
+  /**
+   * Fullscreen alt-screen mode: there is no native scrollback, so mouse-wheel
+   * events must drive the in-app transcript scroll instead of being passed
+   * through to the terminal. When set, wheel-up/down call `onScroll` and mouse
+   * tracking is kept enabled regardless of input text so wheel events arrive.
+   */
+  mouseScroll?: boolean;
+  /**
+   * Called with a signed line delta when the user scrolls the mouse wheel in
+   * fullscreen mode. Positive = scroll UP (older output), negative = DOWN.
+   */
+  onScroll?: (deltaLines: number) => void;
 }
+
+// Lines advanced per mouse-wheel notch in fullscreen transcript scrolling.
+const WHEEL_LINES_PER_NOTCH = 3;
 
 // Padding (1 each side) = 2 characters of overhead. Gemini's composer is borderless
 // except for a zero-height top rule, so wrapping should not reserve border columns.
@@ -305,6 +327,7 @@ function getVisualLines(text: string, columns: number): string[] {
 export function InputArea({
   onSubmit,
   onAbort,
+  injectText,
   disabled = false,
   isActive = true,
   onDownAtEnd,
@@ -316,13 +339,6 @@ export function InputArea({
   onStartTask,
   onRunAllTasks,
   onDeleteTask,
-  goalPickerOpen = false,
-  goals = [],
-  onCloseGoalPicker,
-  onRunGoal,
-  onDeleteGoal,
-  onPauseGoal,
-  onToggleGoal,
   onToggleSkills,
   onTogglePixel,
   onToggleMarkdown,
@@ -330,6 +346,8 @@ export function InputArea({
   commands = [],
   scopeBadge,
   disableMouseTracking,
+  mouseScroll,
+  onScroll,
   onTab,
 }: InputAreaProps) {
   const theme = useTheme();
@@ -343,6 +361,21 @@ export function InputArea({
   const historyRef = useRef<string[]>(loadHistory());
   const historyIndexRef = useRef(-1);
   const draftRef = useRef("");
+
+  // ── External text injection (e.g. queued messages restored on interrupt) ──
+  // Append injected text to any existing draft and move the cursor to the end.
+  // Keyed on nonce so repeated injections of identical text still fire.
+  const lastInjectNonceRef = useRef<number | null>(null);
+  useEffect(() => {
+    if (!injectText || injectText.text.length === 0) return;
+    if (lastInjectNonceRef.current === injectText.nonce) return;
+    lastInjectNonceRef.current = injectText.nonce;
+    setValue((prev) => {
+      const next = prev.length > 0 ? `${prev}\n\n${injectText.text}` : injectText.text;
+      setCursor(next.length);
+      return next;
+    });
+  }, [injectText]);
 
   // ── Ctrl+R history search state ──────────────────────────
   const [searchMode, setSearchMode] = useState(false);
@@ -370,7 +403,6 @@ export function InputArea({
   const { columns } = useTerminalSize();
   const [menuIndex, setMenuIndex] = useState(0);
   const [taskPickerIndex, setTaskPickerIndex] = useState(0);
-  const [goalPickerIndex, setGoalPickerIndex] = useState(0);
   const [pasteText, setPasteText] = useState(""); // accumulated pasted content
   const [pasteOffset, setPasteOffset] = useState(0); // where in value the paste starts
   const pasteTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
@@ -383,7 +415,6 @@ export function InputArea({
     [isSlashMode, commands, slashFilter],
   );
   const runnableTasks = useMemo(() => tasks.filter((task) => task.status !== "done"), [tasks]);
-  const selectableGoals = useMemo(() => [...goals], [goals]);
 
   // Reset menu index when filter changes
   useEffect(() => {
@@ -393,10 +424,6 @@ export function InputArea({
   useEffect(() => {
     setTaskPickerIndex((index) => Math.min(index, Math.max(0, runnableTasks.length - 1)));
   }, [runnableTasks.length]);
-
-  useEffect(() => {
-    setGoalPickerIndex((index) => Math.min(index, Math.max(0, selectableGoals.length - 1)));
-  }, [selectableGoals.length]);
 
   // Border color pulse (when idle/waiting for input)
   const borderPulseColors = useMemo(
@@ -554,6 +581,19 @@ export function InputArea({
   // terminal handle CMD+click for opening links natively.
   const hasInputTextRef = useRef(value.length > 0);
 
+  // Fullscreen wheel-scroll routing. Kept in refs so the emit-wrapper effect
+  // (whose deps are intentionally stable) always sees the freshest callback.
+  const mouseScrollRef = useRef(mouseScroll);
+  mouseScrollRef.current = mouseScroll;
+  const onScrollRef = useRef(onScroll);
+  onScrollRef.current = onScroll;
+  // Assigned by the mouse effect; called by the keyboard handler to re-arm
+  // mouse tracking after the user finishes a native text selection (see the
+  // fullscreen selection-mode logic below). Lifting it out of the effect lets
+  // a keystroke — the unambiguous "I'm done selecting" signal — restore the
+  // wheel without a fragile timer that would cut a slow selection short.
+  const reenableMouseRef = useRef<() => void>(() => {});
+
   useEffect(() => {
     if (!isActive || !internal_eventEmitter) return;
     // Hard-bail when mouse tracking is disabled at the prop level — used by
@@ -567,7 +607,9 @@ export function InputArea({
 
     // Only enable mouse tracking if there's text — when empty, let the
     // terminal handle clicks natively (e.g., CMD+click to open links).
-    if (hasInputTextRef.current) {
+    // In fullscreen mode we always enable it so wheel-scroll events arrive even
+    // when the composer is empty (there's no native scrollback to fall back to).
+    if (hasInputTextRef.current || mouseScrollRef.current) {
       process.stdout.write(ENABLE_MOUSE);
     }
 
@@ -579,26 +621,57 @@ export function InputArea({
     const originalEmit = internal_eventEmitter.emit.bind(internal_eventEmitter);
     mouseEmitRef.current.original = originalEmit;
 
-    // Scroll passthrough: when a scroll event is detected, temporarily disable
-    // mouse tracking so the terminal handles scroll natively (scrollback buffer).
-    // Re-enable after a short idle period so click-to-cursor continues to work.
+    // Mouse-release passthrough: when we want the TERMINAL (not the app) to
+    // handle a gesture — native scroll in the legacy model, or native text
+    // selection / CMD+click link-opening in fullscreen — we disable mouse
+    // tracking so the terminal owns the mouse.
     let scrollTimer: ReturnType<typeof setTimeout> | null = null;
     let mouseDisabled = false;
 
+    // Re-arm mouse tracking only when something still needs it: there's input
+    // text to position a cursor in (legacy click-to-cursor), OR we're in
+    // fullscreen where the wheel drives the transcript scroll. Without the
+    // fullscreen clause the mouse would stay dead after the first click and the
+    // wheel would stop scrolling.
     const reenableMouse = () => {
-      if (mouseDisabled && hasInputTextRef.current) {
+      if (scrollTimer) {
+        clearTimeout(scrollTimer);
+        scrollTimer = null;
+      }
+      if (mouseDisabled && (hasInputTextRef.current || mouseScrollRef.current)) {
         process.stdout.write(ENABLE_MOUSE);
         mouseDisabled = false;
       }
     };
+    // Exposed so the keyboard handler can re-arm on the next keystroke.
+    reenableMouseRef.current = reenableMouse;
 
-    const pauseMouseForScroll = () => {
+    // Timed release — used for the legacy scroll-passthrough model where a short
+    // idle reliably means the wheel gesture is over.
+    const pauseMouseTimed = (durationMs: number) => {
       if (!mouseDisabled) {
         process.stdout.write(DISABLE_MOUSE);
         mouseDisabled = true;
       }
       if (scrollTimer) clearTimeout(scrollTimer);
-      scrollTimer = setTimeout(reenableMouse, 300);
+      scrollTimer = setTimeout(reenableMouse, durationMs);
+    };
+    const pauseMouseForScroll = () => pauseMouseTimed(SCROLL_PAUSE_MS);
+
+    // Indefinite release for native selection / link-clicks in fullscreen. NO
+    // timer: a text selection can take as long as the user wants, and a timer
+    // that re-armed mid-drag would abort the selection. The wheel is restored
+    // only when the user presses a key (handled in the keyboard useInput) — an
+    // unambiguous signal that they're done selecting and back to driving the
+    // app. A long safety-net timer guards against a stuck state if no key ever
+    // follows (e.g. they copy and switch windows).
+    const pauseMouseForNativeInteraction = () => {
+      if (!mouseDisabled) {
+        process.stdout.write(DISABLE_MOUSE);
+        mouseDisabled = true;
+      }
+      if (scrollTimer) clearTimeout(scrollTimer);
+      scrollTimer = setTimeout(reenableMouse, NATIVE_INTERACTION_SAFETY_MS);
     };
 
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -630,10 +703,31 @@ export function InputArea({
           const isMotion = (btnCode & 32) !== 0;
           const isScroll = (btnCode & 64) !== 0;
 
-          // On scroll: disable mouse tracking so the terminal handles it natively,
-          // then re-enable after idle so click-to-cursor keeps working.
+          // On scroll wheel:
           if (isScroll) {
+            // Fullscreen alt-screen: no native scrollback exists, so route the
+            // wheel into the in-app transcript scroll. Wheel-up (button bit 0
+            // clear) scrolls toward older output, wheel-down toward newest.
+            if (mouseScrollRef.current && onScrollRef.current) {
+              const wheelUp = (btnCode & 1) === 0;
+              onScrollRef.current(wheelUp ? WHEEL_LINES_PER_NOTCH : -WHEEL_LINES_PER_NOTCH);
+              continue;
+            }
+            // Legacy scrollback model: disable mouse tracking so the terminal
+            // handles it natively, then re-enable after idle.
             pauseMouseForScroll();
+            continue;
+          }
+
+          // Fullscreen: the wheel is the ONLY gesture we capture. Any other
+          // mouse event means the user wants to interact with the terminal
+          // itself — drag to select/copy text, or CMD+click a link. Release the
+          // mouse so the terminal handles it natively, then re-arm for the
+          // wheel after an idle window. (We trade away composer click-to-cursor
+          // in fullscreen; the keyboard positions the cursor, and copy/paste +
+          // links matter more.)
+          if (mouseScrollRef.current) {
+            pauseMouseForNativeInteraction();
             continue;
           }
 
@@ -743,6 +837,7 @@ export function InputArea({
 
     return () => {
       if (scrollTimer) clearTimeout(scrollTimer);
+      reenableMouseRef.current = () => {};
       process.stdout.write(DISABLE_MOUSE);
       process.removeListener("exit", onProcessExit);
       // Restore original emit
@@ -761,11 +856,13 @@ export function InputArea({
     const hasText = value.length > 0;
     if (hasText !== hasInputTextRef.current) {
       hasInputTextRef.current = hasText;
-      if (isActive) {
+      // In fullscreen mode mouse tracking stays on regardless of input text so
+      // wheel-scroll keeps working with an empty composer — never disable it.
+      if (isActive && !mouseScroll) {
         process.stdout.write(hasText ? ENABLE_MOUSE : DISABLE_MOUSE);
       }
     }
-  }, [value, isActive]);
+  }, [value, isActive, mouseScroll]);
 
   // Helper: delete selected text and return new value + cursor position.
   // Returns null if no selection is active.
@@ -791,6 +888,12 @@ export function InputArea({
       const inputWithoutFocusReports = stripTerminalFocusSequences(input);
       if (!inputWithoutFocusReports && input) return;
       if (isMouseEscapeSequence(inputWithoutFocusReports)) return;
+
+      // A real keystroke is the "I'm done selecting" signal: re-arm mouse
+      // tracking (no-op if it was never released) so the wheel works again.
+      // This is why native selection can take as long as the user wants — it's
+      // ended by intent (a key) rather than a timer that could cut it short.
+      reenableMouseRef.current();
 
       // Reset kill ring accumulation for non-kill keys
       input = inputWithoutFocusReports;
@@ -905,41 +1008,6 @@ export function InputArea({
       // Ctrl+T toggles task picker
       if (key.ctrl && input === "t") {
         onToggleTasks?.();
-        return;
-      }
-
-      if (goalPickerOpen) {
-        if (key.escape || (key.ctrl && input === "g")) {
-          onCloseGoalPicker?.();
-          return;
-        }
-        if (key.upArrow) {
-          setGoalPickerIndex((i) => Math.max(0, i - 1));
-          return;
-        }
-        if (key.downArrow) {
-          setGoalPickerIndex((i) => Math.min(selectableGoals.length - 1, i + 1));
-          return;
-        }
-        const goal = selectableGoals[Math.min(goalPickerIndex, selectableGoals.length - 1)];
-        if (input.toLowerCase() === "d") {
-          if (goal) onDeleteGoal?.(goal);
-          return;
-        }
-        if (input.toLowerCase() === "p") {
-          if (goal) onPauseGoal?.(goal);
-          return;
-        }
-        if (isReturnKey) {
-          if (goal) onRunGoal?.(goal);
-          return;
-        }
-        return;
-      }
-
-      // Ctrl+G toggles goal picker in normal input mode. In search mode it cancels search above.
-      if (key.ctrl && input === "g") {
-        onToggleGoal?.();
         return;
       }
 
@@ -1887,15 +1955,7 @@ export function InputArea({
         })()}
       </Box>
       {renderInputEdge(backgroundColor ? INPUT_BOTTOM_FILL : "─")}
-      {goalPickerOpen ? (
-        <Box paddingRight={2}>
-          <GoalPickerMenu
-            goals={goals}
-            selectedIndex={goalPickerIndex}
-            width={Math.max(20, columns)}
-          />
-        </Box>
-      ) : taskPickerOpen ? (
+      {taskPickerOpen ? (
         <Box paddingRight={2}>
           <TaskPickerMenu
             tasks={tasks}

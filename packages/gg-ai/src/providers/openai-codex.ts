@@ -129,6 +129,13 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
       response.headers.get("x-oai-request-id") ??
       undefined;
 
+    // ChatGPT-subscription usage-window exhaustion. The codex backend returns
+    // HTTP 429 with a usage_limit_reached / usage_not_included / rate_limit_exceeded
+    // code and a reset timestamp. Stop immediately with a clear message instead
+    // of letting the agent loop retry a 429 it can't recover from.
+    const usageLimit = codexUsageLimitError(parsed.errorObj, response.status, requestId);
+    if (usageLimit) throw usageLimit;
+
     let hint: string | undefined;
     if (response.status === 400 && text.includes("not supported")) {
       if (options.model === "gpt-5.5-pro") {
@@ -203,6 +210,14 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
       // message ("…request ID abc123 in your message"); fish it out so the
       // FormattedError can surface it on its own line.
       const requestId = extractCodexRequestId(message) ?? (event.request_id as string | undefined);
+      // ChatGPT-subscription usage-window exhaustion can arrive mid-stream as an
+      // error chunk. Surface it as a hard usage-limit stop, not a retriable error.
+      const usageLimit = codexUsageLimitError(
+        nested ?? (event as Record<string, unknown>),
+        undefined,
+        requestId,
+      );
+      if (usageLimit) throw usageLimit;
       throw new ProviderError("openai", message, {
         ...(requestId != null ? { requestId } : {}),
         ...(code === "server_error" ? { statusCode: 500 } : {}),
@@ -614,8 +629,13 @@ function extractCodexRequestId(message: string): string | undefined {
 }
 
 // HTTP error bodies come back as JSON or plain text. Try to extract a clean
-// message string + request_id so we never spill the raw JSON into the UI.
-function parseCodexErrorBody(text: string): { message?: string; requestId?: string } {
+// message string + request_id (and the raw error object) so we never spill the
+// raw JSON into the UI.
+function parseCodexErrorBody(text: string): {
+  message?: string;
+  requestId?: string;
+  errorObj?: Record<string, unknown>;
+} {
   if (!text) return {};
   try {
     const parsed = JSON.parse(text) as Record<string, unknown>;
@@ -629,11 +649,68 @@ function parseCodexErrorBody(text: string): { message?: string; requestId?: stri
       (parsed.request_id as string | undefined) ??
       (error?.request_id as string | undefined) ??
       (message ? extractCodexRequestId(message) : undefined);
-    return { ...(message ? { message } : {}), ...(requestId ? { requestId } : {}) };
+    // Some codex error payloads put the usage-limit fields at the top level
+    // rather than under `error` — prefer the nested object but fall back to the
+    // whole payload so resets_at / code are still visible.
+    const errorObj = error ?? parsed;
+    return {
+      ...(message ? { message } : {}),
+      ...(requestId ? { requestId } : {}),
+      ...(errorObj ? { errorObj } : {}),
+    };
   } catch {
     // Non-JSON body — return the trimmed text directly, capped so we never
     // splat a huge HTML error page.
     const trimmed = text.trim().slice(0, 240);
     return trimmed ? { message: trimmed } : {};
   }
+}
+
+const CODEX_USAGE_LIMIT_CODE = /usage_limit_reached|usage_not_included/i;
+const CODEX_RATE_LIMIT_CODE = /rate_limit_exceeded/i;
+
+/**
+ * Detect a ChatGPT-subscription usage-window exhaustion from a Codex error
+ * payload and build a canonical usage-limit ProviderError. The codex backend
+ * returns HTTP 429 with an error `code`/`type` of usage_limit_reached /
+ * usage_not_included (hard plan-window stop) or rate_limit_exceeded, plus a
+ * `resets_at` (unix seconds) directly or nested under `rate_limits.primary` /
+ * `.secondary` (or a `resets_in_seconds` countdown).
+ *
+ * Returns null for anything that isn't clearly a usage-window stop — a bare
+ * transient 429 with no reset info still flows through the normal retry path.
+ */
+function codexUsageLimitError(
+  errorObj: Record<string, unknown> | undefined,
+  statusCode: number | undefined,
+  requestId: string | undefined,
+): ProviderError | null {
+  const code = String(errorObj?.code ?? errorObj?.type ?? "");
+  const rateLimits = errorObj?.rate_limits as
+    | { primary?: { resets_at?: number }; secondary?: { resets_at?: number } }
+    | undefined;
+  const resetsAtRaw =
+    (typeof errorObj?.resets_at === "number" ? (errorObj.resets_at as number) : undefined) ??
+    rateLimits?.primary?.resets_at ??
+    rateLimits?.secondary?.resets_at;
+  const resetsInSeconds =
+    typeof errorObj?.resets_in_seconds === "number"
+      ? (errorObj.resets_in_seconds as number)
+      : undefined;
+  const resetsAt =
+    typeof resetsAtRaw === "number" && resetsAtRaw > 0
+      ? resetsAtRaw
+      : resetsInSeconds != null && resetsInSeconds > 0
+        ? Math.floor(Date.now() / 1000) + resetsInSeconds
+        : undefined;
+
+  const isHardUsage = CODEX_USAGE_LIMIT_CODE.test(code);
+  const isRateOr429 = CODEX_RATE_LIMIT_CODE.test(code) || statusCode === 429;
+  if (!isHardUsage && !(isRateOr429 && resetsAt != null)) return null;
+
+  return new ProviderError("openai", "ChatGPT usage limit reached", {
+    statusCode: statusCode ?? 429,
+    ...(requestId ? { requestId } : {}),
+    ...(resetsAt ? { resetsAt } : {}),
+  });
 }

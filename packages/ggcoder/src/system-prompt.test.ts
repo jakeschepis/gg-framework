@@ -42,8 +42,6 @@ function promptSize(prompt: string): { characters: number; lines: number; sectio
 function promptAudit(prompt: string): { size: ReturnType<typeof promptSize>; flags: string[] } {
   const flags: string[] = [];
   const obsoleteOrContradictory = [
-    "## Goal Auto-Continuation Events",
-    "[event:goal_worker_complete]",
     "what observable artifact would prove the requested outcome worked end-to-end",
     "the simplest reliable local/free proof path",
     "generic tests, scripts, screenshots, benchmarks, or simulations; use them by default",
@@ -101,13 +99,9 @@ describe("buildSystemPrompt", () => {
     expect(sectionIndex(prompt, "## Research & Verification")).toBeLessThan(
       sectionIndex(prompt, "## Code Quality"),
     );
-    expect(prompt).not.toContain("## Goal Auto-Continuation Events");
-    expect(prompt).not.toContain("[event:goal_worker_complete]");
-    expect(prompt).toContain("model the intended experience");
-    expect(prompt).toContain("choose the required senses/signals");
     expect(prompt).toContain("Woops I just farted!");
     expect(prompt).toContain("don't force it, overuse it, or repeat one hardcoded line");
-    expect(prompt).toContain(
+    expect(prompt).not.toContain(
       "Do not default to generic tests, scripts, screenshots, benchmarks, or simulations",
     );
     expect(sectionIndex(prompt, "## Code Quality")).toBeLessThan(sectionIndex(prompt, "## Tools"));
@@ -144,7 +138,7 @@ describe("buildSystemPrompt", () => {
     expect(renderedTools).not.toContain("**edit**");
   });
 
-  it("places project-context precedence next to project context before style packs", async () => {
+  it("states rule precedence exactly once and keeps project context before style packs", async () => {
     const cwd = await makeProject({
       "AGENTS.md": "Use tabs for this fixture.",
       "tsconfig.json": "{}",
@@ -159,162 +153,18 @@ describe("buildSystemPrompt", () => {
       new Set<LanguageId>(["typescript"]),
     );
 
-    const projectContextIndex = sectionIndex(prompt, "## Project Context");
-    const precedenceIndex = prompt.indexOf("**Highest precedence**", projectContextIndex);
-    expect(precedenceIndex).toBeGreaterThan(projectContextIndex);
-    expect(precedenceIndex).toBeLessThan(sectionIndex(prompt, "### AGENTS.md"));
+    // Precedence lives in How to Work only — not restated in Project Context or Style Packs.
+    expect(prompt).toContain("Rule precedence: project context files");
+    expect(prompt.match(/Rule precedence/g)).toHaveLength(1);
+    expect(prompt).not.toContain("**Highest precedence**");
+    expect(prompt).not.toContain("override default guidance");
+    expect(prompt).not.toContain("override these defaults");
     expect(sectionIndex(prompt, "## Project Context")).toBeLessThan(
       sectionIndex(prompt, "## Language Style Packs"),
     );
-    expect(prompt).toContain(
-      "AGENTS.md / CLAUDE.md and other project rules override default guidance",
-    );
   });
 
-  it("renders Goal planner mode as compact research-only instructions", async () => {
-    const cwd = await makeProject({ "AGENTS.md": "Project rules win." });
-    const prompt = await buildSystemPrompt(
-      cwd,
-      undefined,
-      true,
-      ".gg/plans/approved.md",
-      [
-        "read",
-        "bash",
-        "goals",
-        "edit",
-        "write",
-        "subagent",
-        "source_path",
-        "web_search",
-        "web_fetch",
-        "mcp__kencode-search__referenceSources",
-        "mcp__kencode-search__discoverRepos",
-        "mcp__kencode-search__searchCode",
-      ],
-      undefined,
-      "planner",
-    );
-    const firstLine = prompt.split("\n", 1)[0];
-
-    expect(firstLine).toContain("Goal planner");
-    expect(firstLine).toContain("not setup, coordinator, or implementation worker");
-    expect(prompt).toContain("## Goal Planner Mode (ACTIVE)");
-    expect(prompt).toContain("classify uncertainty");
-    expect(prompt).toContain("Output exactly one `GOAL_PLAN` block");
-    expect(prompt).toContain("research=<none|local|docs|code|mixed>");
-    expect(prompt).toContain("`source_path`");
-    expect(prompt).toContain("`web_search`/`web_fetch`");
-    expect(prompt).toContain("kencode reference/discover/searchCode");
-    expect(prompt).toContain("Forbidden: `edit`, `write`, `subagent`, `goals`");
-    expect(prompt).toContain("background processes");
-    expect(prompt).not.toContain("entering plan mode");
-    expect(prompt).not.toContain("## Plan Mode (ACTIVE)");
-    expect(prompt).not.toContain("## Approved Plan");
-  });
-
-  it("renders Goal setup mode as orchestration-only instructions", async () => {
-    const cwd = await makeProject({ "AGENTS.md": "Project rules win." });
-    const prompt = await buildSystemPrompt(
-      cwd,
-      undefined,
-      false,
-      ".gg/plans/approved.md",
-      ["read", "bash", "goals", "edit", "write", "subagent"],
-      undefined,
-      "setup",
-    );
-    const firstLine = prompt.split("\n", 1)[0];
-
-    expect(firstLine).toContain("Goal setup orchestrator");
-    expect(firstLine).toContain("not an implementation worker");
-    expect(firstLine).not.toContain("works directly in the user's codebase");
-    expect(prompt).toContain("## Goal Setup Mode (ACTIVE)");
-    expect(prompt).toContain("create/update the durable run with `goals create`");
-    expect(prompt).toContain("Allowed tools: read/search/list tools");
-    expect(prompt).toContain("Forbidden: `edit`, `write`, `subagent`, verifier execution");
-    expect(prompt).toContain("Workers are the only actors that implement project changes");
-    expect(prompt).toContain("Goal Worktree Isolation Contract");
-    expect(prompt).toContain("isolated candidate worktree tasks");
-    expect(prompt).toContain("base SHA");
-    expect(prompt).toContain("candidate packet");
-    expect(prompt).toContain("Goal Task DAG Contract");
-    expect(prompt).toContain("depends_on");
-    expect(prompt).toContain("parallel_group");
-    expect(prompt).toContain("expected_changed_scope");
-    expect(prompt).toContain("merge_strategy");
-    expect(prompt).not.toContain("## Approved Plan");
-    expect(prompt).not.toContain("## Plan Mode (ACTIVE)");
-    expect(prompt).not.toContain("Restricted: bash, edit, write except .gg/plans/");
-  });
-
-  it("renders Goal setup mode without plan-mode leakage even when planMode is true", async () => {
-    const cwd = await makeProject();
-    const prompt = await buildSystemPrompt(
-      cwd,
-      undefined,
-      true,
-      ".gg/plans/approved.md",
-      ["read", "goals"],
-      undefined,
-      "setup",
-    );
-
-    expect(prompt).toContain("Goal setup orchestrator");
-    expect(prompt).toContain("## Goal Setup Mode (ACTIVE)");
-    expect(prompt).toContain("Forbidden: `edit`, `write`, `subagent`, verifier execution");
-    expect(prompt).not.toContain("entering plan mode");
-    expect(prompt).not.toContain("## Plan Mode (ACTIVE)");
-    expect(prompt).not.toContain("## Approved Plan");
-  });
-
-  it("renders Goal coordinator mode as status-first direct-implementation prohibition", async () => {
-    const cwd = await makeProject();
-    const prompt = await buildSystemPrompt(
-      cwd,
-      undefined,
-      false,
-      undefined,
-      ["read", "goals", "bash"],
-      undefined,
-      "coordinator",
-    );
-    const firstLine = prompt.split("\n", 1)[0];
-
-    expect(firstLine).toContain("durable Goal coordinator");
-    expect(firstLine).toContain("not an implementation worker");
-    expect(firstLine).not.toContain("works directly in the user's codebase");
-    expect(prompt).toContain("## Goal Coordinator Mode (ACTIVE)");
-    expect(prompt).toContain("call `goals status` for the current run first");
-    expect(prompt).toContain("before choosing any next action");
-    expect(prompt).toContain(
-      "Completion rule: call `goals complete` only when the configured verifier has run as the final pre-audit gate",
-    );
-    expect(prompt).toContain("configured verifier has run as the final pre-audit gate");
-    expect(prompt).toContain(
-      "a final completion audit has compared the actual durable files/logs/results",
-    );
-    expect(prompt).toContain("let workers use targeted checks while they build/fix/reconcile");
-    expect(prompt).toContain("the read-only final audit may reconcile matching durable proof");
-    expect(prompt).toContain("rerun the configured verifier before final audit");
-    expect(prompt).toContain("Forbidden: direct project implementation, `edit`, `write`, `bash`");
-    expect(prompt).toContain("Workers and UI-driven verifier execution are the only actors");
-    expect(prompt).toContain("Goal Worktree Isolation Contract");
-    expect(prompt).toContain("candidate packets first");
-    expect(prompt).toContain("main/integration checkout");
-    expect(prompt).toContain("verify after merge");
-    expect(prompt).toContain("Goal Task DAG Contract");
-    expect(prompt).toContain("zero-dependency");
-    expect(prompt).toContain("start independent tasks in parallel");
-    expect(prompt).toContain("unlock dependent tasks");
-    expect(prompt).toContain("updated integration base");
-    expect(prompt).not.toContain("take a first control-loop action before status");
-    expect(prompt).not.toContain("## Plan Mode (ACTIVE)");
-    expect(prompt).not.toContain("Restricted: bash, edit, write except .gg/plans/");
-    expect(prompt).not.toContain("## Approved Plan");
-  });
-
-  it("renders normal mode as direct coding mode without Goal identity or restrictions", async () => {
+  it("renders normal mode as direct coding mode", async () => {
     const cwd = await makeProject();
     const prompt = await buildSystemPrompt(cwd, undefined, false, undefined, [
       "read",
@@ -322,20 +172,10 @@ describe("buildSystemPrompt", () => {
       "write",
       "bash",
       "subagent",
-      "goals",
     ]);
 
     expect(prompt).toContain("works directly in the user's codebase");
     expect(prompt).toContain("completing tasks end-to-end");
-    expect(prompt).not.toContain("Goal planner");
-    expect(prompt).not.toContain("Goal setup orchestrator");
-    expect(prompt).not.toContain("durable Goal coordinator");
-    expect(prompt).not.toContain("## Goal Planner Mode (ACTIVE)");
-    expect(prompt).not.toContain("## Goal Setup Mode (ACTIVE)");
-    expect(prompt).not.toContain("## Goal Coordinator Mode (ACTIVE)");
-    expect(prompt).not.toContain("orchestration-only");
-    expect(prompt).not.toContain("Forbidden: direct project implementation");
-    expect(prompt).not.toContain("Workers are the only actors that implement project changes");
   });
 
   it("preserves critical operating rules concisely", async () => {
@@ -356,7 +196,6 @@ describe("buildSystemPrompt", () => {
     for (const required of [
       "works directly in the user's codebase",
       "completing tasks end-to-end",
-      "at most one short sentence",
       "Final replies: 1–3 sentences, hard cap 5",
       "Read before `edit`/`write`",
       "re-read after formatters",
@@ -472,53 +311,9 @@ describe("buildSystemPrompt", () => {
       new Set<LanguageId>(["typescript"]),
     );
 
-    const goalPlannerPrompt = await buildSystemPrompt(
-      normalCwd,
-      undefined,
-      false,
-      undefined,
-      [
-        "read",
-        "bash",
-        "goals",
-        "edit",
-        "write",
-        "subagent",
-        "source_path",
-        "web_search",
-        "web_fetch",
-        "mcp__kencode-search__referenceSources",
-        "mcp__kencode-search__discoverRepos",
-        "mcp__kencode-search__searchCode",
-      ],
-      undefined,
-      "planner",
-    );
-    const goalSetupPrompt = await buildSystemPrompt(
-      normalCwd,
-      undefined,
-      false,
-      undefined,
-      ["read", "bash", "goals", "edit", "write", "subagent"],
-      undefined,
-      "setup",
-    );
-    const goalCoordinatorPrompt = await buildSystemPrompt(
-      normalCwd,
-      undefined,
-      false,
-      undefined,
-      ["read", "goals", "bash", "subagent"],
-      undefined,
-      "coordinator",
-    );
-
     const measurements = {
       normal: promptSize(normalPrompt),
       planMode: promptSize(planModePrompt),
-      goalPlanner: promptSize(goalPlannerPrompt),
-      goalSetup: promptSize(goalSetupPrompt),
-      goalCoordinator: promptSize(goalCoordinatorPrompt),
       typescriptProjectContextToolsSkills: promptSize(typescriptPrompt),
     };
 
@@ -526,14 +321,8 @@ describe("buildSystemPrompt", () => {
 
     expect(measurements.normal.characters).toBeLessThan(4_800);
     expect(measurements.planMode.characters).toBeLessThan(5_600);
-    expect(measurements.goalPlanner.characters).toBeLessThan(6_800);
-    expect(measurements.goalSetup.characters).toBeLessThan(6_800);
-    expect(measurements.goalCoordinator.characters).toBeLessThan(6_800);
     expect(measurements.typescriptProjectContextToolsSkills.characters).toBeLessThan(9_500);
     expect(measurements.planMode.characters).toBeGreaterThan(measurements.normal.characters);
-    expect(measurements.goalPlanner.characters).toBeGreaterThan(measurements.normal.characters);
-    expect(measurements.goalSetup.characters).toBeGreaterThan(measurements.normal.characters);
-    expect(measurements.goalCoordinator.characters).toBeGreaterThan(measurements.normal.characters);
     expect(measurements.typescriptProjectContextToolsSkills.characters).toBeGreaterThan(
       measurements.normal.characters,
     );
@@ -572,5 +361,32 @@ describe("buildSystemPrompt", () => {
     expect(audit.flags).toEqual([]);
     expect(audit.size.characters).toBeLessThan(9_500);
     expect(audit.size.sections).toBeGreaterThanOrEqual(8);
+  });
+
+  it("uses the Claude Code identity for Anthropic and GG Coder for other providers", async () => {
+    const cwd = await makeProject();
+    const anthropic = await buildSystemPrompt(
+      cwd,
+      undefined,
+      false,
+      undefined,
+      ["read"],
+      undefined,
+      "anthropic",
+    );
+    const openai = await buildSystemPrompt(
+      cwd,
+      undefined,
+      false,
+      undefined,
+      ["read"],
+      undefined,
+      "openai",
+    );
+
+    expect(anthropic.startsWith("You are Claude Code")).toBe(true);
+    expect(anthropic).not.toContain("GG Coder by Ken Kai");
+    expect(openai.startsWith("You are GG Coder by Ken Kai")).toBe(true);
+    expect(openai).not.toContain("You are Claude Code");
   });
 });

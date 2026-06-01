@@ -5,6 +5,7 @@ import type { ActivityPhase, RetryInfo } from "../hooks/useAgentLoop.js";
 import type { useTheme } from "../theme/theme.js";
 import { ChatInputFooterStack } from "./ChatLayout.js";
 import { ChatStatusRow } from "./ChatStatusRow.js";
+import { LiveToolPanel, type LiveToolEntry } from "./LiveToolPanel.js";
 
 interface ChatInputStackProps {
   columns: number;
@@ -12,6 +13,7 @@ interface ChatInputStackProps {
   statusSlotVisible: boolean;
   activityVisible: boolean;
   stallStatusVisible: boolean;
+  liveToolFeed: readonly LiveToolEntry[];
   doneStatus: { verb: string; durationMs: number } | null;
   activityPhase: ActivityPhase;
   elapsedMs: number;
@@ -37,6 +39,7 @@ export function ChatInputStack({
   statusSlotVisible,
   activityVisible,
   stallStatusVisible,
+  liveToolFeed,
   doneStatus,
   activityPhase,
   elapsedMs,
@@ -67,6 +70,21 @@ export function ChatInputStack({
         width={columns}
         height={0}
       />
+      {activityVisible && activityPhase !== "generating" && liveToolFeed.length > 0 && (
+        <>
+          <LiveToolPanel entries={liveToolFeed} columns={columns} />
+          <Box
+            borderStyle="single"
+            borderTop
+            borderBottom={false}
+            borderLeft={false}
+            borderRight={false}
+            borderColor={theme.textDim}
+            width={columns}
+            height={0}
+          />
+        </>
+      )}
       <ChatStatusRow
         visible={statusSlotVisible}
         activityVisible={activityVisible}

@@ -5,15 +5,15 @@ export interface TranscriptSpacingItem {
   kind: string;
   text?: string;
   tools?: unknown;
+  continuation?: boolean;
 }
 
 export const TRANSCRIPT_SPACING_KINDS = [
   "user",
   "assistant",
+  "ideal_hook",
   "queued",
   "task",
-  "goal",
-  "goal_progress",
   "tool_start",
   "tool_done",
   "tool_group",
@@ -24,7 +24,6 @@ export const TRANSCRIPT_SPACING_KINDS = [
   "error",
   "stopped",
   "plan_transition",
-  "goal_agent_transition",
   "model_transition",
   "theme_transition",
   "plan_event",
@@ -45,8 +44,15 @@ const COMPACT_TRANSCRIPT_BOUNDARIES = new Set<string>([
   "user→assistant",
   "assistant→user",
   "user→queued",
-  "assistant→assistant",
 ]);
+
+// NOTE: `assistant→assistant` is intentionally NOT compact. Two consecutive
+// assistant items are separate responses (e.g. across tool turns, now that tool
+// rows render in the pinned LiveToolPanel instead of the transcript) and need a
+// blank-line separator. Continuation paragraphs of a SINGLE streamed response
+// are handled earlier via the `continuation` flag, which re-inserts the same
+// blank line before reaching this compact check — so paragraph breaks are not
+// affected by this exclusion.
 
 export function shouldSeparateTranscriptItems({
   previousKind,
@@ -160,6 +166,14 @@ export function getTranscriptItemMarginTop({
   const previousKind =
     previousLiveItem?.kind ?? lastPendingHistoryItem?.kind ?? lastHistoryItem?.kind;
   if (item.kind === "assistant") {
+    // A continuation chunk is the next paragraph of a SINGLE response whose
+    // earlier paragraphs were already flushed mid-stream. It always gets the
+    // blank line that separated the paragraphs in the original response, even
+    // when the text is empty. Mirrors the serializer's `leadingSeparator: true`
+    // for continuations. (Separate assistant responses are also separated below
+    // via the standard boundary rule, now that assistant→assistant is no longer
+    // a compact boundary.)
+    if (item.continuation === true && previousKind === "assistant") return 1;
     return shouldTopSpaceAssistantAfterToolBoundary({
       text: typeof item.text === "string" ? item.text : "",
       previousLiveItem,

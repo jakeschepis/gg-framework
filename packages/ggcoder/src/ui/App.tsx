@@ -3,12 +3,10 @@ import { Box, useStdout } from "ink";
 import { useTerminalSize } from "./hooks/useTerminalSize.js";
 import { useChatLayoutMeasurements } from "./hooks/useChatLayoutMeasurements.js";
 import { useTaskPickerController } from "./hooks/useTaskPickerController.js";
-import { useGoalPickerController } from "./hooks/useGoalPickerController.js";
 import { useModeState } from "./hooks/useModeState.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import { useContextCompaction } from "./hooks/useContextCompaction.js";
 import { usePixelFixFlow } from "./hooks/usePixelFixFlow.js";
-import { useGoalOrchestration } from "./hooks/useGoalOrchestration.js";
 import { useDoublePress } from "./hooks/useDoublePress.js";
 import {
   useTaskBarStore,
@@ -27,7 +25,7 @@ import {
   type ThinkingLevel,
   type TextContent,
 } from "@kenkaiiii/gg-ai";
-import { extractImagePaths, type ImageAttachment } from "../utils/image.js";
+import { downscaleForPreview, extractImagePaths, type ImageAttachment } from "../utils/image.js";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import { useAgentLoop, type StreamSnapshot, type UserContent } from "./hooks/useAgentLoop.js";
 import { useTranscriptHistory } from "./hooks/useTranscriptHistory.js";
@@ -36,14 +34,10 @@ import type { SubAgentInfo } from "./components/SubAgentPanel.js";
 import type { SubAgentUpdate, SubAgentDetails } from "../tools/subagent.js";
 import { createWebSearchTool } from "../tools/web-search.js";
 import { ChatScreen } from "./components/ChatScreen.js";
+import type { LiveToolEntry } from "./components/LiveToolPanel.js";
+import { LIVE_TOOL_PANEL_ROWS } from "./components/LiveToolPanel.js";
 import { FullScreenOverlayRouter } from "./components/FullScreenOverlayRouter.js";
 import { SessionSummaryDisplay } from "./components/SessionSummary.js";
-import {
-  reconcileGoalStatusEntriesWithRuns,
-  removeGoalStatusEntry,
-  syncGoalStatusEntries,
-  type GoalStatusEntry,
-} from "./components/GoalStatusBar.js";
 import type { PreparedPixelFix } from "../core/pixel-fix.js";
 import type { SlashCommandInfo } from "./components/SlashCommandMenu.js";
 import type { ProcessManager } from "../core/process-manager.js";
@@ -71,6 +65,8 @@ import { loadCustomCommands, type CustomCommand } from "../core/custom-commands.
 import { detectLanguages, type LanguageId } from "../core/language-detector.js";
 import { detectVerifyCommands } from "../core/verify-commands.js";
 import type { Skill } from "../core/skills.js";
+import type { CheckpointInfo, CheckpointStore, RestoreMode } from "../core/checkpoint-store.js";
+import { RewindOverlay } from "./components/RewindOverlay.js";
 import {
   extractPlanSteps,
   findCompletedMarkers,
@@ -89,35 +85,23 @@ import {
   flushOverflow,
 } from "./live-item-flush.js";
 import { splitAssistantStreamingText } from "./utils/assistant-stream-split.js";
-import {
-  goalHasBlockingPrerequisites,
-  loadGoalRuns,
-  reconcileActiveGoalRuns,
-  upsertGoalRun,
-  type GoalReference,
-  type GoalRun,
-} from "../core/goal-store.js";
 import { getNextPendingTask, markTaskInProgress } from "../core/tasks-store.js";
-import { listGoalWorkers, stopGoalWorker } from "../core/goal-worker.js";
-import { isGoalSyntheticEvent, parseGoalSyntheticEvent } from "./goal-events.js";
-import type { GoalMode } from "../core/runtime-mode.js";
 import type { TerminalHistoryPrinter } from "./terminal-history.js";
 import { buildUserContentWithAttachments } from "./prompt-routing.js";
 import { submitPromptCommand } from "./submit-prompt-command.js";
 import { handleUiSlashCommand } from "./submit-slash-commands.js";
+import { buildIdealReviewMessage, evaluateIdealReview } from "../core/ideal-review.js";
 import { getNextThinkingLevel, isThinkingLevelSupported } from "./thinking-level.js";
 import {
-  appendGoalProgressDraft,
-  completedItemsWithDurableGoalTerminalProgress,
-} from "./goal-progress.js";
-import {
   getDoneFlushDecision,
-  nextGoalModeAfterAgentDone,
   shouldTopSpaceAfterPrintedAgentBoundary,
   shouldTopSpaceStreamingAssistant,
   type DoneStatus,
 } from "./layout-decisions.js";
 import { isTranscriptSpacingItem } from "./transcript/spacing.js";
+import { buildTranscriptLines } from "./transcript/transcript-lines.js";
+import { useTranscriptScroll } from "./hooks/useTranscriptScroll.js";
+import { scrollTranscriptByLines } from "./stores/transcript-scroll-store.js";
 import { renderTranscriptItem } from "./transcript/TranscriptRenderer.js";
 import { formatDuration } from "./duration-format.js";
 import { pickDurationVerb } from "./duration-summary.js";
@@ -144,56 +128,33 @@ import {
 } from "./item-helpers.js";
 import type {
   CompletedItem,
-  GoalProgressDraft,
+  ImagePreview,
   QueuedItem,
   SessionSummaryItem,
   ServerToolDoneItem,
   ServerToolStartItem,
   SubAgentGroupItem,
+  TaskItem,
   ToolDoneItem,
   ToolGroupItem,
   ToolStartItem,
   UserItem,
 } from "./app-items.js";
 
-export type {
-  CompletedItem,
-  GoalProgressDraft,
-  GoalProgressItem,
-  ToolGroupItem,
-} from "./app-items.js";
+export type { CompletedItem, ToolGroupItem } from "./app-items.js";
+import { IDEAL_HOOK_NOTICE_TEXT, lastVisibleTranscriptItem } from "./app-items.js";
 export type { DoneStatus } from "./layout-decisions.js";
-export {
-  buildGoalSetupPromptFromPlanner,
-  buildUserContentWithAttachments,
-  collectAssistantTextSince,
-  isGoalPromptCommandName,
-  routePromptCommandInput,
-  runGoalPromptSetupSequence,
-} from "./prompt-routing.js";
+export { buildUserContentWithAttachments, routePromptCommandInput } from "./prompt-routing.js";
 export { getNextThinkingLevel } from "./thinking-level.js";
-export {
-  appendGoalProgressDraft,
-  completedItemsWithDurableGoalTerminalProgress,
-  formatGoalTerminalProgress,
-  getGoalContinuationChoiceKey,
-  routeGoalSyntheticEvent,
-  truncateGoalProgressText,
-} from "./goal-progress.js";
 export {
   getChatControlsLayoutDecision,
   getDoneFlushDecision,
-  getGoalActivationPaneTransition,
-  getGoalSetupFinishedPaneTransition,
-  getGoalSetupPaneTransitionAfterRun,
   getScrollStabilizationDecision,
   getStaticHistoryKey,
   hasParagraphBreakLiveUserMessage,
   isTallLiveUserMessage,
-  nextGoalModeAfterAgentDone,
   shouldHideHistoryForOverlayView,
   shouldHideStaticItemsForOverlayView,
-  shouldResetUIForGoalSetupPaneTransition,
   shouldStabilizeOverlayPaneRerender,
   shouldTopSpaceAfterPrintedAgentBoundary,
   shouldTopSpaceAssistantAfterToolBoundary,
@@ -205,15 +166,6 @@ export {
   partitionCompleted,
   pinStreamingTextBeforeToolBoundary,
 } from "./item-helpers.js";
-export {
-  buildGoalDirtyWorktreePauseRun,
-  buildGoalDirtyWorktreeUserPrompt,
-  buildGoalUserPauseRun,
-  goalDirtyWorktreeInfoText,
-  goalRunNeedsExplicitContinuationAfterWorker,
-  shouldKeepGoalRunTrackedAfterDecision,
-  shouldRunGoalTaskInMainCheckout,
-} from "./goal-run-helpers.js";
 
 /** Tools that get aggregated into a single compact group when possible. */
 const AGGREGATABLE_TOOLS = new Set([
@@ -245,6 +197,7 @@ export interface AppProps {
   cwd: string;
   version: string;
   showTokenUsage?: boolean;
+  idealReviewEnabled?: boolean;
   onSlashCommand?: (input: string) => Promise<string | null>;
   loggedInProviders?: Provider[];
   credentialsByProvider?: Record<
@@ -259,18 +212,26 @@ export interface AppProps {
   settingsFile?: string;
   mcpManager?: MCPClientManager;
   authStorage?: AuthStorage;
-  goalModeRef?: { current: GoalMode };
   planModeRef?: { current: boolean };
   skills?: Skill[];
-  initialOverlay?: "pixel" | "goal";
+  /** Per-session file checkpoint store backing the /rewind command. */
+  checkpointStore?: CheckpointStore;
+  initialOverlay?: "pixel";
   rebuildToolsForCwd?: (cwd: string) => AgentTool[];
-  goalReferencesRef?: { current: readonly GoalReference[] | undefined };
   connectInitialMcpTools?: () => Promise<AgentTool[]>;
   planCallbacks?: {
     onEnterPlan?: (reason?: string) => void | Promise<void>;
     onExitPlan?: (planPath: string) => Promise<string>;
   };
   terminalHistoryPrinter?: TerminalHistoryPrinter;
+  /**
+   * When true, the UI runs in the alternate-screen fullscreen viewport: the
+   * transcript is rendered inside Ink as a bounded, app-scrolled region above a
+   * pinned controls region, and nothing is written to native scrollback. This
+   * is what keeps the footer a truly fixed bottom region. Defaults off (legacy
+   * scrollback path) for non-TTY / CI / print modes.
+   */
+  fullscreen?: boolean;
   /**
    * Wired by `renderApp`. Tears down the current Ink instance and renders
    * a fresh one. Patching Ink's internal frame tracking in place is
@@ -324,27 +285,43 @@ export interface AppProps {
     sessionId?: string;
     sessionTitle?: string;
     sessionTitleGenerated: boolean;
-    overlay?: "model" | "goal" | "skills" | "plan" | "theme" | "pixel" | null;
+    overlay?: "model" | "skills" | "plan" | "theme" | "pixel" | null;
     planAutoExpand?: boolean;
-    goalAutoExpand?: boolean;
     pendingAction?: {
       prompt: string;
       infoText?: string;
       planEvent?: { event: "approved" | "rejected" | "dismissed"; detail?: string };
     };
-    pendingGoalRun?: GoalRun;
     isAgentRunning?: boolean;
     pendingResetUI?: boolean;
     runAllTasks?: boolean;
     runAllPixel?: boolean;
-    goalStatusEntries?: GoalStatusEntry[];
-    goalMode?: GoalMode;
     planMode?: boolean;
     sessionStats?: SessionStats;
+    idealReviewEnabled?: boolean;
   };
 }
 
 // ── App Component ──────────────────────────────────────────
+
+/**
+ * Extract inline image previews carried on a tool result's `details` payload.
+ * Image-producing tools (e.g. screenshot) attach `{ imagePreviews: [...] }` so
+ * the terminal-history printer can render the captured pixels inline.
+ */
+function extractToolImagePreviews(details: unknown): ImagePreview[] | undefined {
+  if (!details || typeof details !== "object") return undefined;
+  const previews = (details as { imagePreviews?: unknown }).imagePreviews;
+  if (!Array.isArray(previews)) return undefined;
+  const valid = previews.filter(
+    (p): p is ImagePreview =>
+      typeof p === "object" &&
+      p !== null &&
+      typeof (p as ImagePreview).base64 === "string" &&
+      typeof (p as ImagePreview).mediaType === "string",
+  );
+  return valid.length > 0 ? valid : undefined;
+}
 
 export function App(props: AppProps) {
   const theme = useTheme();
@@ -354,6 +331,9 @@ export function App(props: AppProps) {
 
   // Hoisted before terminal title hook so it can reference them
   const [lastUserMessage, setLastUserMessage] = useState("");
+  // Bumped on every prompt submit; the fullscreen transcript scroll controller
+  // watches this to snap back to the bottom so the newest output is visible.
+  const [scrollResetToken, setScrollResetToken] = useState(0);
   const [exitPending, setExitPending] = useState(false);
   const [quittingSummary, setQuittingSummary] = useState<SessionSummaryItem["summary"] | null>(
     null,
@@ -383,31 +363,32 @@ export function App(props: AppProps) {
     return [{ kind: "banner", id: "banner" }];
   });
   // Items from the current/last turn — rendered in the live area so they stay visible.
-  // Seed from sessionStore so Goal progress/completion rows and other live output
-  // survive pane/overlay/resize remounts before they are finalized.
+  // Seed from sessionStore so live output
+  // survives pane/overlay/resize remounts before it is finalized.
   const [liveItems, setLiveItems] = useState<CompletedItem[]>(() => {
     const restoredLiveItems = uniqueItemsById(props.sessionStore?.liveItems ?? []);
     const restoredHistoryIds = new Set(history.map((item) => item.id));
     return removeItemsWithIds(restoredLiveItems, restoredHistoryIds);
   });
+  // Rolling feed of recent tool actions for the pinned LiveToolPanel. Kept
+  // separate from `liveItems` (the scrollback record) so tool calls mutate in
+  // place above the activity bar instead of spamming the transcript.
+  const [liveToolFeed, setLiveToolFeed] = useState<LiveToolEntry[]>([]);
   // overlay seeded from sessionStore (lives across remount). Falls back to
   // props.initialOverlay (CLI launched with one), then null.
-  const [overlay, setOverlay] = useState<
-    "model" | "goal" | "skills" | "plan" | "theme" | "pixel" | null
-  >(props.sessionStore?.overlay ?? props.initialOverlay ?? null);
-  const [goalStatusEntries, setGoalStatusEntries] = useState<GoalStatusEntry[]>(
-    props.sessionStore?.goalStatusEntries ?? [],
+  const [overlay, setOverlay] = useState<"model" | "skills" | "plan" | "theme" | "pixel" | null>(
+    props.sessionStore?.overlay ?? props.initialOverlay ?? null,
   );
   const [updatePending, setUpdatePending] = useState<boolean>(
     () => getPendingUpdate(props.version) !== null,
   );
+  // Signal that pushes text into the InputArea composer (e.g. restoring queued
+  // messages after an interrupt). Bumping `nonce` triggers the injection even
+  // when the text is identical to a prior restore.
+  const [composerInject, setComposerInject] = useState<{ text: string; nonce: number } | null>(
+    null,
+  );
   const agentRunningRef = useRef(false);
-  const runningGoalIdsRef = useRef<Set<string>>(new Set());
-  const activeVerifierRunIdsRef = useRef<Set<string>>(new Set());
-  const queuedGoalSyntheticEventsRef = useRef(0);
-  const goalContinuationFlightsRef = useRef<Set<string>>(new Set());
-  const goalContinuationRecentChoicesRef = useRef<Map<string, number>>(new Map());
-  const startGoalRunRef = useRef<(run: GoalRun) => void>(() => {});
   const [runAllTasks, setRunAllTasks] = useState(props.sessionStore?.runAllTasks ?? false);
   const runAllTasksRef = useRef(props.sessionStore?.runAllTasks ?? false);
   const startTaskRef = useRef<(title: string, prompt: string, taskId: string) => void>(() => {});
@@ -416,6 +397,10 @@ export function App(props: AppProps) {
   const startPixelFixRef = useRef<(errorId: string) => void>(() => {});
   const cwdRef = useRef(props.cwd);
   const [displayedCwd, setDisplayedCwd] = useState(props.cwd);
+  // /rewind overlay: holds the checkpoint list while the picker is open.
+  const [rewindCheckpoints, setRewindCheckpoints] = useState<CheckpointInfo[] | null>(null);
+  // Monotonic user-turn counter keying per-turn checkpoints.
+  const rewindTurnRef = useRef(0);
   const taskPicker = useTaskPickerController({
     displayedCwd,
     onStartTask: (title, prompt, taskId) => startTaskRef.current(title, prompt, taskId),
@@ -426,18 +411,16 @@ export function App(props: AppProps) {
   );
   // Suppress "done" status when a plan overlay is about to open
   const planOverlayPendingRef = useRef(false);
-  const goalSetupPanePendingRef = useRef(false);
   const [gitBranch, setGitBranch] = useState<string | null>(null);
   const [currentModel, setCurrentModel] = useState(props.model);
   const [currentProvider, setCurrentProvider] = useState(props.provider);
+  const currentProviderRef = useRef(props.provider);
   const [currentTools, setCurrentTools] = useState(props.tools);
   const currentToolsRef = useRef(props.tools);
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel | undefined>(props.thinking);
   const [renderMarkdown, setRenderMarkdown] = useState(true);
   const messagesRef = useRef<Message[]>(props.sessionStore?.messages ?? props.messages);
   const [planAutoExpand, setPlanAutoExpand] = useState(props.sessionStore?.planAutoExpand ?? false);
-  const [goalAutoExpand, setGoalAutoExpand] = useState(props.sessionStore?.goalAutoExpand ?? false);
-  const goalAutoExpandRef = useRef(props.sessionStore?.goalAutoExpand ?? false);
   const approvedPlanPathRef = useRef<string | undefined>(props.sessionStore?.approvedPlanPath);
   const planStepsRef = useRef<PlanStep[]>(props.sessionStore?.planSteps ?? []);
   const [planSteps, setPlanSteps] = useState<PlanStep[]>(props.sessionStore?.planSteps ?? []);
@@ -448,7 +431,7 @@ export function App(props: AppProps) {
   const followUpNudgesRef = useRef<{ step: number; count: number }>({ step: 0, count: 0 });
   // Seed the per-item ID counter so it doesn't collide with IDs already in
   // sessionStore.history (which survives remount). Without this, a remount
-  // (resize, overlay toggle, goal pane open, etc.) starts the counter at 0
+  // (resize, overlay toggle, task pane open, etc.) starts the counter at 0
   // and new items generate ids "ui-0", "ui-1", "ui-2"… that collide with
   // the same ids from the previous mount, triggering React's duplicate-key
   // warning and causing duplicate/omitted renders.
@@ -467,6 +450,10 @@ export function App(props: AppProps) {
     props.sessionStore?.sessionStats ??
       createSessionStats({ sessionId: props.sessionStore?.sessionId ?? props.sessionId }),
   );
+  const [idealReviewEnabled, setIdealReviewEnabled] = useState(
+    props.sessionStore?.idealReviewEnabled ?? props.idealReviewEnabled ?? true,
+  );
+  const idealReviewEnabledRef = useRef(idealReviewEnabled);
   /** Last actual API-reported input token count (from turn_end). */
   const lastActualTokensRef = useRef(0);
   /** Timestamp (ms) when lastActualTokensRef was last updated by turn_end. */
@@ -493,66 +480,26 @@ export function App(props: AppProps) {
   const triggerAutoSetupRef = useRef<() => Promise<void>>(async () => {});
 
   const getId = () => `ui-${nextIdRef.current++}`;
-  const appendGoalAgentTransition = useCallback((text: string) => {
-    setLiveItems((prev) => [...prev, { kind: "goal_agent_transition", text, id: getId() }]);
-  }, []);
-  const appendGoalProgress = useCallback((item: GoalProgressDraft) => {
-    setLiveItems((prev) => appendGoalProgressDraft(prev, item, getId));
-  }, []);
-  const goalNumberForRun = useCallback(
-    (runId: string) =>
-      Math.max(1, goalStatusEntries.findIndex((entry) => entry.runId === runId) + 1),
-    [goalStatusEntries],
-  );
-  const clearGoalStatusEntry = useCallback(
-    (runId: string) => {
-      setGoalStatusEntries((prev) => {
-        const next = removeGoalStatusEntry(prev, runId);
-        if (props.sessionStore) props.sessionStore.goalStatusEntries = next;
-        return next;
-      });
-    },
-    [props.sessionStore],
-  );
-  const upsertGoalStatusEntry = useCallback(
-    (entry: GoalStatusEntry) => {
-      setGoalStatusEntries((prev) => {
-        const next = syncGoalStatusEntries(prev, entry);
-        if (props.sessionStore) props.sessionStore.goalStatusEntries = next;
-        return next;
-      });
-    },
-    [props.sessionStore],
-  );
+
+  useEffect(() => {
+    idealReviewEnabledRef.current = idealReviewEnabled;
+    if (props.sessionStore) props.sessionStore.idealReviewEnabled = idealReviewEnabled;
+  }, [idealReviewEnabled, props.sessionStore]);
 
   const sessionStore = props.sessionStore;
 
-  const {
-    goalMode,
-    planMode,
-    goalModeStateRef,
-    planModeStateRef,
-    rebuildSystemPrompt,
-    replaceSystemPrompt,
-    setGoalModeAndPrompt,
-    setPlanModeAndPrompt,
-    clearGoalModeIfIdle,
-  } = useModeState({
-    initialGoalMode: props.sessionStore?.goalMode ?? props.goalModeRef?.current ?? "off",
-    initialPlanMode: props.sessionStore?.planMode ?? props.planModeRef?.current ?? false,
-    skills: props.skills,
-    goalModeRef: props.goalModeRef,
-    planModeRef: props.planModeRef,
-    sessionStore: props.sessionStore,
-    cwdRef,
-    currentToolsRef,
-    approvedPlanPathRef,
-    injectedLanguagesRef,
-    messagesRef,
-    runningGoalIdsRef,
-    activeVerifierRunIdsRef,
-    queuedGoalSyntheticEventsRef,
-  });
+  const { planMode, rebuildSystemPrompt, replaceSystemPrompt, setPlanModeAndPrompt } = useModeState({
+      initialPlanMode: props.sessionStore?.planMode ?? props.planModeRef?.current ?? false,
+      skills: props.skills,
+      planModeRef: props.planModeRef,
+      sessionStore: props.sessionStore,
+      cwdRef,
+      currentToolsRef,
+      providerRef: currentProviderRef,
+      approvedPlanPathRef,
+      injectedLanguagesRef,
+      messagesRef,
+    });
 
   const {
     pendingHistoryFlushRef,
@@ -561,7 +508,12 @@ export function App(props: AppProps) {
     finalizeSubmittedUserItem,
     clearPendingHistory,
   } = useTranscriptHistory({
-    terminalHistoryPrinter: props.terminalHistoryPrinter,
+    // In fullscreen alt-screen mode the transcript renders inside Ink (the
+    // viewport), so we must NOT write completed rows to native scrollback —
+    // doing so would scroll the live frame. Dropping the printer keeps history
+    // accumulating in React state (still flushed + persisted) without any
+    // stdout writes. The legacy scrollback path keeps the printer.
+    terminalHistoryPrinter: props.fullscreen ? undefined : props.terminalHistoryPrinter,
     terminalHistoryContext: {
       theme,
       columns,
@@ -627,16 +579,6 @@ export function App(props: AppProps) {
     if (sessionStore) sessionStore.overlay = overlay;
   }, [overlay, sessionStore]);
   useEffect(() => {
-    goalAutoExpandRef.current = goalAutoExpand;
-    if (sessionStore) sessionStore.goalAutoExpand = goalAutoExpand;
-  }, [goalAutoExpand, sessionStore]);
-  useEffect(() => {
-    if (sessionStore) sessionStore.goalStatusEntries = goalStatusEntries;
-  }, [goalStatusEntries, sessionStore]);
-  useEffect(() => {
-    if (sessionStore) sessionStore.goalMode = goalMode;
-  }, [goalMode, sessionStore]);
-  useEffect(() => {
     if (sessionStore) sessionStore.planMode = planMode;
   }, [planMode, sessionStore]);
   useEffect(() => {
@@ -665,41 +607,6 @@ export function App(props: AppProps) {
     getGitBranch(displayedCwd).then(setGitBranch);
   }, [displayedCwd]);
 
-  useEffect(() => {
-    let cancelled = false;
-    const refreshGoalCount = () => {
-      void reconcileActiveGoalRuns(props.cwd, {
-        isWorkerActive: (workerId) =>
-          listGoalWorkers(props.cwd).some(
-            (worker) => worker.id === workerId && worker.status === "running",
-          ),
-      }).then(({ runs }) => {
-        if (cancelled) return;
-        setHistory((prev) => completedItemsWithDurableGoalTerminalProgress(prev, runs));
-        setGoalStatusEntries((prev) => {
-          const next = reconcileGoalStatusEntriesWithRuns(prev, runs, {
-            isWorkerActive: (workerId, run) =>
-              listGoalWorkers(props.cwd).some(
-                (worker) =>
-                  worker.id === workerId &&
-                  worker.goalRunId === run.id &&
-                  worker.status === "running",
-              ),
-            isVerifierActive: (run) => activeVerifierRunIdsRef.current.has(run.id),
-          });
-          if (props.sessionStore) props.sessionStore.goalStatusEntries = next;
-          return next;
-        });
-      });
-    };
-    refreshGoalCount();
-    const interval = setInterval(refreshGoalCount, 1000);
-    return () => {
-      cancelled = true;
-      clearInterval(interval);
-    };
-  }, [props.cwd]);
-
   // Periodic update check during long sessions
   useEffect(() => {
     startPeriodicUpdateCheck(props.version, (msg) => {
@@ -721,13 +628,6 @@ export function App(props: AppProps) {
   useEffect(() => {
     currentToolsRef.current = currentTools;
   }, [currentTools]);
-
-  const setActiveGoalReferences = useCallback(
-    (references: readonly GoalReference[] | undefined): void => {
-      if (props.goalReferencesRef) props.goalReferencesRef.current = references;
-    },
-    [props.goalReferencesRef],
-  );
 
   useEffect(() => {
     if (!props.connectInitialMcpTools) return;
@@ -965,6 +865,20 @@ export function App(props: AppProps) {
       projectId: activeProjectId,
       resolveCredentials,
       transformContext,
+      getIdealReviewMessage: (stats) => {
+        if (!idealReviewEnabledRef.current) return null;
+        const decision = evaluateIdealReview(stats);
+        if (!decision.shouldReview) return null;
+        log("INFO", "ideal", "Injecting ideal review before final response", {
+          score: String(decision.score),
+          reasons: decision.reasons.join(", "),
+        });
+        setLiveItems((prev) => [
+          ...prev,
+          { kind: "ideal_hook", text: IDEAL_HOOK_NOTICE_TEXT, id: getId() },
+        ]);
+        return buildIdealReviewMessage(decision.reasons);
+      },
     },
     {
       onComplete: useCallback(() => {
@@ -1036,10 +950,6 @@ export function App(props: AppProps) {
       ]),
       onTurnText: useCallback(
         (text: string, thinking: string, thinkingMs: number) => {
-          if (goalModeStateRef.current === "planner") {
-            return;
-          }
-
           const hadStreamedAssistantFlush = streamedAssistantFlushRef.current.flushedChars > 0;
           const unflushedAssistantText = text.slice(streamedAssistantFlushRef.current.flushedChars);
 
@@ -1135,6 +1045,14 @@ export function App(props: AppProps) {
           log("INFO", "tool", `Tool call started: ${name}`, { id: toolCallId });
           const startedAt = Date.now();
           const animateUntil = startedAt + RUNNING_INDICATOR_ANIMATION_MS;
+
+          // Feed the pinned LiveToolPanel. Keep a small tail (panel shows the
+          // last few rows) so memory stays bounded across long sessions.
+          setLiveToolFeed((prev) =>
+            [...prev, { id: toolCallId, name, args, status: "running" as const }].slice(
+              -(LIVE_TOOL_PANEL_ROWS * 2),
+            ),
+          );
 
           const appendToolStart = (prev: CompletedItem[]): CompletedItem[] => {
             const visible = pinStreamingTextBeforeToolBoundary({
@@ -1275,6 +1193,13 @@ export function App(props: AppProps) {
           details?: unknown,
         ) => {
           recordToolEnd(sessionStatsRef.current, name, isError, durationMs);
+          setLiveToolFeed((prev) =>
+            prev.map((entry) =>
+              entry.id === toolCallId
+                ? { ...entry, status: "done" as const, isError, result, details }
+                : entry,
+            ),
+          );
           if (name === "edit" && !isError) {
             const diff = (details as { diff?: string } | undefined)?.diff ?? result;
             addLinesChanged(sessionStatsRef.current, {
@@ -1371,6 +1296,7 @@ export function App(props: AppProps) {
                     isError,
                     durationMs,
                     details,
+                    imagePreviews: extractToolImagePreviews(details),
                     id: startItem.id,
                   };
                   updated = [...prev];
@@ -1387,6 +1313,7 @@ export function App(props: AppProps) {
                       isError,
                       durationMs,
                       details,
+                      imagePreviews: extractToolImagePreviews(details),
                       id: getId(),
                     },
                   ];
@@ -1530,116 +1457,90 @@ export function App(props: AppProps) {
         },
         [queueFlush],
       ),
-      onDone: useCallback(
-        (durationMs: number, toolsUsed: string[]) => {
-          log("INFO", "agent", `Agent done`, {
-            duration: `${durationMs}ms`,
-            toolsUsed: toolsUsed.join(",") || "none",
+      onDone: useCallback((durationMs: number, toolsUsed: string[]) => {
+        log("INFO", "agent", `Agent done`, {
+          duration: `${durationMs}ms`,
+          toolsUsed: toolsUsed.join(",") || "none",
+        });
+        const doneDecision = getDoneFlushDecision({
+          planOverlayPending: planOverlayPendingRef.current,
+        });
+        // Don't show "done" status when the plan review pane is about to open —
+        // the agent loop finished but we're waiting for user approval/review.
+        // Still flush live transcript rows before the pane remounts; otherwise
+        // setup output remains in ephemeral liveItems and appears to vanish.
+        if (doneDecision.showDoneStatus) {
+          setDoneStatus({ durationMs, toolsUsed, verb: pickDurationVerb(toolsUsed) });
+          playNotificationSound();
+        }
+        // Keep the final assistant response mounted in the live frame after a
+        // normal chat turn finishes. Moving a large final response to terminal
+        // history at this moment writes many scrollback rows while the footer is
+        // still mounted, which visibly pushes the input/footer upward. The final
+        // response is flushed on the next submit before the new prompt is shown.
+        // Non-chat overlay transitions still flush so setup/plan output
+        // does not vanish during remounts.
+        if (doneDecision.flushLiveItems && !doneDecision.showDoneStatus) {
+          setLiveItems((prev) => {
+            if (prev.length > 0) queueFlush(prev);
+            return prev;
           });
-          const doneDecision = getDoneFlushDecision({
-            planOverlayPending: planOverlayPendingRef.current,
-            goalMode: goalModeStateRef.current,
-            goalAutoExpand: goalAutoExpandRef.current,
-          });
-          // Don't show "done" status when plan/goal review panes are about to open —
-          // the agent loop finished but we're waiting for user approval/review.
-          // Still flush live transcript rows before the pane remounts; otherwise
-          // setup output remains in ephemeral liveItems and appears to vanish.
-          if (doneDecision.showDoneStatus) {
-            setDoneStatus({ durationMs, toolsUsed, verb: pickDurationVerb(toolsUsed) });
-            playNotificationSound();
-          }
-          // Finalize rows. Do NOT clear the live area here — keep the items
-          // mounted and let the flush drain effect write them to scrollback
-          // FIRST and only then remove them from the live area. Clearing live
-          // up front (return []) erases the rows a frame before the sink writes
-          // them back into scrollback, which makes each finalized item blink
-          // out and the TUI jump as the agent finishes. Write-then-clear keeps
-          // every row continuously on screen (live → scrollback), matching how
-          // Ink's <Static> moves a finalized item in a single atomic frame.
-          if (doneDecision.flushLiveItems) {
-            setLiveItems((prev) => {
-              if (prev.length > 0) queueFlush(prev);
-              return prev;
-            });
-          }
+        }
 
-          const nextGoalMode = nextGoalModeAfterAgentDone({
-            currentMode: goalModeStateRef.current,
-            runningGoalIds: runningGoalIdsRef.current.size,
-            queuedSyntheticEvents: queuedGoalSyntheticEventsRef.current,
-            activeContinuationFlights: goalContinuationFlightsRef.current.size,
-          });
-          if (nextGoalMode !== goalModeStateRef.current) {
-            void setGoalModeAndPrompt(nextGoalMode);
-          }
+        // Run-all: auto-start next pending task after a short delay.
+        if (runAllTasksRef.current) {
+          setTimeout(() => {
+            const cwd = cwdRef.current;
+            const next = getNextPendingTask(cwd);
+            if (next) {
+              markTaskInProgress(cwd, next.id);
+              startTaskRef.current(next.title, next.prompt, next.id);
+            } else {
+              setRunAllTasks(false);
+              log("INFO", "tasks", "Run-all complete — no more pending tasks");
+            }
+          }, 500);
+        }
 
-          // Run-all: auto-start next pending task after a short delay.
-          if (runAllTasksRef.current) {
-            setTimeout(() => {
-              const cwd = cwdRef.current;
-              const next = getNextPendingTask(cwd);
-              if (next) {
-                markTaskInProgress(cwd, next.id);
-                startTaskRef.current(next.title, next.prompt, next.id);
-              } else {
-                setRunAllTasks(false);
-                log("INFO", "tasks", "Run-all complete — no more pending tasks");
-              }
-            }, 500);
-          }
+        // Pixel fix: observe branch + commits, patch status, optionally pick
+        // up the next open error if run-all is active.
+        const pendingFix = currentPixelFixRef.current;
+        if (pendingFix) {
+          currentPixelFixRef.current = null;
+          void (async () => {
+            try {
+              const { finalizePixelFix } = await import("../core/pixel-fix.js");
+              const result = await finalizePixelFix(pendingFix);
+              log("INFO", "pixel", `Pixel fix done: ${result.outcome}`, {
+                errorId: pendingFix.errorId,
+                reason: result.reason,
+              });
+            } catch (err) {
+              log("ERROR", "pixel", `Pixel finalize failed: ${(err as Error).message}`);
+            }
 
-          // Goal loop: after the orchestrator handles a worker/verifier event,
-          // continue the same Goal automatically until it reaches a terminal state.
-          for (const runId of [...runningGoalIdsRef.current]) {
-            setTimeout(() => continueGoalRun(runId), 500);
-          }
-
-          // Pixel fix: observe branch + commits, patch status, optionally pick
-          // up the next open error if run-all is active.
-          const pendingFix = currentPixelFixRef.current;
-          if (pendingFix) {
-            currentPixelFixRef.current = null;
-            void (async () => {
-              try {
-                const { finalizePixelFix } = await import("../core/pixel-fix.js");
-                const result = await finalizePixelFix(pendingFix);
-                log("INFO", "pixel", `Pixel fix done: ${result.outcome}`, {
-                  errorId: pendingFix.errorId,
-                  reason: result.reason,
-                });
-              } catch (err) {
-                log("ERROR", "pixel", `Pixel finalize failed: ${(err as Error).message}`);
-              }
-
-              if (runAllPixelRef.current) {
-                setTimeout(() => {
-                  void (async () => {
-                    const { fetchPixelEntries } = await import("../core/pixel.js");
-                    const data = await fetchPixelEntries();
-                    const next = data.entries.find((e) => e.status === "open");
-                    if (next) {
-                      startPixelFixRef.current(next.errorId);
-                    } else {
-                      setRunAllPixel(false);
-                      log("INFO", "pixel", "Run-all complete — no more open errors");
-                    }
-                  })();
-                }, 500);
-              }
-            })();
-          }
-        },
-        [setGoalModeAndPrompt],
-      ),
+            if (runAllPixelRef.current) {
+              setTimeout(() => {
+                void (async () => {
+                  const { fetchPixelEntries } = await import("../core/pixel.js");
+                  const data = await fetchPixelEntries();
+                  const next = data.entries.find((e) => e.status === "open");
+                  if (next) {
+                    startPixelFixRef.current(next.errorId);
+                  } else {
+                    setRunAllPixel(false);
+                    log("INFO", "pixel", "Run-all complete — no more open errors");
+                  }
+                })();
+              }, 500);
+            }
+          })();
+        }
+      }, []),
       onAborted: useCallback(() => {
         log("WARN", "agent", "Agent run aborted by user");
         setRunAllPixel(false);
         currentPixelFixRef.current = null;
-        queuedGoalSyntheticEventsRef.current = 0;
-        goalSetupPanePendingRef.current = false;
-        setActiveGoalReferences(undefined);
-        if (goalModeStateRef.current !== "off") void setGoalModeAndPrompt("off");
         setDoneStatus(null);
         setLiveItems((prev) => {
           const next = prev.map((item): CompletedItem => {
@@ -1683,12 +1584,11 @@ export function App(props: AppProps) {
           });
           return [...next, { kind: "stopped", text: "Request was stopped.", id: getId() }];
         });
-      }, [setActiveGoalReferences, setGoalModeAndPrompt]),
+      }, []),
       onQueuedStart: useCallback(
         (content: UserContent) => {
           // When a queued message starts processing, show it as a UserItem
-          // and flush prior items to history. Synthetic system events are hidden
-          // from the transcript but still routed through the main agent context.
+          // and flush prior items to history.
           const displayText =
             typeof content === "string"
               ? content
@@ -1696,34 +1596,6 @@ export function App(props: AppProps) {
                   .filter((c): c is TextContent => c.type === "text")
                   .map((c) => c.text)
                   .join("\n");
-          if (isGoalSyntheticEvent(displayText)) {
-            queuedGoalSyntheticEventsRef.current = Math.max(
-              0,
-              queuedGoalSyntheticEventsRef.current - 1,
-            );
-            void setGoalModeAndPrompt("coordinator");
-            const eventInfo = parseGoalSyntheticEvent(displayText);
-            // Write-then-clear: keep the rows mounted and let the flush drain
-            // print them to scrollback before removing them, so they don't blink
-            // out of the live area a frame before reappearing in scrollback.
-            setLiveItems((prev) => {
-              if (prev.length > 0) queueFlush(prev);
-              return prev;
-            });
-            setDoneStatus(null);
-            appendGoalProgress({
-              kind: "goal_progress",
-              phase: "orchestrator_reviewing",
-              title: "Orchestrator reviewing Goal update",
-              detail:
-                eventInfo?.kind === "worker"
-                  ? `Worker ${eventInfo.worker ?? "finished"} reported back${eventInfo.task ? ` on ${eventInfo.task}` : ""}. Inspecting Goal state.`
-                  : `Verifier reported ${eventInfo?.status ?? "status"}. Inspecting evidence and next action.`,
-              workerId: eventInfo?.worker,
-              status: eventInfo?.status,
-            });
-            return;
-          }
           const imageCount =
             typeof content === "string"
               ? undefined
@@ -1738,7 +1610,7 @@ export function App(props: AppProps) {
           setDoneStatus(null);
           finalizeSubmittedUserItem(userItem);
         },
-        [appendGoalProgress, finalizeSubmittedUserItem, setGoalModeAndPrompt],
+        [finalizeSubmittedUserItem],
       ),
       // Inject a "continue with the next step" follow-up when the agent
       // would otherwise stop mid-plan. The prompt-only instruction wasn't
@@ -1858,24 +1730,17 @@ export function App(props: AppProps) {
 
   // Consume pending post-remount work once on mount. Set by resetUI options
   // for paths that remount AND immediately drive work (plan accept/reject,
-  // pixel fix, Goal approval). The work survives the unmount because
+  // pixel fix, plan accept/reject). The work survives the unmount because
   // it lives in renderApp's closure (sessionStore), not React state.
   useEffect(() => {
     if (pendingActionConsumedRef.current) return;
     const action = sessionStore?.pendingAction;
-    const pendingGoalRun = sessionStore?.pendingGoalRun;
-    if (!action && !pendingGoalRun) return;
+    if (!action) return;
     pendingActionConsumedRef.current = true;
     if (sessionStore) {
       sessionStore.pendingAction = undefined;
-      sessionStore.pendingGoalRun = undefined;
     }
     setDoneStatus(null);
-    if (pendingGoalRun) {
-      startGoalRunRef.current(pendingGoalRun);
-      return;
-    }
-    if (!action) return;
     if (action.planEvent) {
       const ev = action.planEvent;
       setLiveItems((prev) => [
@@ -1914,6 +1779,53 @@ export function App(props: AppProps) {
         // surface the badge when packs are newly applicable. No-op if the set
         // has not grown.
         await applyLanguageDetectionRef.current("input");
+      }
+
+      if (trimmed === "/ideal-on" || trimmed === "/ideal-off") {
+        const next = trimmed === "/ideal-on";
+        setIdealReviewEnabled(next);
+        if (props.settingsFile) {
+          const sm = new SettingsManager(props.settingsFile);
+          await sm.load();
+          await sm.set("idealReviewEnabled", next);
+        }
+        setLiveItems((prev) => [
+          ...prev,
+          {
+            kind: "info",
+            text: next
+              ? "Ideal review enabled. Use /ideal-off to disable it."
+              : "Ideal review disabled. Use /ideal-on to enable it.",
+            id: getId(),
+          },
+        ]);
+        return;
+      }
+
+      // /rewind — open the checkpoint picker (needs React state + the store).
+      if (trimmed === "/rewind") {
+        const store = props.checkpointStore;
+        if (!store) {
+          setLiveItems((prev) => [
+            ...prev,
+            { kind: "info", text: "Checkpoints are not available in this session.", id: getId() },
+          ]);
+          return;
+        }
+        const cps = await store.listCheckpoints();
+        if (cps.length === 0) {
+          setLiveItems((prev) => [
+            ...prev,
+            {
+              kind: "info",
+              text: "No checkpoints yet \u2014 edit a file through ggcoder first.",
+              id: getId(),
+            },
+          ]);
+          return;
+        }
+        setRewindCheckpoints(cps);
+        return;
       }
 
       if (
@@ -1979,37 +1891,7 @@ export function App(props: AppProps) {
             void replaceSystemPrompt({ clearApprovedPlan: true });
             setLiveItems([{ kind: "plan_event", event: "dismissed", id: getId() }]);
           },
-          openGoalsPicker: () => {
-            // Mutex: refuse the goal picker while plan mode is active — the two
-            // workflows are mutually exclusive (one drafts a single-turn plan,
-            // the other orchestrates durable multi-worker goals).
-            if (planModeStateRef.current) {
-              setLiveItems((prev) => [
-                ...prev,
-                {
-                  kind: "info",
-                  text: "Cannot open goals while plan mode is active. Submit your plan via exit_plan (or use /clearplan) first.",
-                  id: getId(),
-                },
-              ]);
-              return;
-            }
-            taskPicker.close();
-            goalPicker.openPicker();
-          },
           enterPlanMode: async (objective: string) => {
-            // Mutex: refuse plan mode while any goal phase is active.
-            if (goalModeStateRef.current !== "off") {
-              setLiveItems((prev) => [
-                ...prev,
-                {
-                  kind: "info",
-                  text: `Cannot enter plan mode while a goal is active (goal mode: ${goalModeStateRef.current}). Complete or pause the goal first.`,
-                  id: getId(),
-                },
-              ]);
-              return;
-            }
             await handleEnterPlanMode(objective || undefined);
             if (objective) {
               void agentLoop.run(objective).catch((err: unknown) => {
@@ -2031,27 +1913,14 @@ export function App(props: AppProps) {
         await submitPromptCommand({
           trimmed,
           inputImages,
-          cwd: props.cwd,
           currentModel,
           customCommands,
-          messagesRef,
-          goalSetupPanePendingRef,
-          goalModeStateRef,
-          planModeStateRef,
-          goalAutoExpandRef,
-          setActiveGoalReferences,
           setLastUserMessage,
           setDoneStatus,
           finalizeSubmittedUserItem,
-          setGoalModeAndPrompt,
           runAgent: (content) => agentLoop.run(content),
-          appendGoalAgentTransition,
           setLiveItems,
           getId,
-          setGoalAutoExpand,
-          setPlanAutoExpand,
-          closeTaskPicker: taskPicker.close,
-          openGoalPicker: goalPicker.openPicker,
           reloadCustomCommands,
         })
       ) {
@@ -2080,7 +1949,7 @@ export function App(props: AppProps) {
           "queue",
           `Queued message: ${trimmed.length > 80 ? trimmed.slice(0, 80) + "..." : trimmed}`,
         );
-        agentLoop.queueMessage(userContent);
+        agentLoop.queueMessage(userContent, input);
         let displayText = input;
         if (hasImages) {
           const { cleanText } = await extractImagePaths(input, props.cwd);
@@ -2102,14 +1971,28 @@ export function App(props: AppProps) {
         const { cleanText } = await extractImagePaths(input, props.cwd);
         displayText = cleanText;
       }
+      let imagePreviews: ImagePreview[] | undefined;
+      if (hasImages) {
+        const built = await Promise.all(
+          inputImages
+            .filter((img) => img.kind === "image")
+            .map(async (img): Promise<ImagePreview> => {
+              const downscaled = await downscaleForPreview(Buffer.from(img.data, "base64"));
+              return { base64: downscaled.toString("base64"), mediaType: img.mediaType };
+            }),
+        );
+        imagePreviews = built.length > 0 ? built : undefined;
+      }
       const userItem: UserItem = {
         kind: "user",
         text: displayText,
         imageCount: hasImages ? inputImages.length : undefined,
+        imagePreviews,
         pasteInfo,
         id: getId(),
       };
       setLastUserMessage(input);
+      setScrollResetToken((token) => token + 1);
       setDoneStatus(null);
       // Clear stale plan progress if there's no active approved plan
       // (avoids lingering progress from a completed or abandoned plan run)
@@ -2117,7 +2000,19 @@ export function App(props: AppProps) {
         planStepsRef.current = [];
         setPlanSteps([]);
       }
-      finalizeSubmittedUserItem(userItem);
+      finalizeSubmittedUserItem(userItem, liveItems);
+
+      // Open a per-turn checkpoint capturing the conversation position right
+      // before this exchange, so /rewind can restore pre-turn code/chat state.
+      if (props.checkpointStore) {
+        rewindTurnRef.current += 1;
+        await props.checkpointStore
+          .openCheckpoint({
+            turnIndex: rewindTurnRef.current,
+            messageIndex: messagesRef.current.length,
+          })
+          .catch(() => {});
+      }
 
       // Run agent
       try {
@@ -2136,10 +2031,10 @@ export function App(props: AppProps) {
     },
     [
       agentLoop,
-      appendGoalAgentTransition,
       compactConversation,
       currentModel,
       finalizeSubmittedUserItem,
+      liveItems,
       props.cwd,
       props.onSlashCommand,
       props.resetUI,
@@ -2148,8 +2043,6 @@ export function App(props: AppProps) {
       showSessionSummaryAndExit,
       reloadCustomCommands,
       replaceSystemPrompt,
-      setActiveGoalReferences,
-      setGoalModeAndPrompt,
     ],
   );
 
@@ -2157,14 +2050,20 @@ export function App(props: AppProps) {
 
   const handleAbort = useCallback(() => {
     if (agentLoop.isRunning) {
-      agentLoop.clearQueue();
+      // Restore any unsent queued messages to the composer instead of dropping
+      // them, so an interrupt never silently discards what the user typed.
+      const queuedText = agentLoop.drainQueuedText();
+      if (queuedText) {
+        setLiveItems((prev) => prev.filter((item) => item.kind !== "queued"));
+        setComposerInject({ text: queuedText, nonce: nextIdRef.current++ });
+      }
       agentLoop.abort();
     } else if (compactionAbortRef.current) {
       compactionAbortRef.current.abort();
     } else {
       handleDoubleExit();
     }
-  }, [agentLoop, handleDoubleExit]);
+  }, [agentLoop, handleDoubleExit, setLiveItems]);
 
   const handleToggleThinking = useCallback(() => {
     setThinkingLevel((prev) => {
@@ -2189,6 +2088,9 @@ export function App(props: AppProps) {
       const newProvider = value.slice(0, colonIdx) as Provider;
       const newModelId = value.slice(colonIdx + 1);
       log("INFO", "model", `Model changed`, { provider: newProvider, model: newModelId });
+      // Keep the ref in sync before any prompt rebuild so the identity (Claude
+      // Code vs GG Coder) reflects the newly selected provider immediately.
+      currentProviderRef.current = newProvider;
 
       const rebuildPromptWithTools = (tools: AgentTool[]) => {
         currentToolsRef.current = tools;
@@ -2325,7 +2227,6 @@ export function App(props: AppProps) {
     };
     const promptOrder = [
       // Project audits / one-shot analysis
-      "goal",
       "init",
       "expand",
       "bullet-proof",
@@ -2360,6 +2261,20 @@ export function App(props: AppProps) {
         sectionTitle: "built-in",
       },
       { name: "plans", aliases: [], description: "Open the plan browser", sectionTitle: "built-in" },
+      {
+        name: idealReviewEnabled ? "ideal-off" : "ideal-on",
+        aliases: [],
+        description: idealReviewEnabled
+          ? "Disable pre-final ideal review"
+          : "Enable pre-final ideal review",
+        sectionTitle: "built-in",
+      },
+      {
+        name: "rewind",
+        aliases: [],
+        description: "Restore files/conversation to a checkpoint",
+        sectionTitle: "built-in",
+      },
       ...orderedPromptCommands,
       ...remainingPromptCommands,
       ...customCommands.map((cmd) => ({
@@ -2375,15 +2290,16 @@ export function App(props: AppProps) {
         sectionTitle: "built-in",
       },
     ];
-  }, [customCommands]);
+  }, [customCommands, idealReviewEnabled]);
 
   const renderItem = (item: CompletedItem, index: number, items: CompletedItem[]) =>
     renderTranscriptItem({
       item,
       index,
       items,
-      pendingHistoryFlushLastItem: pendingHistoryFlushRef.current.at(-1),
-      historyLastItem: history.at(-1),
+      pendingHistoryFlushLastItem:
+        index === 0 ? lastVisibleTranscriptItem(pendingHistoryFlushRef.current) : undefined,
+      historyLastItem: index === 0 ? lastVisibleTranscriptItem(history) : undefined,
       version: props.version,
       currentModel,
       currentProvider,
@@ -2395,63 +2311,25 @@ export function App(props: AppProps) {
     });
 
   const openOverlay = useCallback(
-    (kind: "goal" | "skills" | "plan" | "pixel") => {
+    (kind: "skills" | "plan" | "pixel") => {
       if (props.resetUI && props.sessionStore && !agentLoop.isRunning) {
         props.sessionStore.overlay = kind;
         if (kind !== "plan") props.sessionStore.planAutoExpand = false;
-        if (kind !== "goal") props.sessionStore.goalAutoExpand = false;
         props.resetUI();
       } else {
         if (props.sessionStore) {
           props.sessionStore.overlay = kind;
           if (kind !== "plan") props.sessionStore.planAutoExpand = false;
-          if (kind !== "goal") props.sessionStore.goalAutoExpand = false;
-          if (agentLoop.isRunning && kind !== "goal" && kind !== "plan") {
+          if (agentLoop.isRunning && kind !== "plan") {
             props.sessionStore.pendingResetUI = true;
           }
         }
         if (kind !== "plan") setPlanAutoExpand(false);
-        if (kind !== "goal") setGoalAutoExpand(false);
         setOverlay(kind);
       }
     },
     [agentLoop.isRunning, props],
   );
-
-  const { continueGoalRun, startGoalRun, pauseGoalRun } = useGoalOrchestration({
-    cwd: props.cwd,
-    resetUI: props.resetUI,
-    sessionStore: props.sessionStore,
-    currentProvider,
-    currentModel,
-    thinkingLevel,
-    agentLoop,
-    appendGoalProgress,
-    goalNumberForRun,
-    clearGoalStatusEntry,
-    upsertGoalStatusEntry,
-    setGoalModeAndPrompt,
-    clearGoalModeIfIdle,
-    agentRunningRef,
-    runningGoalIdsRef,
-    activeVerifierRunIdsRef,
-    queuedGoalSyntheticEventsRef,
-    goalContinuationFlightsRef,
-    goalContinuationRecentChoicesRef,
-    startGoalRunRef,
-    startTaskRef,
-    messagesRef,
-    persistedIndexRef,
-    sessionManagerRef,
-    sessionPathRef,
-    cwdRef,
-    setLiveItems,
-    setHistory,
-    setLastUserMessage,
-    setDoneStatus,
-    getId,
-    clearPendingHistory,
-  });
 
   useEffect(() => {
     runAllTasksRef.current = runAllTasks;
@@ -2492,6 +2370,86 @@ export function App(props: AppProps) {
     initialRunAllPixel: props.sessionStore?.runAllPixel ?? false,
   });
 
+  // Starts a single task: opens a fresh session + chat and runs the task
+  // prompt through the agent loop. Wired into startTaskRef so both the task
+  // picker (Enter = start one, r = run all) and the run-all auto-advance in
+  // onDone can invoke it from stale closures.
+  const startTask = useCallback(
+    (title: string, prompt: string, taskId: string) => {
+      const taskCwd = cwdRef.current;
+      const shortId = taskId.slice(0, 8);
+      const completionHint =
+        `\n\n---\nWhen you have fully completed this task, call the tasks tool to mark it done:\n` +
+        `tasks({ action: "done", id: "${shortId}" })`;
+      const fullPrompt = prompt + completionHint;
+
+      if (props.resetUI && props.sessionStore) {
+        const sysMsg = messagesRef.current[0];
+        const newMessages: Message[] =
+          sysMsg && sysMsg.role === "system" ? [sysMsg] : messagesRef.current.slice(0, 1);
+        const taskItem: TaskItem = { kind: "task", title, id: getId() };
+        const sm = sessionManagerRef.current;
+
+        void (async () => {
+          let newSessionPath: string | undefined;
+          if (sm) {
+            try {
+              const session = await sm.create(taskCwd, currentProvider, currentModel);
+              newSessionPath = session.path;
+              log("INFO", "tasks", "New session for task", { path: session.path });
+            } catch {
+              // Session creation is best-effort.
+            }
+          }
+          if (props.sessionStore) props.sessionStore.overlay = null;
+          props.resetUI?.({
+            wipeSession: true,
+            messages: newMessages,
+            history: [{ kind: "banner", id: "banner" }, taskItem],
+            sessionPath: newSessionPath,
+            pendingAction: { prompt: fullPrompt },
+          });
+        })();
+        return;
+      }
+
+      clearPendingHistory();
+      setHistory([{ kind: "banner", id: "banner" }]);
+      setLiveItems([]);
+      messagesRef.current = messagesRef.current.slice(0, 1);
+      agentLoop.reset();
+      persistedIndexRef.current = messagesRef.current.length;
+      const sm = sessionManagerRef.current;
+      if (sm) {
+        void sm.create(taskCwd, currentProvider, currentModel).then((session) => {
+          sessionPathRef.current = session.path;
+          log("INFO", "tasks", "New session for task", { path: session.path });
+        });
+      }
+      const taskItem: TaskItem = { kind: "task", title, id: getId() };
+      setLastUserMessage(title);
+      setDoneStatus(null);
+      setLiveItems([taskItem]);
+      void agentLoop.run(fullPrompt).catch((err: unknown) => {
+        setLiveItems((prev) => [...prev, toErrorItem(err, getId())]);
+      });
+    },
+    [agentLoop, currentModel, currentProvider, props],
+  );
+  // Keep the ref in sync so stale closures (task picker, onDone run-all) can
+  // start a task without being recreated each render.
+  startTaskRef.current = startTask;
+
+  // Reset the live tool feed at the start of each run so the pinned panel only
+  // ever reflects the current turn's activity, not the previous one's.
+  const wasRunningRef = useRef(false);
+  useEffect(() => {
+    if (agentLoop.isRunning && !wasRunningRef.current) {
+      setLiveToolFeed([]);
+    }
+    wasRunningRef.current = agentLoop.isRunning;
+  }, [agentLoop.isRunning]);
+
   const isSkillsView = overlay === "skills";
   const isPlanView = overlay === "plan";
   const {
@@ -2501,6 +2459,7 @@ export function App(props: AppProps) {
     statusSlotVisible,
     mainControlsRef,
     measuredLiveAreaRows,
+    viewportRows,
   } = useChatLayoutMeasurements({
     rows,
     columns,
@@ -2516,15 +2475,26 @@ export function App(props: AppProps) {
     displayedCwd,
     gitBranch,
     thinkingLevel,
-    goalMode,
     exitPending,
     taskBarExpanded,
-    goalStatusEntryCount: goalStatusEntries.length,
+    liveToolFeedCount: liveToolFeed.length,
   });
   const isPixelView = overlay === "pixel";
   const hasLiveAssistantItem = liveItems.some((item) => item.kind === "assistant");
-  const rawVisibleStreamingText =
-    goalModeStateRef.current === "planner" || hasLiveAssistantItem ? "" : agentLoop.streamingText;
+  const rawVisibleStreamingText = hasLiveAssistantItem ? "" : agentLoop.streamingText;
+  // Compute the prospective paragraph flush DURING render so the live frame
+  // immediately drops the prefix that is about to be written to scrollback.
+  // The queueFlush below runs in an effect (after paint), so if the live text
+  // were sliced only by the already-committed `flushedChars`, the just-flushed
+  // paragraph would render BOTH in scrollback and live for one frame — that
+  // transient extra height is what shoves the footer up and then back down on
+  // every chunk boundary. Slicing by the prospective flush here keeps the live
+  // frame height monotonic, so the footer never bounces.
+  const alreadyFlushedChars = streamedAssistantFlushRef.current.flushedChars;
+  const pendingFlushChars = rawVisibleStreamingText
+    ? splitAssistantStreamingText(rawVisibleStreamingText.slice(alreadyFlushedChars)).flushedText
+        .length
+    : 0;
   useEffect(() => {
     if (!rawVisibleStreamingText) {
       streamedAssistantFlushRef.current = { flushedChars: 0, text: "" };
@@ -2555,11 +2525,21 @@ export function App(props: AppProps) {
     };
   }, [rawVisibleStreamingText, queueFlush]);
   const visibleStreamingText = stripDoneMarkers(
-    rawVisibleStreamingText.slice(streamedAssistantFlushRef.current.flushedChars),
+    rawVisibleStreamingText.slice(alreadyFlushedChars + pendingFlushChars),
   );
   const lastLiveItem = liveItems.at(-1);
+  // For spacing decisions, the previous row is the last item that actually
+  // RENDERS. Panel-replaced tool items (now shown only in the LiveToolPanel)
+  // render null, so counting them as the boundary inserts a blank separator
+  // above the streamed response with nothing visible above it.
+  const lastVisibleLiveItem = lastVisibleTranscriptItem(liveItems);
   const lastPendingHistoryItem = pendingHistoryFlushRef.current.at(-1);
   const lastHistoryItem = history.at(-1);
+  // Spacing variants: flushed tool rows render null (LiveToolPanel owns them), so
+  // the streamed/first-live boundary must look past them to the last row that
+  // actually printed — otherwise a tool→assistant separator leaves a phantom gap.
+  const lastVisiblePendingHistoryItem = lastVisibleTranscriptItem(pendingHistoryFlushRef.current);
+  const lastVisibleHistoryItem = lastVisibleTranscriptItem(history);
   const previousTranscriptItem = lastPendingHistoryItem ?? lastHistoryItem;
   const isAwaitingAssistantAfterUser =
     agentLoop.isRunning &&
@@ -2574,14 +2554,66 @@ export function App(props: AppProps) {
       isAwaitingAssistantAfterUser);
   const shouldTopSpaceStreamingText = shouldTopSpaceStreamingAssistant({
     visibleStreamingText,
-    lastLiveItem,
-    lastPendingHistoryItem,
-    lastHistoryItem,
+    lastLiveItem: lastVisibleLiveItem,
+    lastPendingHistoryItem: lastVisiblePendingHistoryItem,
+    lastHistoryItem: lastVisibleHistoryItem,
   });
   // When earlier paragraphs of THIS response were already flushed to scrollback
   // mid-stream, the live remainder is the next paragraph — re-insert the blank
   // line that separated them so the live tail lines up with the flushed history.
-  const streamingContinuesFlushed = streamedAssistantFlushRef.current.flushedChars > 0;
+  const streamingContinuesFlushed = alreadyFlushedChars + pendingFlushChars > 0;
+
+  // ── Fullscreen alt-screen transcript ───────────────────
+  // Flatten history + live items + in-flight streaming into the flat ANSI line
+  // buffer the viewport renders. Reuses the same serializer the legacy
+  // scrollback printer used, so the transcript looks identical. Only computed
+  // when fullscreen is active (the legacy path renders items through Ink).
+  const transcriptContext = useMemo(
+    () => ({
+      theme,
+      columns,
+      version: props.version,
+      model: currentModel,
+      provider: currentProvider,
+      cwd: displayedCwd,
+    }),
+    [theme, columns, props.version, currentModel, currentProvider, displayedCwd],
+  );
+  const transcriptLines = useMemo(() => {
+    if (!props.fullscreen) return [];
+    const items: CompletedItem[] = [...history, ...uniqueItemsById(liveItems)];
+    const hasStreaming = visibleStreamingText.length > 0 || agentLoop.streamingThinking.length > 0;
+    if (hasStreaming) {
+      items.push({
+        kind: "assistant",
+        text: visibleStreamingText,
+        thinking: agentLoop.streamingThinking,
+        thinkingMs: agentLoop.thinkingMs,
+        continuation: streamingContinuesFlushed,
+        id: "__streaming__",
+      });
+    }
+    return buildTranscriptLines(items, transcriptContext);
+  }, [
+    props.fullscreen,
+    history,
+    liveItems,
+    visibleStreamingText,
+    agentLoop.streamingThinking,
+    agentLoop.thinkingMs,
+    streamingContinuesFlushed,
+    transcriptContext,
+  ]);
+  // Keyboard + bounds controller. The offset itself lives in the external
+  // transcript-scroll store; the viewport subscribes to it directly so scroll
+  // re-renders only the viewport, not this whole component.
+  useTranscriptScroll({
+    totalLines: transcriptLines.length,
+    viewportRows,
+    active: !!props.fullscreen && !overlay && !taskBarFocused,
+    resetToken: scrollResetToken,
+  });
+
   const visibleQueuedCount = liveItems.filter((item) => item.kind === "queued").length;
   const hiddenQueuedCount = Math.max(0, agentLoop.queuedCount - visibleQueuedCount);
   const shouldTopSpaceQueueIndicator =
@@ -2592,6 +2624,58 @@ export function App(props: AppProps) {
       lastPendingHistoryItem,
       lastHistoryItem,
     });
+
+  const handleRewindCancel = useCallback(() => setRewindCheckpoints(null), []);
+
+  const handleRewindRestore = useCallback(
+    (id: string, mode: RestoreMode) => {
+      const store = props.checkpointStore;
+      setRewindCheckpoints(null);
+      if (!store) return;
+      void (async () => {
+        try {
+          const result = await store.restore(id, mode);
+          const turnNum = id.replace(/^cp-0*/, "") || id;
+          const detailParts: string[] = [];
+          if (mode === "code" || mode === "both") {
+            detailParts.push(
+              `${result.filesRestored} file${result.filesRestored === 1 ? "" : "s"} restored`,
+            );
+          }
+          if (mode === "conversation" || mode === "both") detailParts.push("conversation rewound");
+          const infoText = `Rewound to checkpoint #${turnNum} (${detailParts.join(", ")}).`;
+
+          if (mode === "conversation" || mode === "both") {
+            const truncated = messagesRef.current.slice(0, Math.max(1, result.messageIndex));
+            messagesRef.current = truncated;
+            persistedIndexRef.current = truncated.length;
+            agentLoop.reset();
+            // Remount in lockstep so the banner + confirmation re-render cleanly
+            // after the conversation context is truncated (CLAUDE.md pattern).
+            if (props.resetUI) {
+              props.resetUI({
+                wipeSession: true,
+                messages: truncated,
+                history: [
+                  { kind: "banner", id: "banner" },
+                  { kind: "info", text: infoText, id: getId() },
+                ],
+              });
+              return;
+            }
+          }
+          setLiveItems((prev) => [...prev, { kind: "info", text: infoText, id: getId() }]);
+        } catch (err) {
+          const msg = err instanceof Error ? err.message : String(err);
+          setLiveItems((prev) => [
+            ...prev,
+            { kind: "info", text: `Rewind failed: ${msg}`, id: getId() },
+          ]);
+        }
+      })();
+    },
+    [props.checkpointStore, props.resetUI, agentLoop, messagesRef, persistedIndexRef],
+  );
 
   const handleCloseRemountableOverlay = () => {
     if (props.resetUI && props.sessionStore && !agentLoop.isRunning) {
@@ -2780,75 +2864,8 @@ export function App(props: AppProps) {
     });
   };
 
-  const handleRunGoalFromPicker = (run: GoalRun) => {
-    setDoneStatus(null);
-    appendGoalProgress({
-      kind: "goal_progress",
-      phase: "continuing",
-      title: `Goal run requested: ${run.title}`,
-      detail: "Enter pressed in Ctrl+G; starting the Goal orchestrator.",
-      status: run.status,
-    });
-    log("INFO", "goal", `Goal run requested from Ctrl+G: ${run.title}`, { id: run.id });
-    void (async () => {
-      const latestRun = (await loadGoalRuns(props.cwd)).find((item) => item.id === run.id) ?? run;
-      const requestedAt = new Date().toISOString();
-      const runWithContinuation = await upsertGoalRun(props.cwd, {
-        ...latestRun,
-        status:
-          latestRun.status === "running" || latestRun.status === "verifying"
-            ? latestRun.status
-            : "ready",
-        continueRequestedAt: requestedAt,
-        blockers: goalHasBlockingPrerequisites(latestRun) ? latestRun.blockers : [],
-        evidence: [
-          ...latestRun.evidence,
-          {
-            id: `goal-rerun-${requestedAt}`,
-            kind: "summary" as const,
-            label: "Goal rerun requested",
-            content:
-              "Continuation requested from Ctrl+G; the orchestrator will choose the next eligible Goal action.",
-            createdAt: requestedAt,
-          },
-        ],
-      });
-      startGoalRun(runWithContinuation);
-    })().catch((err: unknown) => {
-      log("ERROR", "goal", err instanceof Error ? err.message : String(err));
-      setLiveItems((prev) => [...prev, toErrorItem(err, getId(), "Goal")]);
-    });
-  };
-
-  const handleDeleteGoalSideEffects = async (run: GoalRun) => {
-    runningGoalIdsRef.current.delete(run.id);
-    const latestRun = (await loadGoalRuns(props.cwd)).find((item) => item.id === run.id) ?? run;
-    if (latestRun.activeWorkerId) await stopGoalWorker(latestRun.activeWorkerId);
-    clearGoalStatusEntry(run.id);
-    clearGoalModeIfIdle();
-  };
-
-  const handleGoalPickerError = (err: unknown) => {
-    log("ERROR", "goal", err instanceof Error ? err.message : String(err));
-    setLiveItems((prev) => [...prev, toErrorItem(err, getId(), "Goal")]);
-  };
-
-  const goalPicker = useGoalPickerController({
-    cwd: props.cwd,
-    onRunGoal: handleRunGoalFromPicker,
-    onDeleteGoalSideEffects: handleDeleteGoalSideEffects,
-    onPauseGoal: pauseGoalRun,
-    onError: handleGoalPickerError,
-  });
-
   const handleToggleTasks = () => {
-    goalPicker.close();
     taskPicker.toggle();
-  };
-
-  const handleToggleGoalPicker = () => {
-    taskPicker.close();
-    goalPicker.toggle();
   };
 
   const fullScreenOverlay = isPixelView
@@ -2869,7 +2886,13 @@ export function App(props: AppProps) {
 
   return (
     <Box flexDirection="column" width={columns} flexShrink={0} flexGrow={0}>
-      {fullScreenOverlay ? (
+      {rewindCheckpoints ? (
+        <RewindOverlay
+          checkpoints={rewindCheckpoints}
+          onRestore={handleRewindRestore}
+          onCancel={handleRewindCancel}
+        />
+      ) : fullScreenOverlay ? (
         <FullScreenOverlayRouter
           overlay={fullScreenOverlay}
           version={props.version}
@@ -2896,6 +2919,10 @@ export function App(props: AppProps) {
           reserveStreamingSpacing={shouldReserveStreamingSpacing}
           renderMarkdown={renderMarkdown}
           measuredLiveAreaRows={measuredLiveAreaRows}
+          fullscreen={props.fullscreen}
+          rows={rows}
+          transcriptLines={transcriptLines}
+          viewportRows={viewportRows}
           assistantMarginTop={shouldTopSpaceStreamingText || streamingContinuesFlushed ? 1 : 0}
           streamingContinuation={streamingContinuesFlushed}
           controlsRef={mainControlsRef}
@@ -2905,6 +2932,7 @@ export function App(props: AppProps) {
           statusSlotVisible={statusSlotVisible}
           activityVisible={activityVisible}
           stallStatusVisible={stallStatusVisible}
+          liveToolFeed={liveToolFeed}
           doneStatus={doneStatus}
           activityPhase={agentLoop.activityPhase}
           elapsedMs={agentLoop.elapsedMs}
@@ -2923,16 +2951,18 @@ export function App(props: AppProps) {
           inputControls={{
             onSubmit: handleSubmit,
             onAbort: handleAbort,
+            injectText: composerInject,
             inputActive: !taskBarFocused && !overlay,
             onDownAtEnd: handleFocusTaskBar,
             onShiftTab: handleToggleThinking,
             onToggleTasks: handleToggleTasks,
-            onToggleGoal: handleToggleGoalPicker,
             onToggleSkills: () => openOverlay("skills"),
             onTogglePixel: () => openOverlay("pixel"),
             onToggleMarkdown: () => setRenderMarkdown((prev) => !prev),
             cwd: props.cwd,
             commands: allCommands,
+            mouseScroll: props.fullscreen,
+            onScroll: scrollTranscriptByLines,
           }}
           taskPicker={{
             open: taskPicker.open,
@@ -2941,14 +2971,6 @@ export function App(props: AppProps) {
             onStart: taskPicker.start,
             onRunAll: taskPicker.runAll,
             onDelete: taskPicker.deleteTask,
-          }}
-          goalPicker={{
-            open: goalPicker.open,
-            goals: goalPicker.goals,
-            onClose: goalPicker.close,
-            onRun: goalPicker.run,
-            onDelete: goalPicker.deleteGoal,
-            onPause: goalPicker.pause,
           }}
           overlay={overlay}
           onModelSelect={handleModelSelect}
@@ -2963,10 +2985,8 @@ export function App(props: AppProps) {
           contextWindowOptions={contextWindowOptions}
           displayedCwd={displayedCwd}
           gitBranch={gitBranch}
-          goalMode={goalMode}
           planMode={planMode}
           exitPending={exitPending}
-          goalStatusEntries={goalStatusEntries}
           footerStatusLayout={footerStatusLayout}
           backgroundTasks={bgTasks}
           taskBarFocused={taskBarFocused}

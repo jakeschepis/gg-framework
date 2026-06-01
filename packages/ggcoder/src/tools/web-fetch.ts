@@ -1,5 +1,7 @@
 import { z } from "zod";
-import type { AgentTool } from "@kenkaiiii/gg-agent";
+import type { AgentTool, ToolContext } from "@kenkaiiii/gg-agent";
+import { extractToMarkdown } from "./html-extract.js";
+import { extractPdfText, PdfExtractorUnavailable } from "./pdf-extract.js";
 
 /**
  * Block requests to private/internal network addresses to prevent SSRF.
@@ -160,67 +162,451 @@ export function htmlToCleanText(html: string): string {
     .trim();
 }
 
+// ── Fetch configuration ──────────────────────────────────────
+
+const MAX_REDIRECTS = 5;
+const MAX_PDF_BYTES = 25 * 1024 * 1024; // refuse PDFs larger than ~25 MB
+const MAX_URLS = 10;
+const MAX_CONCURRENCY = 5;
+const PER_URL_MIN_BUDGET = 1000;
+
+const FETCH_HEADERS: Record<string, string> = {
+  "User-Agent": "Mozilla/5.0 (compatible; GGCoder/1.0)",
+  Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+};
+
+const DOC_PATH_PATTERNS = [/\/docs?\b/i, /\/reference\b/i, /\/api\b/i, /\/guide/i, /\/learn\b/i];
+const DOC_ROOT_SEGMENTS = new Set(["docs", "doc", "reference", "api", "guide", "learn"]);
+const LONG_LLMS_THRESHOLD = 20000;
+const DEFAULT_LLMS_CANDIDATE_LIMIT = 6;
+
+type FetchFormat = "markdown" | "text" | "html";
+type LlmsCandidateKind = "llms" | "llms-full" | "llms-ctx" | "page-md";
+
+interface LlmsCandidate {
+  url: string;
+  label: string;
+  kind: LlmsCandidateKind;
+  priority: number;
+}
+
+interface FetchOptions {
+  maxLength: number;
+  format: FetchFormat;
+  preferLlmsTxt: boolean;
+}
+
+interface RawResponse {
+  status: number;
+  statusText: string;
+  contentType: string;
+  contentLength: number | null;
+  body: Response;
+  finalUrl: string;
+}
+
+/** Result of a single-fetch attempt: either a usable response or an error string. */
+type FetchOneResult = { ok: true; response: RawResponse } | { ok: false; error: string };
+
+/**
+ * Fetch a URL, transparently following safe redirects up to `MAX_REDIRECTS`.
+ * Each hop's target is re-validated with `isBlockedUrl` (SSRF) and the abort
+ * signal is honored throughout. Returns the final non-redirect response or an
+ * error string describing why the fetch could not complete.
+ */
+async function fetchOne(url: string, signal: AbortSignal): Promise<FetchOneResult> {
+  let currentUrl = url;
+
+  for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    const response = await fetch(currentUrl, {
+      headers: FETCH_HEADERS,
+      redirect: "manual",
+      signal: AbortSignal.any([signal, AbortSignal.timeout(30000)]),
+    });
+
+    if (response.status >= 300 && response.status < 400) {
+      const location = response.headers.get("location");
+      if (!location) {
+        return {
+          ok: false,
+          error: `Error: HTTP ${response.status} redirect without Location header`,
+        };
+      }
+      const redirectUrl = new URL(location, currentUrl).toString();
+      if (isBlockedUrl(redirectUrl)) {
+        return {
+          ok: false,
+          error: "Error: Redirect blocked — target URL is private/internal or unsupported.",
+        };
+      }
+      currentUrl = redirectUrl;
+      continue;
+    }
+
+    const contentLengthHeader = response.headers.get("content-length");
+    return {
+      ok: true,
+      response: {
+        status: response.status,
+        statusText: response.statusText,
+        contentType: response.headers.get("content-type") ?? "",
+        contentLength: contentLengthHeader ? Number(contentLengthHeader) : null,
+        body: response,
+        finalUrl: currentUrl,
+      },
+    };
+  }
+
+  return { ok: false, error: `Error: too many redirects (>${MAX_REDIRECTS})` };
+}
+
+function truncate(content: string, maxLength: number): string {
+  if (content.length <= maxLength) return content;
+  return content.slice(0, maxLength) + "\n\n[Content truncated]";
+}
+
+function looksLikePdf(contentType: string, url: string, head: Uint8Array): boolean {
+  if (contentType.includes("application/pdf")) return true;
+  const magic =
+    head.length >= 4 &&
+    head[0] === 0x25 &&
+    head[1] === 0x50 &&
+    head[2] === 0x44 &&
+    head[3] === 0x46;
+  if (url.toLowerCase().split("?")[0].endsWith(".pdf") && magic) return true;
+  return false;
+}
+
+/** Process a fetched PDF body into extracted text or an explanatory error. */
+async function processPdf(response: RawResponse, maxLength: number): Promise<string> {
+  if (response.contentLength !== null && response.contentLength > MAX_PDF_BYTES) {
+    return `Error: PDF too large (${response.contentLength} bytes; limit ${MAX_PDF_BYTES}).`;
+  }
+  const buffer = await response.body.arrayBuffer();
+  if (buffer.byteLength > MAX_PDF_BYTES) {
+    return `Error: PDF too large (${buffer.byteLength} bytes; limit ${MAX_PDF_BYTES}).`;
+  }
+  try {
+    const { text, pages } = await extractPdfText(new Uint8Array(buffer));
+    return `[PDF · ${pages} page${pages === 1 ? "" : "s"}]\n\n${truncate(text.trim(), maxLength)}`;
+  } catch (err) {
+    if (err instanceof PdfExtractorUnavailable) {
+      return "PDF detected but the optional 'unpdf' dependency is not installed. Add it: pnpm add -w unpdf";
+    }
+    const msg = err instanceof Error ? err.message : String(err);
+    return `Error extracting PDF text: ${msg}`;
+  }
+}
+
+/** Process a fetched HTML/text body into the requested format. */
+async function processHtmlOrText(
+  response: RawResponse,
+  text: string,
+  opts: FetchOptions,
+): Promise<string> {
+  const isHtml = response.contentType.includes("html");
+  if (!isHtml) {
+    return truncate(text, opts.maxLength);
+  }
+
+  if (opts.format === "text") {
+    return truncate(htmlToCleanText(text), opts.maxLength);
+  }
+
+  // markdown (default) and html both attempt Readability extraction first.
+  try {
+    const extracted = await extractToMarkdown(text, response.finalUrl);
+    if (extracted) {
+      const heading = extracted.title ? `# ${extracted.title}\n\n` : "";
+      return truncate(heading + extracted.markdown, opts.maxLength);
+    }
+  } catch {
+    // Extractor unavailable or failed — fall through to the regex path.
+  }
+
+  return truncate(htmlToCleanText(text), opts.maxLength);
+}
+
+/**
+ * Run the full per-URL pipeline (SSRF check → redirects → PDF/HTML/text →
+ * format). Never throws: returns content or an `Error: …` string so one bad
+ * URL in a multi-URL call doesn't fail the whole call.
+ */
+async function fetchAndProcess(
+  url: string,
+  opts: FetchOptions,
+  signal: AbortSignal,
+): Promise<string> {
+  if (isBlockedUrl(url)) {
+    return "Error: URL blocked — requests to private/internal network addresses are not allowed.";
+  }
+
+  try {
+    const result = await fetchOne(url, signal);
+    if (!result.ok) return result.error;
+
+    const { response } = result;
+    if (!(response.status >= 200 && response.status < 300)) {
+      return `Error: HTTP ${response.status} ${response.statusText}`;
+    }
+
+    const buffer = await response.body.arrayBuffer();
+    const head = new Uint8Array(buffer.slice(0, 4));
+
+    if (looksLikePdf(response.contentType, response.finalUrl, head)) {
+      // Re-wrap the already-read buffer so processPdf can read it again.
+      const pdfResponse: RawResponse = {
+        ...response,
+        body: new Response(buffer),
+        contentLength: buffer.byteLength,
+      };
+      return await processPdf(pdfResponse, opts.maxLength);
+    }
+
+    const text = new TextDecoder().decode(buffer);
+    return await processHtmlOrText(response, text, opts);
+  } catch (error) {
+    const msg = error instanceof Error ? error.message : String(error);
+    return `Error fetching ${url}: ${msg}`;
+  }
+}
+
+/** Heuristic: does this URL look like a documentation page worth probing for llms.txt? */
+function isDocish(url: string): boolean {
+  let parsed: URL;
+  try {
+    parsed = new URL(url);
+  } catch {
+    return false;
+  }
+  if (parsed.hostname.toLowerCase().startsWith("docs.")) return true;
+  return DOC_PATH_PATTERNS.some((p) => p.test(parsed.pathname));
+}
+
+function addLlmsFileCandidates(
+  candidates: LlmsCandidate[],
+  baseUrl: string,
+  host: string,
+  maxLength: number,
+  priorityBase: number,
+): void {
+  const base = baseUrl.endsWith("/") ? baseUrl : `${baseUrl}/`;
+  candidates.push({
+    url: `${base}llms.txt`,
+    label: `llms.txt for ${host}`,
+    kind: "llms",
+    priority: priorityBase,
+  });
+  candidates.push({
+    url: `${base}llms-ctx.txt`,
+    label: `llms-ctx.txt for ${host}`,
+    kind: "llms-ctx",
+    priority: priorityBase + 2,
+  });
+  if (maxLength >= LONG_LLMS_THRESHOLD) {
+    candidates.push({
+      url: `${base}llms-full.txt`,
+      label: `llms-full.txt for ${host}`,
+      kind: "llms-full",
+      priority: priorityBase + 3,
+    });
+    candidates.push({
+      url: `${base}llms-ctx-full.txt`,
+      label: `llms-ctx-full.txt for ${host}`,
+      kind: "llms-ctx",
+      priority: priorityBase + 4,
+    });
+  }
+}
+
+export function buildLlmsCandidates(url: string, maxLength: number): LlmsCandidate[] {
+  const parsed = new URL(url);
+  const candidates: LlmsCandidate[] = [];
+  addLlmsFileCandidates(candidates, parsed.origin, parsed.host, maxLength, 10);
+
+  const pathSegments = parsed.pathname.split("/").filter(Boolean);
+  const docRootIndex = pathSegments.findIndex((segment) =>
+    DOC_ROOT_SEGMENTS.has(segment.toLowerCase()),
+  );
+  if (docRootIndex >= 0) {
+    const rootPath = pathSegments
+      .slice(0, docRootIndex + 1)
+      .map(encodeURIComponent)
+      .join("/");
+    addLlmsFileCandidates(candidates, `${parsed.origin}/${rootPath}/`, parsed.host, maxLength, 20);
+  }
+
+  const pageMarkdownUrl = new URL(parsed.href);
+  pageMarkdownUrl.hash = "";
+  if (pageMarkdownUrl.pathname.endsWith("/")) {
+    pageMarkdownUrl.pathname += "index.html.md";
+  } else if (!pageMarkdownUrl.pathname.endsWith(".md")) {
+    pageMarkdownUrl.pathname += ".md";
+  }
+  candidates.push({
+    url: pageMarkdownUrl.href,
+    label: `Markdown source for ${pageMarkdownUrl.host}${pageMarkdownUrl.pathname}`,
+    kind: "page-md",
+    priority: 15,
+  });
+
+  const seen = new Set<string>();
+  return candidates
+    .sort((a, b) => a.priority - b.priority)
+    .filter((candidate) => {
+      if (seen.has(candidate.url)) return false;
+      seen.add(candidate.url);
+      return true;
+    });
+}
+
+function looksLikeHtmlErrorPage(text: string): boolean {
+  const trimmed = text.trim().slice(0, 4000).toLowerCase();
+  if (/^(<!doctype html|<html\b)/i.test(trimmed)) return true;
+  if (/<title>\s*(404|not found|error)\b/i.test(trimmed)) return true;
+  const tagMatches = trimmed.match(/<\/?[a-z][^>]*>/g) ?? [];
+  return tagMatches.length > 20 && tagMatches.join("").length > trimmed.length * 0.25;
+}
+
+function looksLikeMarkdownDocument(
+  text: string,
+  contentType: string,
+  candidate: LlmsCandidate,
+): boolean {
+  const trimmed = text.trim();
+  const minimumLength = candidate.kind === "page-md" ? 80 : 120;
+  if (trimmed.length <= minimumLength) return false;
+  if (looksLikeHtmlErrorPage(trimmed)) return false;
+  if (/text\/plain|text\/markdown|markdown/i.test(contentType)) return true;
+  if (/^---\s*[\s\S]{0,1200}?---\s*\n#\s+/m.test(trimmed)) return true;
+  if (/^#\s+\S+/m.test(trimmed)) return true;
+  const markdownLinks = trimmed.match(/\[[^\]]+\]\([^)]+\)/g) ?? [];
+  const listItems = trimmed.match(/^\s*[-*]\s+\S+/gm) ?? [];
+  return candidate.kind !== "page-md" && markdownLinks.length + listItems.length >= 3;
+}
+
+async function tryLlmsResource(
+  url: string,
+  opts: FetchOptions,
+  signal: AbortSignal,
+): Promise<string | null> {
+  let candidates: LlmsCandidate[];
+  try {
+    candidates = buildLlmsCandidates(url, opts.maxLength);
+  } catch {
+    return null;
+  }
+
+  const limit =
+    opts.maxLength >= LONG_LLMS_THRESHOLD ? candidates.length : DEFAULT_LLMS_CANDIDATE_LIMIT;
+  for (const candidate of candidates.slice(0, limit)) {
+    if (isBlockedUrl(candidate.url)) continue;
+    try {
+      const result = await fetchOne(candidate.url, signal);
+      if (!result.ok) continue;
+      const { response } = result;
+      if (response.status !== 200) continue;
+      const text = await response.body.text();
+      if (!looksLikeMarkdownDocument(text, response.contentType, candidate)) continue;
+      return `[${candidate.label}]\nSource: ${response.finalUrl}\n\n${truncate(text.trim(), opts.maxLength)}`;
+    } catch {
+      // Try the next candidate; probes should never block the real fetch.
+    }
+  }
+
+  return null;
+}
+
+async function fetchWithPreferredDocs(
+  url: string,
+  opts: FetchOptions,
+  signal: AbortSignal,
+): Promise<string> {
+  if (opts.preferLlmsTxt && !isBlockedUrl(url) && isDocish(url)) {
+    const llms = await tryLlmsResource(url, opts, signal);
+    if (llms) return llms;
+  }
+  return await fetchAndProcess(url, opts, signal);
+}
+
 export function createWebFetchTool(): AgentTool<typeof parameters> {
   return {
     name: "web_fetch",
     description:
-      "Fetch and read content from a URL. Returns the text content of the page with HTML tags stripped. Useful for reading articles, documentation, or any web page.",
+      "Fetch and read web page content. Accepts a single `url` or a `urls` array (up to 10, " +
+      "fetched concurrently). Returns clean Markdown by default (`format`: markdown|text|html) via " +
+      "main-content extraction. Extracts text from PDFs, follows safe redirects automatically, and " +
+      "prefers a site's curated /llms.txt for docs pages when available.",
     parameters,
-    async execute(args) {
+    async execute(args, context: ToolContext) {
       const maxLength = args.max_length ?? 10000;
+      const format: FetchFormat = args.format ?? "markdown";
+      const preferLlmsTxt = args.prefer_llms_txt !== false;
 
-      if (isBlockedUrl(args.url)) {
-        return "Error: URL blocked — requests to private/internal network addresses are not allowed.";
+      // Multi-URL path: bounded-concurrency pool, per-URL budget, ordered output.
+      if (args.urls && args.urls.length > 0) {
+        const urls = args.urls;
+        const perUrlBudget = Math.max(PER_URL_MIN_BUDGET, Math.floor(maxLength / urls.length));
+        const opts: FetchOptions = { maxLength: perUrlBudget, format, preferLlmsTxt };
+        const sections = await runPool(urls, MAX_CONCURRENCY, (u) =>
+          fetchWithPreferredDocs(u, opts, context.signal),
+        );
+        return urls.map((u, i) => `## ${u}\n${sections[i]}`).join("\n\n");
       }
 
-      try {
-        const response = await fetch(args.url, {
-          headers: {
-            "User-Agent": "Mozilla/5.0 (compatible; GGCoder/1.0)",
-            Accept: "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
-          },
-          redirect: "manual",
-          signal: AbortSignal.timeout(30000),
-        });
-
-        if (response.status >= 300 && response.status < 400) {
-          const location = response.headers.get("location");
-          if (!location) return `Error: HTTP ${response.status} redirect without Location header`;
-          const redirectUrl = new URL(location, args.url).toString();
-          if (isBlockedUrl(redirectUrl)) {
-            return "Error: Redirect blocked — target URL is private/internal or unsupported.";
-          }
-          return `Error: Redirects are not followed automatically. Safe redirect target: ${redirectUrl}`;
-        }
-
-        if (!response.ok) {
-          return `Error: HTTP ${response.status} ${response.statusText}`;
-        }
-
-        const contentType = response.headers.get("content-type") ?? "";
-        const text = await response.text();
-
-        let content: string;
-        if (contentType.includes("html")) {
-          content = htmlToCleanText(text);
-        } else {
-          content = text;
-        }
-
-        if (content.length > maxLength) {
-          content = content.slice(0, maxLength) + "\n\n[Content truncated]";
-        }
-
-        return content;
-      } catch (error) {
-        const msg = error instanceof Error ? error.message : String(error);
-        return `Error fetching ${args.url}: ${msg}`;
+      const url = args.url;
+      if (!url) {
+        return "Error: provide either `url` or `urls`.";
       }
+
+      const opts: FetchOptions = { maxLength, format, preferLlmsTxt };
+      return await fetchWithPreferredDocs(url, opts, context.signal);
     },
   };
 }
 
-const parameters = z.object({
-  url: z.string().describe("The URL to fetch"),
-  max_length: z.number().optional().describe("Maximum characters to return (default: 10000)"),
-});
+/**
+ * Run `worker` over `items` with at most `limit` in flight, preserving input
+ * order in the returned results array.
+ */
+async function runPool<T, R>(
+  items: readonly T[],
+  limit: number,
+  worker: (item: T) => Promise<R>,
+): Promise<R[]> {
+  const results = new Array<R>(items.length);
+  let next = 0;
+
+  async function runner(): Promise<void> {
+    while (next < items.length) {
+      const index = next++;
+      results[index] = await worker(items[index]);
+    }
+  }
+
+  const runners = Array.from({ length: Math.min(limit, items.length) }, () => runner());
+  await Promise.all(runners);
+  return results;
+}
+
+const parameters = z
+  .object({
+    url: z.string().optional().describe("The URL to fetch"),
+    urls: z
+      .array(z.string())
+      .max(MAX_URLS)
+      .optional()
+      .describe(`Fetch multiple URLs concurrently (up to ${MAX_URLS}); returns a sectioned digest`),
+    max_length: z.number().optional().describe("Maximum characters to return (default: 10000)"),
+    format: z
+      .enum(["markdown", "text", "html"])
+      .optional()
+      .describe("Output format: markdown (default, main-content extraction), text, or html"),
+    prefer_llms_txt: z
+      .boolean()
+      .optional()
+      .describe("Prefer a site's curated /llms.txt for documentation pages (default: true)"),
+  })
+  .refine((v) => Boolean(v.url) !== Boolean(v.urls && v.urls.length > 0), {
+    message: "Provide exactly one of `url` or `urls`.",
+  });

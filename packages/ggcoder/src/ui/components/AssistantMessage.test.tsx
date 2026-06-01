@@ -418,40 +418,31 @@ describe("AssistantMessage live layout", () => {
     expect(assistantIndex).toBeLessThan(toolIndex);
   });
 
-  it("keeps a blank visual row between a flushed tool row and active streaming text", async () => {
+  it("omits the flushed tool row from scrollback and renders the streaming text", async () => {
     const frame = await renderFlushedToolThenAssistantFrame({ historyState: "committed" });
     const physicalLines = frame.split("\n");
 
-    expect(physicalLines).toContain(" ⏺ Read 1 file: a.ts");
+    expect(physicalLines).not.toContain(" ⏺ Read 1 file: a.ts");
     expect(physicalLines).toContain(" ⏺ Next I’ll inspect the terminal history serialized output.");
-    expect(frame).toContain(
-      " ⏺ Read 1 file: a.ts\n\n ⏺ Next I’ll inspect the terminal history serialized output.",
-    );
   });
 
-  it("keeps that blank row while the flushed tool row is pending history state commit", async () => {
+  it("omits the tool row from scrollback while pending history state commit", async () => {
     const frame = await renderFlushedToolThenAssistantFrame({ historyState: "pending" });
     const physicalLines = frame.split("\n");
 
-    expect(physicalLines).toContain(" ⏺ Read 1 file: a.ts");
+    expect(physicalLines).not.toContain(" ⏺ Read 1 file: a.ts");
     expect(physicalLines).toContain(" ⏺ Next I’ll inspect the terminal history serialized output.");
-    expect(frame).toContain(
-      " ⏺ Read 1 file: a.ts\n\n ⏺ Next I’ll inspect the terminal history serialized output.",
-    );
   });
 
-  it("keeps that blank row for a completed live assistant row pending history state commit", async () => {
+  it("omits the tool row for a completed live assistant row pending history commit", async () => {
     const frame = await renderFlushedToolThenAssistantFrame({
       historyState: "pending",
       mode: "completed",
     });
     const physicalLines = frame.split("\n");
 
-    expect(physicalLines).toContain(" ⏺ Read 1 file: a.ts");
+    expect(physicalLines).not.toContain(" ⏺ Read 1 file: a.ts");
     expect(physicalLines).toContain(" ⏺ Next I’ll inspect the terminal history serialized output.");
-    expect(frame).toContain(
-      " ⏺ Read 1 file: a.ts\n\n ⏺ Next I’ll inspect the terminal history serialized output.",
-    );
   });
 
   it("keeps a blank visual row between printed history and compact active tool rows", async () => {

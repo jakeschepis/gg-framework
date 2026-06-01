@@ -552,6 +552,34 @@ function messageToResponse(message: Anthropic.Message): StreamResponse {
   };
 }
 
+/**
+ * Read Anthropic's unified rate-limit headers — the subscription (OAuth) quota
+ * signal. `anthropic-ratelimit-unified-status: rejected` means the usage window
+ * is spent (not a transient per-minute throttle); `-reset` is the unix-seconds
+ * reset time. Works against a web `Headers` object or a plain header record.
+ */
+function readUnifiedRateLimit(headers: unknown): { rejected: boolean; resetsAt?: number } {
+  const get = (name: string): string | null => {
+    if (headers && typeof (headers as { get?: unknown }).get === "function") {
+      return (headers as Headers).get(name);
+    }
+    if (headers && typeof headers === "object") {
+      const rec = headers as Record<string, unknown>;
+      const value = rec[name] ?? rec[name.toLowerCase()];
+      return typeof value === "string" ? value : null;
+    }
+    return null;
+  };
+  const status = get("anthropic-ratelimit-unified-status");
+  const resetRaw =
+    get("anthropic-ratelimit-unified-reset") ??
+    get("anthropic-ratelimit-unified-5h-reset") ??
+    get("anthropic-ratelimit-unified-7d-reset");
+  const resetNum = resetRaw != null ? Number(resetRaw) : Number.NaN;
+  const resetsAt = Number.isFinite(resetNum) && resetNum > 0 ? resetNum : undefined;
+  return { rejected: status === "rejected", ...(resetsAt ? { resetsAt } : {}) };
+}
+
 function toError(err: unknown): ProviderError {
   if (err instanceof Anthropic.APIError) {
     // Anthropic exposes request IDs as `requestID` in current SDKs, `request_id`
@@ -580,6 +608,24 @@ function toError(err: unknown): ProviderError {
             : undefined;
     const message =
       bodyType && bodyMessage ? `${bodyType}: ${bodyMessage}` : (bodyMessage ?? err.message);
+
+    // Subscription (OAuth) usage-window exhaustion. Anthropic returns 429 with
+    // the unified rate-limit headers; a "rejected" status — or a reset stamp
+    // meaningfully in the future — means the plan's usage is spent, not a
+    // transient per-minute throttle. Stamp a canonical message so downstream
+    // retry logic stops instead of burning minutes retrying.
+    if (err.status === 429) {
+      const limit = readUnifiedRateLimit(err.headers);
+      const farOff = limit.resetsAt != null && limit.resetsAt * 1000 - Date.now() > 60_000;
+      if (limit.rejected || farOff) {
+        return new ProviderError("anthropic", "Claude usage limit reached", {
+          statusCode: 429,
+          ...(requestId ? { requestId } : {}),
+          ...(limit.resetsAt ? { resetsAt: limit.resetsAt } : {}),
+          cause: err,
+        });
+      }
+    }
 
     return new ProviderError("anthropic", message, {
       statusCode: err.status,

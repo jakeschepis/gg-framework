@@ -1,5 +1,10 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { createWebSearchTool, isAdSearchResultUrl } from "./web-search.js";
+import {
+  canonicalSearchResultUrl,
+  createWebSearchTool,
+  isAdSearchResultUrl,
+  normalizeDomain,
+} from "./web-search.js";
 
 const originalFetch = globalThis.fetch;
 
@@ -10,6 +15,28 @@ function context() {
 afterEach(() => {
   globalThis.fetch = originalFetch;
   vi.restoreAllMocks();
+});
+
+describe("canonicalSearchResultUrl", () => {
+  it("strips tracking params and fragments while sorting remaining params", () => {
+    expect(
+      canonicalSearchResultUrl("https://example.com/docs?utm_source=x&b=2&a=1&fbclid=abc#section"),
+    ).toBe("https://example.com/docs?a=1&b=2");
+  });
+
+  it("unwraps nested redirect params safely", () => {
+    expect(
+      canonicalSearchResultUrl(
+        "/l/?url=https%3A%2F%2Fexample.com%2Fguide%3Futm_medium%3Dcpc%26x%3D1",
+      ),
+    ).toBe("https://example.com/guide?x=1");
+    expect(
+      canonicalSearchResultUrl(
+        "https://duckduckgo.com/y.js?u3=https%3A%2F%2Fwww.bing.com%2Faclick%3Fld%3Dabc",
+      ),
+    ).toBeNull();
+    expect(canonicalSearchResultUrl("javascript:alert(1)")).toBeNull();
+  });
 });
 
 describe("isAdSearchResultUrl", () => {
@@ -27,6 +54,11 @@ describe("isAdSearchResultUrl", () => {
     ).toBe(true);
   });
 
+  it("blocks affiliate and ad network hosts", () => {
+    expect(isAdSearchResultUrl("https://awin1.com/cread.php?awinmid=1")).toBe(true);
+    expect(isAdSearchResultUrl("https://ads.linkedin.com/click?id=1")).toBe(true);
+  });
+
   it("allows ordinary organic result URLs", () => {
     expect(isAdSearchResultUrl("https://developer.mozilla.org/en-US/docs/Web/API/fetch")).toBe(
       false,
@@ -34,6 +66,26 @@ describe("isAdSearchResultUrl", () => {
     expect(isAdSearchResultUrl("/l/?uddg=https%3A%2F%2Fwww.typescriptlang.org%2Fdocs%2F")).toBe(
       false,
     );
+  });
+});
+
+describe("normalizeDomain", () => {
+  it("lowercases and strips scheme and wildcard prefixes", () => {
+    expect(normalizeDomain("https://Docs.Python.ORG")).toBe("docs.python.org");
+    expect(normalizeDomain("*.example.com")).toBe("example.com");
+    expect(normalizeDomain("  github.com  ")).toBe("github.com");
+  });
+
+  it("converts Unicode homographs to punycode", () => {
+    // "аррӏе" uses Cyrillic look-alikes; hostname normalizes to xn-- punycode.
+    const result = normalizeDomain("аррӏе.com");
+    expect(result).toMatch(/^xn--/);
+    expect(result).not.toBe("apple.com");
+  });
+
+  it("returns null for un-parseable input", () => {
+    expect(normalizeDomain("")).toBeNull();
+    expect(normalizeDomain("   ")).toBeNull();
   });
 });
 
@@ -132,6 +184,171 @@ describe("createWebSearchTool", () => {
     expect(result).toContain("https://example.com/organic");
     expect(result).toContain("from Brave");
     expect(result).not.toContain("Cheap laptops for sale");
+  });
+
+  it("applies time_range and include_domains to the request", async () => {
+    let capturedUrl = "";
+    globalThis.fetch = vi.fn(async (input: RequestInfo | URL) => {
+      capturedUrl = String(input);
+      // Return organic result only on the Google branch.
+      if (capturedUrl.includes("google.com")) {
+        return new Response(
+          `<div class="g"><a href="https://docs.python.org/3/"><h3>Python Docs</h3></a><div class="VwiC3b">Official Python documentation.</div></div>`,
+          { status: 200 },
+        );
+      }
+      return new Response("<html></html>", { status: 200 });
+    }) as typeof fetch;
+
+    const result = await createWebSearchTool().execute(
+      {
+        query: "asyncio",
+        include_domains: ["docs.python.org"],
+        time_range: "week",
+        max_results: 5,
+      },
+      context(),
+    );
+
+    // Last captured URL is the Google branch with recency + site scoping.
+    expect(capturedUrl).toContain("tbs=qdr:w");
+    expect(decodeURIComponent(capturedUrl)).toContain("site:docs.python.org");
+    expect(result).toContain("Python Docs");
+    expect(result).toContain("past week");
+  });
+
+  it("drops results from excluded domains client-side", async () => {
+    const html = `
+      <a class="result__a" href="/l/?uddg=https%3A%2F%2Fw3schools.com%2Ffetch">W3Schools Fetch</a>
+      <a class="result__snippet">Tutorial content.</a>
+      <a class="result__a" href="/l/?uddg=https%3A%2F%2Fdeveloper.mozilla.org%2Fen-US%2Fdocs%2FWeb%2FAPI%2FFetch_API">Fetch API - MDN</a>
+      <a class="result__snippet">MDN reference.</a>
+    `;
+    globalThis.fetch = vi.fn(async () => new Response(html, { status: 200 })) as typeof fetch;
+
+    const result = await createWebSearchTool().execute(
+      { query: "fetch api", exclude_domains: ["w3schools.com"], max_results: 5 },
+      context(),
+    );
+
+    expect(result).toContain("Fetch API - MDN");
+    expect(result).not.toContain("W3Schools");
+    expect(result).toContain("-site:w3schools.com");
+  });
+
+  it("filters coupon spam for non-commerce queries but keeps it for commerce queries", async () => {
+    const html = `
+      <a class="result__a" href="https://coupon.example.com/typescript">TypeScript coupon code</a>
+      <a class="result__snippet">Exclusive deal and discount code for docs.</a>
+      <a class="result__a" href="https://www.typescriptlang.org/docs/">TypeScript Documentation</a>
+      <a class="result__snippet">Official TypeScript docs.</a>
+    `;
+    globalThis.fetch = vi.fn(async () => new Response(html, { status: 200 })) as typeof fetch;
+
+    const docsResult = await createWebSearchTool().execute(
+      { query: "typescript docs", max_results: 5 },
+      context(),
+    );
+    expect(docsResult).toContain("TypeScript Documentation");
+    expect(docsResult).not.toContain("TypeScript coupon code");
+    expect(docsResult).toContain("filtered 1 spam result");
+
+    globalThis.fetch = vi.fn(async () => new Response(html, { status: 200 })) as typeof fetch;
+    const commerceResult = await createWebSearchTool().execute(
+      { query: "best typescript coupon", max_results: 5 },
+      context(),
+    );
+    expect(commerceResult).toContain("TypeScript coupon code");
+  });
+
+  it("collapses duplicate canonical URLs and reports duplicate count", async () => {
+    const html = `
+      <a class="result__a" href="https://example.com/docs?utm_source=a&b=2&a=1#top">Docs first</a>
+      <a class="result__snippet">First snippet.</a>
+      <a class="result__a" href="https://example.com/docs?a=1&b=2">Docs duplicate</a>
+      <a class="result__snippet">Duplicate snippet.</a>
+    `;
+    globalThis.fetch = vi.fn(async () => new Response(html, { status: 200 })) as typeof fetch;
+
+    const result = await createWebSearchTool().execute(
+      { query: "example docs", max_results: 5 },
+      context(),
+    );
+
+    expect(result).toContain("Docs first");
+    expect(result).not.toContain("Docs duplicate");
+    expect(result).toContain("1 duplicate");
+  });
+
+  it("skips sponsored parser blocks and returns organic results", async () => {
+    const html = `
+      <li class="b_algo b_ad">
+        <h2><a href="https://example-ad.com/offer">Sponsored offer</a></h2>
+        <div class="b_adlabel">Ad</div><p>Buy now.</p>
+      </li>
+      <li class="b_algo">
+        <h2><a href="https://developer.mozilla.org/docs/Web/API/Fetch_API">Fetch API - MDN</a></h2>
+        <div class="b_caption"><p>Useful organic snippet.</p></div>
+      </li>
+    `;
+    globalThis.fetch = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("<html></html>", { status: 200 }))
+      .mockResolvedValueOnce(new Response("<html></html>", { status: 200 }))
+      .mockResolvedValueOnce(new Response("<html></html>", { status: 200 }))
+      .mockResolvedValueOnce(new Response(html, { status: 200 })) as typeof fetch;
+
+    const result = await createWebSearchTool().execute(
+      { query: "fetch api mdn", max_results: 5 },
+      context(),
+    );
+
+    expect(result).toContain("Fetch API - MDN");
+    expect(result).not.toContain("Sponsored offer");
+    expect(result).toContain("from Bing");
+  });
+
+  it("reports filtered ad counts only when non-zero", async () => {
+    const html = `
+      <a class="result__a" href="https://googleadservices.com/pagead/aclk">Cloud hosting</a>
+      <a class="result__snippet">Fast platform overview.</a>
+      <a class="result__a" href="https://example.com/docs">Docs</a>
+      <a class="result__snippet">Organic docs.</a>
+    `;
+    globalThis.fetch = vi.fn(async () => new Response(html, { status: 200 })) as typeof fetch;
+
+    const filtered = await createWebSearchTool().execute(
+      { query: "example docs", max_results: 5 },
+      context(),
+    );
+    expect(filtered).toContain("filtered 1 ad");
+
+    globalThis.fetch = vi.fn(
+      async () =>
+        new Response(
+          `<a class="result__a" href="https://example.com/docs">Docs</a><a class="result__snippet">Organic docs.</a>`,
+          { status: 200 },
+        ),
+    ) as typeof fetch;
+    const clean = await createWebSearchTool().execute(
+      { query: "example docs", max_results: 5 },
+      context(),
+    );
+    expect(clean).not.toContain("filtered");
+  });
+
+  it("rejects setting both include_domains and exclude_domains via the schema", () => {
+    const tool = createWebSearchTool();
+    const parsed = tool.parameters.safeParse({
+      query: "x",
+      include_domains: ["a.com"],
+      exclude_domains: ["b.com"],
+    });
+
+    expect(parsed.success).toBe(false);
+    if (!parsed.success) {
+      expect(parsed.error.issues.some((i) => /mutually exclusive/i.test(i.message))).toBe(true);
+    }
   });
 
   it("uses Bing as a fallback and unwraps Bing redirect URLs", async () => {

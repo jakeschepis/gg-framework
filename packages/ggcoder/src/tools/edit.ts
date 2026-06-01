@@ -8,19 +8,13 @@ import {
   generateDiff,
   findClosestSnippet,
   findOccurrenceLines,
-  stripLeadingBlankLine,
+  stripBlankEdges,
   applyDotdotdots,
   applyMissingLeadingWhitespace,
 } from "./edit-diff.js";
 import { localOperations, type ToolOperations } from "./operations.js";
 import { assertFresh, recordWrite, type ReadTracker } from "./read-tracker.js";
-import {
-  goalModeRestriction,
-  isGoalModeActive,
-  isPlanModeActive,
-  planModeRestriction,
-  type GoalMode,
-} from "../core/runtime-mode.js";
+import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 
 type MutationCallback = (filePath: string) => void | Promise<void>;
 
@@ -135,21 +129,16 @@ export function createEditTool(
   cwd: string,
   readFiles?: ReadTracker,
   ops: ToolOperations = localOperations,
-  goalModeRefOrOnFileMutated?: { current: GoalMode } | MutationCallback,
   planModeRefOrOnFileMutated?: { current: boolean } | MutationCallback,
   onFileMutated?: MutationCallback,
+  onPreFileMutation?: MutationCallback,
 ): AgentTool<typeof EditParams> {
-  const goalModeRef = isMutationCallback(goalModeRefOrOnFileMutated)
-    ? undefined
-    : goalModeRefOrOnFileMutated;
   const planModeRef = isPlanModeRef(planModeRefOrOnFileMutated)
     ? planModeRefOrOnFileMutated
     : undefined;
-  const mutationCallback = isMutationCallback(goalModeRefOrOnFileMutated)
-    ? goalModeRefOrOnFileMutated
-    : isMutationCallback(planModeRefOrOnFileMutated)
-      ? planModeRefOrOnFileMutated
-      : onFileMutated;
+  const mutationCallback = isMutationCallback(planModeRefOrOnFileMutated)
+    ? planModeRefOrOnFileMutated
+    : onFileMutated;
   return {
     name: "edit",
     description:
@@ -161,9 +150,6 @@ export function createEditTool(
     parameters: EditParams,
     executionMode: "sequential",
     async execute({ file_path, edits, atomic = false }) {
-      if (isGoalModeActive(goalModeRef)) {
-        return goalModeRestriction("edit", "Goal metadata, evidence plans, and task creation");
-      }
       if (isPlanModeActive(planModeRef)) {
         return planModeRestriction("edit");
       }
@@ -200,7 +186,7 @@ export function createEditTool(
         // Order mirrors aider/coders/editblock_coder.py:
         //   1. exact + smart-quote/dash fuzzy (in tryMatch)
         //   2. indent-flex (model omitted/shortened leading whitespace)
-        //   3. drop leading blank line, retry 1+2
+        //   3. drop spurious leading/trailing blank lines, retry 1+2
         //   4. dotdotdots (`...` elision with preserved middle)
         let result = tryMatch(working, normalizedOld, normalizedNew, replaceAll);
 
@@ -221,7 +207,7 @@ export function createEditTool(
         }
 
         if (!result.ok && result.reason === "not_found") {
-          const stripped = stripLeadingBlankLine(normalizedOld);
+          const stripped = stripBlankEdges(normalizedOld);
           if (stripped !== null) {
             const candidate = tryFallbacks(stripped);
             if (candidate !== null) result = { ok: true, newWorking: candidate };
@@ -269,7 +255,6 @@ export function createEditTool(
         .map((o, i) => (o.ok || !o.failure ? null : { index: i, failure: o.failure }))
         .filter((x): x is { index: number; failure: FailureKind } => x !== null);
       const successCount = outcomes.length - failures.length;
-      const hasNotFound = failures.some((f) => f.failure.reason === "not_found");
 
       // Closest-match snippets only get suppressed when successes will ACTUALLY
       // be persisted (partial-apply with at least one win). In atomic mode we
@@ -293,7 +278,8 @@ export function createEditTool(
         const base =
           `old_text not found in ${fileName}. ` +
           "Text must match verbatim — do not paraphrase. " +
-          "The cached read for this file has been invalidated; call `read` before another edit.";
+          "Fix this edit's old_text to match the file exactly (re-read the region below if unsure); " +
+          "the file is unchanged, so successful edits and prior reads are still valid.";
         // Build a bounded read suggestion around the closest-match line so the
         // model can re-read just that region (e.g. ±25 lines) instead of the
         // whole file. Skipped when willPersistSuccesses — see comment above.
@@ -318,11 +304,12 @@ export function createEditTool(
       // succeeded. Either way nothing should be written and we throw to make
       // the model retry the whole batch.
       if (failures.length > 0 && (atomic || successCount === 0)) {
-        // Hard guardrail: a not_found failure means the model's mental model
-        // of the file is wrong. Invalidate the tracker so the next edit fails
-        // with "File must be read first" — forces a re-read instead of
-        // letting the model burn turns retrying paraphrased variants.
-        if (hasNotFound) readFiles?.delete(resolved);
+        // Nothing was written — the file is byte-identical to the last read, so
+        // the read tracker stays valid. We deliberately do NOT invalidate it
+        // here: doing so turned a precise "old_text not found (closest match
+        // below)" error into a misleading "File must be read first" on every
+        // following edit, hiding the real fix from the model. assertFresh still
+        // catches genuine on-disk changes (formatter/external edit).
         const header =
           atomic && failures.length > 0
             ? `${failures.length} of ${edits.length} edit${edits.length === 1 ? "" : "s"} failed; no changes written (atomic).\n\n`
@@ -338,13 +325,15 @@ export function createEditTool(
 
       if (changed) {
         const finalContent = hasCRLF ? working.replace(/\n/g, "\r\n") : working;
+        // Snapshot the pre-mutation on-disk state for /rewind before writing.
+        await onPreFileMutation?.(resolved);
         await ops.writeFile(resolved, finalContent);
         await recordWrite(readFiles, resolved, finalContent, ops);
         await mutationCallback?.(resolved);
-        // Partial-apply with a not_found in the mix: recordWrite just refreshed
-        // the tracker, but we still want to force a re-read for the next batch
-        // because the model's view of at least one region is wrong.
-        if (hasNotFound) readFiles?.delete(resolved);
+        // recordWrite refreshed the tracker to the just-written content, so the
+        // next edit (including retries of the skipped ones) validates against an
+        // accurate snapshot. No invalidation — the failure message already
+        // carries the closest match and a bounded re-read hint.
       }
 
       if (failures.length === 0) {

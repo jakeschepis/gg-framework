@@ -6,6 +6,8 @@ import {
   classifyOverload,
   extractContextOverflowDetails,
   isContextOverflow,
+  isThinkingBlockError,
+  isUsageLimitError,
 } from "./agent-loop.js";
 import type { AgentEvent, AgentResult, AgentTool } from "./types.js";
 import type { Message, StreamOptions } from "@kenkaiiii/gg-ai";
@@ -84,6 +86,39 @@ async function collectLoop(
 
 // ── Tests ──────────────────────────────────────────────────
 
+describe("isThinkingBlockError", () => {
+  it("detects the latest-assistant-message modification error", () => {
+    expect(
+      isThinkingBlockError(
+        new Error(
+          "messages.3.content.257: `thinking` or `redacted_thinking` blocks in the latest " +
+            "assistant message cannot be modified. These blocks must remain as they were " +
+            "in the original response.",
+        ),
+      ),
+    ).toBe(true);
+  });
+
+  it("detects an invalid thinking signature error", () => {
+    expect(isThinkingBlockError(new Error("Invalid `signature` in `thinking` block"))).toBe(true);
+  });
+
+  it("detects a thinking block type/position error", () => {
+    expect(
+      isThinkingBlockError(
+        new Error("Expected `thinking` or `redacted_thinking`, but found `text`"),
+      ),
+    ).toBe(true);
+  });
+
+  it("returns false for unrelated errors and non-Error values", () => {
+    expect(isThinkingBlockError(new Error("tool_use ids found without tool_result"))).toBe(false);
+    expect(isThinkingBlockError(new Error("rate limit exceeded"))).toBe(false);
+    expect(isThinkingBlockError("cannot be modified")).toBe(false);
+    expect(isThinkingBlockError(null)).toBe(false);
+  });
+});
+
 describe("isContextOverflow", () => {
   it("detects Anthropic overflow error", () => {
     const err = new Error("[anthropic] prompt is too long: 203456 tokens > 200000 maximum");
@@ -159,6 +194,40 @@ describe("classifyOverload", () => {
     expect(
       classifyOverload(new ProviderError("anthropic", "overloaded_error", { statusCode: 529 })),
     ).toBe("overloaded");
+  });
+
+  it("does not treat a usage-window 429 as a retriable rate limit", () => {
+    expect(
+      classifyOverload(
+        new ProviderError("anthropic", "Claude usage limit reached", {
+          statusCode: 429,
+          resetsAt: Math.floor(Date.now() / 1000) + 3600,
+        }),
+      ),
+    ).toBeNull();
+  });
+});
+
+describe("isUsageLimitError", () => {
+  it("matches the canonical usage-limit message", () => {
+    expect(
+      isUsageLimitError(
+        new ProviderError("anthropic", "Claude usage limit reached", { statusCode: 429 }),
+      ),
+    ).toBe(true);
+  });
+
+  it("does not match a transient rate-limit error", () => {
+    expect(
+      isUsageLimitError(
+        new ProviderError("anthropic", "rate_limit_error: Rate limited.", { statusCode: 429 }),
+      ),
+    ).toBe(false);
+  });
+
+  it("returns false for non-Error values", () => {
+    expect(isUsageLimitError("Claude usage limit reached")).toBe(false);
+    expect(isUsageLimitError(null)).toBe(false);
   });
 });
 
@@ -368,6 +437,25 @@ describe("agentLoop", () => {
     );
   });
 
+  it("surfaces a usage-window 429 immediately without retrying", async () => {
+    const usageErr = new ProviderError("anthropic", "Claude usage limit reached", {
+      statusCode: 429,
+      resetsAt: Math.floor(Date.now() / 1000) + 3600,
+    });
+    mockStream.mockReturnValue(mockErrorResult(usageErr) as unknown as ReturnType<typeof stream>);
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+
+    await expect(collectLoop(messages, { provider: "anthropic", model: "test" })).rejects.toThrow(
+      "Claude usage limit reached",
+    );
+    // No retry bucket — the stream is attempted exactly once.
+    expect(mockStream).toHaveBeenCalledTimes(1);
+  });
+
   it("polls getSteeringMessages before the first LLM call", async () => {
     mockStream.mockReturnValueOnce(mockOkResult("Reply") as unknown as ReturnType<typeof stream>);
 
@@ -428,6 +516,39 @@ describe("agentLoop", () => {
     expect(getFollowUpMessages).toHaveBeenCalled();
     expect(events.some((e) => e.type === "follow_up_message")).toBe(true);
     expect(result.totalTurns).toBe(2);
+  });
+
+  it("emits follow-up review before final agent_done", async () => {
+    mockStream
+      .mockReturnValueOnce(mockOkResult("Draft final") as unknown as ReturnType<typeof stream>)
+      .mockReturnValueOnce(mockOkResult("Reviewed final") as unknown as ReturnType<typeof stream>);
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+
+    let injected = false;
+    const getFollowUpMessages = vi.fn().mockImplementation(() => {
+      if (injected) return null;
+      injected = true;
+      return [{ role: "user" as const, content: "Ideal?" }];
+    });
+
+    const { events } = await collectLoop(messages, {
+      provider: "anthropic",
+      model: "test",
+      getFollowUpMessages,
+    });
+
+    const followUpIndex = events.findIndex((event) => event.type === "follow_up_message");
+    const doneIndex = events.findIndex((event) => event.type === "agent_done");
+
+    expect(followUpIndex).toBeGreaterThanOrEqual(0);
+    expect(doneIndex).toBeGreaterThan(followUpIndex);
+    expect(
+      messages.some((message) => message.role === "user" && message.content === "Ideal?"),
+    ).toBe(true);
   });
 
   it("steering takes priority over follow-up at pre-completion", async () => {

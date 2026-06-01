@@ -13,14 +13,12 @@ function itemForKind(kind: CompletedItem["kind"], id: string = kind): CompletedI
       return { kind, id, text: "user" };
     case "assistant":
       return { kind, id, text: "assistant" };
+    case "ideal_hook":
+      return { kind, id, text: "ideal hook" };
     case "queued":
       return { kind, id, text: "queued" };
     case "task":
       return { kind, id, title: "task" };
-    case "goal":
-      return { kind, id, title: "goal" };
-    case "goal_progress":
-      return { kind, id, phase: "worker_started", title: "goal progress" };
     case "tool_start":
       return { kind, id, toolCallId: id, name: "read", args: {}, startedAt: 0, animateUntil: 0 };
     case "tool_done":
@@ -57,8 +55,6 @@ function itemForKind(kind: CompletedItem["kind"], id: string = kind): CompletedI
       return { kind, id, text: "stopped" };
     case "plan_transition":
       return { kind, id, text: "plan", active: true };
-    case "goal_agent_transition":
-      return { kind, id, text: "goal agent" };
     case "model_transition":
       return { kind, id, modelName: "model" };
     case "theme_transition":
@@ -174,6 +170,46 @@ describe("transcript spacing", () => {
         lastHistoryItem: previous,
       }),
     ).toBe(0);
+  });
+
+  it("re-inserts the paragraph gap before a continuation assistant chunk", () => {
+    // A response whose earlier paragraphs were flushed mid-stream commits its
+    // trailing paragraph with continuation:true. assistant→assistant is
+    // otherwise compact, but the original paragraphs were blank-line separated,
+    // so the continuation chunk must get a 1-row top margin (and no dot).
+    const item: CompletedItem = {
+      kind: "assistant",
+      id: "assistant-2",
+      text: "final paragraph",
+      continuation: true,
+    };
+    const previous: CompletedItem = {
+      kind: "assistant",
+      id: "assistant-1",
+      text: "earlier paragraph",
+    };
+
+    expect(
+      getTranscriptItemMarginTop({
+        item,
+        previousLiveItem: previous,
+      }),
+    ).toBe(1);
+  });
+
+  it("separates non-continuation stacked assistant rows with a blank line", () => {
+    // Two separate responses (e.g. across tool turns) are distinct messages and
+    // need a blank-line gap. Continuation paragraphs of one response are handled
+    // earlier via the `continuation` flag and are unaffected.
+    const item: CompletedItem = { kind: "assistant", id: "assistant-2", text: "second answer" };
+    const previous: CompletedItem = { kind: "assistant", id: "assistant-1", text: "first answer" };
+
+    expect(
+      getTranscriptItemMarginTop({
+        item,
+        previousLiveItem: previous,
+      }),
+    ).toBe(1);
   });
 
   it("does not add a top gap to a queued placeholder immediately after its user row", () => {

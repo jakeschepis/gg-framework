@@ -147,6 +147,43 @@ Fix errors from checks you do run before continuing. Quick fixes:
 - **Zod schemas**: tool parameters defined with Zod, converted to JSON Schema at provider boundary
 - **Debug logging**: `~/.gg/debug.log` — timestamped log of startup, auth, tool calls, turn completions, errors. Truncated on each CLI restart. Singleton logger in `src/core/logger.ts`
 
+## MCP Servers
+
+`ggcoder mcp` adds and manages Model Context Protocol servers. Configs are stored in the same `{ "mcpServers": { … } }` shape Claude Code uses, so they're portable both directions.
+
+### Scopes & file locations
+
+- **Global** → `~/.gg/mcp.json` — available in all GG Coder sessions.
+- **Project** → `./.gg/mcp.json` — only the current project root.
+- On a name collision, **project wins**. Provider defaults (e.g. `kencode-search`) stay authoritative — a user server can only add a new name, never override a default.
+
+### Commands
+
+```bash
+ggcoder mcp                              # interactive dashboard (🟢/🔴 status, tool counts, scope)
+ggcoder mcp list                         # list servers with live connection status
+ggcoder mcp get <name>                   # show one server's config (secrets masked)
+ggcoder mcp add <args…>                  # add a server (claude-compatible grammar)
+ggcoder mcp remove <name> [--scope s]    # remove a server
+```
+
+The `add` grammar mirrors `claude mcp add` 1:1 — you can paste a `claude mcp add …` (or `ggcoder mcp add …`) line and the prefix is stripped automatically:
+
+```bash
+ggcoder mcp add --transport http notion https://mcp.notion.com/mcp
+ggcoder mcp add --transport sse asana https://mcp.asana.com/sse
+ggcoder mcp add --env AIRTABLE_API_KEY=key airtable -- npx -y airtable-mcp-server
+```
+
+`--scope user` maps to global; `local`/`project` map to project. Code lives in `core/mcp/` (`store.ts` persistence, `parse-add-command.ts` parser, `client.ts` `connectAllDetailed`/`probe`) and `cli/mcp.ts` + `ui/mcp.tsx`.
+
+### Caveats
+
+- **Connection is startup-only.** MCP connects once at launch (`connectInitialMcpTools` in `cli.ts`). Adding a server via `ggcoder mcp` mid-session won't hot-load it — restart ggcoder.
+- **Pixel chdir flow.** Project-scoped servers load relative to `process.cwd()` at startup. The Pixel fix flow swaps cwd mid-session (`process.chdir` + `rebuildToolsForCwd`); project MCP servers won't follow that swap.
+- **WebSocket transport** is parsed but rejected (no WS client today).
+- **Env var expansion** (`${VAR}`) in `.mcp.json` is NOT expanded in v1 — values pass through literally.
+
 ## Pixel — error tracking + auto-fix queue
 
 `@kenkaiiii/gg-pixel` is a drop-in error tracking SDK. Errors flow to a Cloudflare Worker (`gg-pixel-server`) backed by D1. `ggcoder pixel` opens an in-Ink overlay that lists open errors per project and hands each one off to the existing agent loop — same UX as the Task pane.

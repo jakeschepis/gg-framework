@@ -1,5 +1,6 @@
 import type { Provider } from "@kenkaiiii/gg-ai";
 import type { MCPServerConfig } from "./types.js";
+import { loadServers } from "./store.js";
 
 export const DEFAULT_MCP_SERVERS: MCPServerConfig[] = [
   { name: "kencode-search", command: "npx", args: ["-y", "@kenkaiiii/kencode-search"] },
@@ -53,4 +54,22 @@ export function getMCPServers(provider: Provider, apiKey?: string): MCPServerCon
   }
 
   return servers;
+}
+
+/**
+ * Full startup set: provider defaults + user-configured servers from
+ * ~/.gg/mcp.json and ./.gg/mcp.json. Provider defaults stay authoritative —
+ * a user server can only ADD a new name, never override a default like
+ * `kencode-search`.
+ */
+export async function getAllMcpServers(
+  provider: Provider,
+  apiKey: string | undefined,
+  cwd: string,
+): Promise<MCPServerConfig[]> {
+  const defaults = getMCPServers(provider, apiKey);
+  const defaultNames = new Set(defaults.map((s) => s.name));
+  const scoped = await loadServers(cwd);
+  const userServers = scoped.map((s) => s.config).filter((c) => !defaultNames.has(c.name));
+  return [...defaults, ...userServers];
 }

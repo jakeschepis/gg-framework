@@ -1,10 +1,6 @@
 import { z } from "zod";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
-import {
-  isGoalModeActive,
-  isPlanModeActive,
-  type GoalMode,
-} from "../core/runtime-mode.js";
+import { isPlanModeActive } from "../core/runtime-mode.js";
 
 const EnterPlanParams = z.object({
   reason: z
@@ -15,7 +11,6 @@ const EnterPlanParams = z.object({
 
 export function createEnterPlanTool(
   onEnterPlan: (reason?: string) => void | Promise<void>,
-  goalModeRef?: { current: GoalMode },
   planModeRef?: { current: boolean },
 ): AgentTool<typeof EnterPlanParams> {
   return {
@@ -27,12 +22,6 @@ export function createEnterPlanTool(
     parameters: EnterPlanParams,
     executionMode: "sequential",
     async execute({ reason }) {
-      if (isGoalModeActive(goalModeRef)) {
-        return (
-          "Error: Cannot enter plan mode while a goal is active. " +
-          "Run `goals status` to see active goals, or complete/pause the goal first."
-        );
-      }
       if (isPlanModeActive(planModeRef)) {
         return "Already in plan mode — continue your research. Draft the plan in .gg/plans/<name>.md and call exit_plan when ready.";
       }
@@ -42,7 +31,7 @@ export function createEnterPlanTool(
         "Allowed actions:\n" +
         "- Use read, grep, find, ls, source_path, web_fetch/web_search, and code search tools to investigate\n" +
         "- Write the implementation plan to .gg/plans/<name>.md\n\n" +
-        "Restricted: bash, edit, write outside .gg/plans/, subagent, task mutation, and goal orchestration.\n\n" +
+        "Restricted: bash, edit, write outside .gg/plans/, subagent, and task mutation.\n\n" +
         "When the plan is ready, call exit_plan with the plan file path."
       );
     },

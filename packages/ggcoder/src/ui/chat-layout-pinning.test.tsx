@@ -385,8 +385,8 @@ describe("chat controls layout", () => {
       exitPending: false,
       footerStatusLayout: noFooterStatus,
       taskBarExpanded: false,
-      goalStatusEntryCount: 0,
       footerFitsOnOneLine: true,
+      liveToolPanelRows: 0,
     });
 
     expect(layout).toEqual({ controlsRows: 6, liveAreaRows: 18 });
@@ -403,8 +403,8 @@ describe("chat controls layout", () => {
       exitPending: false,
       footerStatusLayout: noFooterStatus,
       taskBarExpanded: false,
-      goalStatusEntryCount: 0,
       footerFitsOnOneLine: true,
+      liveToolPanelRows: 0,
     });
     const done = getChatControlsLayoutDecision({
       rows: 24,
@@ -416,11 +416,87 @@ describe("chat controls layout", () => {
       exitPending: false,
       footerStatusLayout: noFooterStatus,
       taskBarExpanded: false,
-      goalStatusEntryCount: 0,
       footerFitsOnOneLine: true,
+      liveToolPanelRows: 0,
     });
 
     expect(done.controlsRows).toBe(running.controlsRows);
+  });
+
+  it("reserves the same controls rows for idle and running status", () => {
+    const idle = getChatControlsLayoutDecision({
+      rows: 24,
+      columns: 80,
+      agentRunning: false,
+      activityVisible: false,
+      doneStatusVisible: false,
+      stallStatusVisible: false,
+      exitPending: false,
+      footerStatusLayout: noFooterStatus,
+      taskBarExpanded: false,
+      footerFitsOnOneLine: true,
+      liveToolPanelRows: 0,
+    });
+    const running = getChatControlsLayoutDecision({
+      rows: 24,
+      columns: 80,
+      agentRunning: true,
+      activityVisible: true,
+      doneStatusVisible: false,
+      stallStatusVisible: false,
+      exitPending: false,
+      footerStatusLayout: noFooterStatus,
+      taskBarExpanded: false,
+      footerFitsOnOneLine: true,
+      liveToolPanelRows: 0,
+    });
+
+    expect(idle.controlsRows).toBe(running.controlsRows);
+    expect(idle.liveAreaRows).toBe(running.liveAreaRows);
+  });
+
+  it("reserves controls rows for the live tool panel so the footer never bounces as tools run", () => {
+    const base = {
+      rows: 24,
+      columns: 80,
+      agentRunning: true,
+      activityVisible: true,
+      doneStatusVisible: false,
+      stallStatusVisible: false,
+      exitPending: false,
+      footerStatusLayout: noFooterStatus,
+      taskBarExpanded: false,
+      footerFitsOnOneLine: true,
+    };
+    const noPanel = getChatControlsLayoutDecision({ ...base, liveToolPanelRows: 0 });
+    const oneRow = getChatControlsLayoutDecision({ ...base, liveToolPanelRows: 1 });
+    const threeRows = getChatControlsLayoutDecision({ ...base, liveToolPanelRows: 3 });
+
+    // Each tool-panel row is added to the controls budget and removed from the
+    // live area, so the total stays exactly `rows` and the footer stays pinned.
+    expect(oneRow.controlsRows).toBe(noPanel.controlsRows + 1);
+    expect(threeRows.controlsRows).toBe(noPanel.controlsRows + 3);
+    expect(noPanel.controlsRows + noPanel.liveAreaRows).toBe(24);
+    expect(threeRows.controlsRows + threeRows.liveAreaRows).toBe(24);
+  });
+
+  it("caps the reserved live tool panel rows at the rolling window height", () => {
+    const base = {
+      rows: 24,
+      columns: 80,
+      agentRunning: true,
+      activityVisible: true,
+      doneStatusVisible: false,
+      stallStatusVisible: false,
+      exitPending: false,
+      footerStatusLayout: noFooterStatus,
+      taskBarExpanded: false,
+      footerFitsOnOneLine: true,
+    };
+    const threeRows = getChatControlsLayoutDecision({ ...base, liveToolPanelRows: 3 });
+    const tenRows = getChatControlsLayoutDecision({ ...base, liveToolPanelRows: 10 });
+
+    expect(tenRows.controlsRows).toBe(threeRows.controlsRows);
   });
 
   it("keeps a minimum live area when controls consume most terminal rows", () => {
@@ -439,8 +515,8 @@ describe("chat controls layout", () => {
         stack: true,
       },
       taskBarExpanded: true,
-      goalStatusEntryCount: 1,
       footerFitsOnOneLine: false,
+      liveToolPanelRows: 0,
     });
 
     expect(layout.liveAreaRows).toBe(3);

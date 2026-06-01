@@ -15,29 +15,72 @@ interface ConnectedServer {
   lastCallTime: number;
 }
 
+/** Per-server connection outcome for the dashboard / non-interactive list. */
+export interface MCPConnectResult {
+  name: string;
+  ok: boolean;
+  toolCount: number;
+  tools: AgentTool[];
+  error?: string;
+}
+
 export class MCPClientManager {
   private servers: ConnectedServer[] = [];
 
   async connectAll(configs: MCPServerConfig[]): Promise<AgentTool[]> {
+    const results = await this.connectAllDetailed(configs);
+    return results.flatMap((r) => r.tools);
+  }
+
+  /**
+   * Connect every enabled server and return one result per server (success →
+   * ok + toolCount; failure → ok:false with a human-readable error string).
+   * Keeps successfully connected servers in `this.servers`.
+   */
+  async connectAllDetailed(configs: MCPServerConfig[]): Promise<MCPConnectResult[]> {
     const enabled = configs.filter((c) => c.enabled !== false);
     if (enabled.length === 0) return [];
 
-    const results = await Promise.allSettled(enabled.map((c) => this.connectServer(c)));
+    const settled = await Promise.allSettled(enabled.map((c) => this.connectServer(c)));
 
-    const tools: AgentTool[] = [];
-    for (let i = 0; i < results.length; i++) {
-      const result = results[i];
+    const results: MCPConnectResult[] = settled.map((result, i) => {
+      const name = enabled[i].name;
       if (result.status === "fulfilled") {
-        tools.push(...result.value);
-      } else {
-        log("WARN", "mcp", `Failed to connect to MCP server "${enabled[i].name}"`, {
-          error: String(result.reason),
-        });
+        return { name, ok: true, toolCount: result.value.length, tools: result.value };
       }
-    }
+      const error = formatConnectError(result.reason);
+      log("WARN", "mcp", `Failed to connect to MCP server "${name}"`, { error });
+      return { name, ok: false, toolCount: 0, tools: [], error };
+    });
 
-    log("INFO", "mcp", `Connected ${this.servers.length} MCP server(s), ${tools.length} tool(s)`);
-    return tools;
+    const connected = results.filter((r) => r.ok).length;
+    const toolCount = results.reduce((sum, r) => sum + r.toolCount, 0);
+    log("INFO", "mcp", `Connected ${connected} MCP server(s), ${toolCount} tool(s)`);
+    return results;
+  }
+
+  /**
+   * Connect a single server, list its tools, then close that client so the
+   * probe connection doesn't accumulate in `this.servers`. Used to validate a
+   * server before persisting it.
+   */
+  async probe(config: MCPServerConfig): Promise<MCPConnectResult> {
+    try {
+      const tools = await this.connectServer(config);
+      const server = this.servers.find((s) => s.name === config.name);
+      if (server) {
+        this.servers = this.servers.filter((s) => s !== server);
+        try {
+          await server.client.close();
+        } catch {
+          // Ignore close errors during probe teardown.
+        }
+      }
+      return { name: config.name, ok: true, toolCount: tools.length, tools };
+    } catch (err) {
+      const error = formatConnectError(err);
+      return { name: config.name, ok: false, toolCount: 0, tools: [], error };
+    }
   }
 
   private async connectServer(config: MCPServerConfig): Promise<AgentTool[]> {
@@ -175,6 +218,18 @@ export class MCPClientManager {
  * Used for SSEClientTransport's eventSourceInit to pass auth headers
  * on the initial SSE GET connection (which doesn't use requestInit).
  */
+/**
+ * Turn a thrown connection error into a short human-readable string. Surfaces
+ * the common rate-limit case explicitly; otherwise the underlying message.
+ */
+function formatConnectError(reason: unknown): string {
+  const msg = reason instanceof Error ? reason.message : String(reason);
+  if (msg.includes("Too Many R") || msg.includes("429")) {
+    return "Rate limited (429) — try again in a moment.";
+  }
+  return msg;
+}
+
 function createHeaderFetch(extraHeaders: Record<string, string>) {
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
   return (url: string | URL, init: any): Promise<Response> => {

@@ -2,9 +2,7 @@ import React from "react";
 import type { DOMElement } from "ink";
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import type { ContextWindowOptions } from "../../core/model-registry.js";
-import type { GoalMode } from "../../core/runtime-mode.js";
 import type { TaskRecord } from "../../core/tasks-store.js";
-import type { GoalRun } from "../../core/goal-store.js";
 import type { SlashCommandInfo } from "./SlashCommandMenu.js";
 import type { ImageAttachment } from "../../utils/image.js";
 import type { CompletedItem } from "../app-items.js";
@@ -14,26 +12,30 @@ import { ChatControls, ChatLayout } from "./ChatLayout.js";
 import { ChatFooterPane } from "./ChatFooterPane.js";
 import { ChatInputStack } from "./ChatInputStack.js";
 import { ChatLivePane } from "./ChatLivePane.js";
+import { TranscriptViewport } from "./TranscriptViewport.js";
 import { QueueIndicator } from "./QueueIndicator.js";
 import { InputArea, type PasteInfo } from "./InputArea.js";
-import { type GoalStatusEntry } from "./GoalStatusBar.js";
 import { FooterStatusRow } from "./FooterStatusRow.js";
+import type { LiveToolEntry } from "./LiveToolPanel.js";
 import type { ActivityPhase, RetryInfo } from "../hooks/useAgentLoop.js";
 import type { BackgroundProcess } from "../../core/process-manager.js";
 
 interface ChatInputControls {
   onSubmit: (value: string, images: ImageAttachment[], paste?: PasteInfo) => void;
   onAbort: () => void;
+  injectText?: { text: string; nonce: number } | null;
   inputActive: boolean;
   onDownAtEnd: () => void;
   onShiftTab: () => void;
   onToggleTasks: () => void;
-  onToggleGoal: () => void;
   onToggleSkills: () => void;
   onTogglePixel: () => void;
   onToggleMarkdown: () => void;
   cwd: string;
   commands: SlashCommandInfo[];
+  /** Fullscreen alt-screen: route mouse-wheel to the transcript scroll. */
+  mouseScroll?: boolean;
+  onScroll?: (deltaLines: number) => void;
 }
 
 interface TaskPickerControls {
@@ -43,15 +45,6 @@ interface TaskPickerControls {
   onStart: (task: TaskRecord) => void;
   onRunAll: (task?: TaskRecord) => void;
   onDelete: (task: TaskRecord) => void;
-}
-
-interface GoalPickerControls {
-  open: boolean;
-  goals: readonly GoalRun[];
-  onClose: () => void;
-  onRun: (run: GoalRun) => void;
-  onDelete: (run: GoalRun) => void;
-  onPause: (run: GoalRun) => void;
 }
 
 interface ChatScreenProps {
@@ -65,6 +58,16 @@ interface ChatScreenProps {
   reserveStreamingSpacing: boolean;
   renderMarkdown: boolean;
   measuredLiveAreaRows: number;
+  /**
+   * Fullscreen alt-screen viewport mode. When true, the transcript is rendered
+   * inside Ink (history + liveItems + streaming) as a bounded, app-scrolled
+   * region, and the controls below it are pinned to the bottom of a full-height
+   * frame. When false, the legacy scrollback `ChatLivePane` tail is used.
+   */
+  fullscreen?: boolean;
+  rows: number;
+  transcriptLines: readonly string[];
+  viewportRows: number;
   assistantMarginTop: number;
   streamingContinuation: boolean;
   controlsRef: (node: DOMElement | null) => void;
@@ -74,6 +77,7 @@ interface ChatScreenProps {
   statusSlotVisible: boolean;
   activityVisible: boolean;
   stallStatusVisible: boolean;
+  liveToolFeed: readonly LiveToolEntry[];
   doneStatus: { verb: string; durationMs: number } | null;
   activityPhase: ActivityPhase;
   elapsedMs: number;
@@ -91,7 +95,6 @@ interface ChatScreenProps {
   formatDuration: (durationMs: number) => string;
   inputControls: ChatInputControls;
   taskPicker: TaskPickerControls;
-  goalPicker: GoalPickerControls;
   overlay: string | null;
   onModelSelect: (modelId: string) => void;
   onModelCancel: () => void;
@@ -105,10 +108,8 @@ interface ChatScreenProps {
   contextWindowOptions?: ContextWindowOptions;
   displayedCwd: string;
   gitBranch?: string | null;
-  goalMode: GoalMode;
   planMode: boolean;
   exitPending: boolean;
-  goalStatusEntries: GoalStatusEntry[];
   footerStatusLayout: FooterStatusLayoutDecision;
   backgroundTasks: BackgroundProcess[];
   taskBarFocused: boolean;
@@ -132,6 +133,10 @@ export function ChatScreen({
   reserveStreamingSpacing,
   renderMarkdown,
   measuredLiveAreaRows,
+  fullscreen,
+  rows,
+  transcriptLines,
+  viewportRows,
   assistantMarginTop,
   streamingContinuation,
   controlsRef,
@@ -141,6 +146,7 @@ export function ChatScreen({
   statusSlotVisible,
   activityVisible,
   stallStatusVisible,
+  liveToolFeed,
   doneStatus,
   activityPhase,
   elapsedMs,
@@ -158,7 +164,6 @@ export function ChatScreen({
   formatDuration,
   inputControls,
   taskPicker,
-  goalPicker,
   overlay,
   onModelSelect,
   onModelCancel,
@@ -172,10 +177,8 @@ export function ChatScreen({
   contextWindowOptions,
   displayedCwd,
   gitBranch,
-  goalMode,
   planMode,
   exitPending,
-  goalStatusEntries,
   footerStatusLayout,
   backgroundTasks,
   taskBarFocused,
@@ -188,20 +191,24 @@ export function ChatScreen({
   onTaskNavigate,
 }: ChatScreenProps) {
   return (
-    <ChatLayout columns={columns}>
-      <ChatLivePane
-        liveItems={liveItems}
-        renderItem={renderItem}
-        isRunning={isRunning}
-        visibleStreamingText={visibleStreamingText}
-        streamingThinking={streamingThinking}
-        thinkingMs={thinkingMs}
-        reserveStreamingSpacing={reserveStreamingSpacing}
-        renderMarkdown={renderMarkdown}
-        measuredLiveAreaRows={measuredLiveAreaRows}
-        assistantMarginTop={assistantMarginTop}
-        streamingContinuation={streamingContinuation}
-      />
+    <ChatLayout columns={columns} rows={fullscreen ? rows : undefined}>
+      {fullscreen ? (
+        <TranscriptViewport lines={transcriptLines} columns={columns} viewportRows={viewportRows} />
+      ) : (
+        <ChatLivePane
+          liveItems={liveItems}
+          renderItem={renderItem}
+          isRunning={isRunning}
+          visibleStreamingText={visibleStreamingText}
+          streamingThinking={streamingThinking}
+          thinkingMs={thinkingMs}
+          reserveStreamingSpacing={reserveStreamingSpacing}
+          renderMarkdown={renderMarkdown}
+          measuredLiveAreaRows={measuredLiveAreaRows}
+          assistantMarginTop={assistantMarginTop}
+          streamingContinuation={streamingContinuation}
+        />
+      )}
 
       <ChatControls controlsRef={controlsRef}>
         <QueueIndicator
@@ -216,6 +223,7 @@ export function ChatScreen({
           statusSlotVisible={statusSlotVisible}
           activityVisible={activityVisible}
           stallStatusVisible={stallStatusVisible}
+          liveToolFeed={liveToolFeed}
           doneStatus={doneStatus}
           activityPhase={activityPhase}
           elapsedMs={elapsedMs}
@@ -237,6 +245,7 @@ export function ChatScreen({
         <InputArea
           onSubmit={inputControls.onSubmit}
           onAbort={inputControls.onAbort}
+          injectText={inputControls.injectText}
           disabled={isRunning}
           isActive={inputControls.inputActive}
           onDownAtEnd={inputControls.onDownAtEnd}
@@ -248,18 +257,13 @@ export function ChatScreen({
           onStartTask={taskPicker.onStart}
           onRunAllTasks={taskPicker.onRunAll}
           onDeleteTask={taskPicker.onDelete}
-          goalPickerOpen={goalPicker.open}
-          goals={goalPicker.goals}
-          onCloseGoalPicker={goalPicker.onClose}
-          onRunGoal={goalPicker.onRun}
-          onDeleteGoal={goalPicker.onDelete}
-          onPauseGoal={goalPicker.onPause}
-          onToggleGoal={inputControls.onToggleGoal}
           onToggleSkills={inputControls.onToggleSkills}
           onTogglePixel={inputControls.onTogglePixel}
           onToggleMarkdown={inputControls.onToggleMarkdown}
           cwd={inputControls.cwd}
           commands={inputControls.commands}
+          mouseScroll={inputControls.mouseScroll}
+          onScroll={inputControls.onScroll}
         />
         <ChatFooterPane
           overlay={overlay}
@@ -276,11 +280,9 @@ export function ChatScreen({
           displayedCwd={displayedCwd}
           gitBranch={gitBranch}
           thinkingLevel={thinkingLevel}
-          goalMode={goalMode}
           planMode={planMode}
           exitPending={exitPending}
           renderMarkdown={renderMarkdown}
-          goalStatusEntries={goalStatusEntries}
         />
         <FooterStatusRow
           columns={columns}

@@ -5,13 +5,7 @@ import type { AgentTool } from "@kenkaiiii/gg-agent";
 import type { AgentDefinition } from "../core/agents.js";
 import { log } from "../core/logger.js";
 import { truncateTail } from "./truncate.js";
-import {
-  goalModeRestriction,
-  isGoalModeActive,
-  isPlanModeActive,
-  planModeRestriction,
-  type GoalMode,
-} from "../core/runtime-mode.js";
+import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 
 const SUB_AGENT_MAX_TURNS = 10;
 const SUB_AGENT_MAX_OUTPUT_CHARS = 100_000; // ~25k tokens, matches other tool limits
@@ -44,7 +38,6 @@ export function createSubAgentTool(
   agents: AgentDefinition[],
   parentProvider: string,
   parentModel: string,
-  goalModeRef?: { current: GoalMode },
   getParentCacheKey?: () => string | undefined,
   planModeRef?: { current: boolean },
 ): AgentTool<typeof SubAgentParams> {
@@ -59,11 +52,13 @@ export function createSubAgentTool(
       `Spawn an isolated sub-agent to handle a focused task. The sub-agent runs as a separate process with its own context window, tools, and system prompt. Use this for tasks that benefit from an isolated context.` +
       agentDesc,
     parameters: SubAgentParams,
-    executionMode: "sequential",
+    // Sub-agents are isolated child processes (own cwd, context, and PID), so
+    // they're safe to run concurrently — unlike bash/edit/write, which mutate
+    // shared local state. Parallel lets the model fan out 3+ sub-agents in one
+    // turn. NOTE: the loop serializes the WHOLE batch if any call is
+    // sequential, so this only fans out when every call in the turn is parallel.
+    executionMode: "parallel",
     async execute(args, context) {
-      if (isGoalModeActive(goalModeRef)) {
-        return goalModeRestriction("subagent", "Goal task creation through the goals tool");
-      }
       if (isPlanModeActive(planModeRef)) {
         return planModeRestriction("subagent");
       }

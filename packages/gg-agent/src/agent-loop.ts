@@ -20,7 +20,7 @@ import type {
   StructuredToolResult,
 } from "./types.js";
 
-const DEFAULT_MAX_TURNS = 200;
+const DEFAULT_MAX_TURNS = 300;
 
 /**
  * Lightweight stream diagnostic callback. When set, the agent loop calls this
@@ -152,6 +152,18 @@ export function isBillingError(err: unknown): boolean {
 }
 
 /**
+ * Detect subscription/plan usage-window exhaustion (e.g. an Anthropic OAuth
+ * plan running out of usage). Unlike a transient per-minute 429, this does NOT
+ * clear with a quick retry — the user must wait for the window to reset — so the
+ * loop surfaces it immediately instead of retrying for minutes. Matches the
+ * canonical message gg-ai stamps onto the provider error.
+ */
+export function isUsageLimitError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  return /usage limit reached/i.test(err.message);
+}
+
+/**
  * Detect overloaded/rate-limit errors from LLM providers.
  * HTTP 429 (rate limit) or 529/503 (overloaded).
  * Excludes billing/quota errors which won't resolve with a retry.
@@ -173,6 +185,26 @@ export function isToolPairingError(err: unknown): boolean {
 }
 
 /**
+ * Detect Anthropic's thinking-block integrity errors. These 400s fire when a
+ * signed `thinking`/`redacted_thinking` block in the latest assistant message
+ * can't be validated — typically a partial/invalid signature from an
+ * interrupted stream, or a block whose position shifted. Recoverable once by
+ * stripping thinking blocks from the message history and re-sending.
+ */
+export function isThinkingBlockError(err: unknown): boolean {
+  if (!(err instanceof Error)) return false;
+  const msg = err.message.toLowerCase();
+  if (!msg.includes("thinking")) return false;
+  return (
+    msg.includes("cannot be modified") ||
+    msg.includes("must remain as they were") ||
+    (msg.includes("signature") && msg.includes("invalid")) ||
+    // "Expected `thinking` or `redacted_thinking`, but found `text`"
+    (msg.includes("expected") && msg.includes("but found"))
+  );
+}
+
+/**
  * Distinguish rate-limit (HTTP 429), server-side overload (HTTP 529), and
  * transient provider 5xx/API failures. Returns null for errors that should not
  * enter the retry bucket. All kinds use the same backoff schedule, but the UI
@@ -183,6 +215,8 @@ export function classifyOverload(
 ): "rate_limit" | "overloaded" | "provider_error" | null {
   if (!(err instanceof Error)) return null;
   if (isBillingError(err)) return null;
+  // Usage-window exhaustion is not retriable — keep it out of the backoff bucket.
+  if (isUsageLimitError(err)) return null;
   const msg = err.message.toLowerCase();
   const errorWithStatus = err as Error & { statusCode?: unknown };
   const statusCode =
@@ -323,6 +357,7 @@ export async function* agentLoop(
   let firstTurn = true;
   let consecutivePauses = 0;
   let toolPairingRepaired = false;
+  let thinkingBlocksStripped = false;
   let overloadRetries = 0;
   let emptyResponseRetries = 0;
   let stallRetries = 0;
@@ -345,7 +380,13 @@ export async function* agentLoop(
   const OVERLOAD_BASE_DELAY_MS = 2_000;
   const OVERLOAD_MAX_DELAY_MS = 30_000;
   const STREAM_FIRST_EVENT_TIMEOUT_MS = 45_000; // 45s to get first event (Opus thinks long)
-  const STREAM_IDLE_TIMEOUT_MS = 30_000; // 30s between events once streaming starts
+  // 90s of true API silence between events once streaming starts. This measures
+  // only time the *API* was quiet -- the timer is armed after we finish yielding
+  // each event downstream, so slow UI/consumer render time is excluded (see the
+  // resetIdleTimer() call after the yield, below). 30s here previously caused
+  // false aborts on large `write`/`edit` tool-call streams when the Ink UI lagged
+  // tens of seconds behind. 90s matches Claude Code's default idle watchdog.
+  const STREAM_IDLE_TIMEOUT_MS = 90_000; // 90s of API silence between events
   // Anthropic models can pause 10-20s mid-stream while computing the next chunk
   // (e.g. generating tool call args for a large write).  10s was too aggressive
   // and caused false "stream stalled" errors, especially in plan mode.
@@ -627,7 +668,14 @@ export async function* agentLoop(
             });
           }
           lastEventTime = now;
-          resetIdleTimer();
+          // The event is in hand -- the API has proven liveness, so stop the idle
+          // timer for the duration of downstream processing. We re-arm it after
+          // the yield completes (see below) so the idle window measures only API
+          // silence, never the time our consumer/UI spent rendering this event.
+          if (idleTimer) {
+            clearTimeout(idleTimer);
+            idleTimer = null;
+          }
           if (event.type === "text_delta") {
             yield { type: "text_delta" as const, text: event.text };
           } else if (event.type === "thinking_delta") {
@@ -673,6 +721,9 @@ export async function* agentLoop(
             };
           }
           lastYieldEndTime = Date.now();
+          // Re-arm the idle timer only now that we're done yielding -- the
+          // countdown to the next event excludes the render time above.
+          resetIdleTimer();
         }
 
         diag("stream_done", {
@@ -694,6 +745,18 @@ export async function* agentLoop(
           provider: options.provider,
           model: options.model,
         });
+        // Subscription/plan usage-window exhaustion (e.g. Anthropic OAuth plan
+        // out of usage). Not a transient throttle — retrying just burns minutes
+        // before failing, which looks like a hang. Surface immediately so the
+        // host UI shows a clear "usage finished" message. The conversation in
+        // `messages` is left intact so the user can resume once it resets.
+        if (isUsageLimitError(err)) {
+          diag("usage_limit_reached", {
+            provider: options.provider,
+            model: options.model,
+          });
+          throw err;
+        }
         // Context overflow: try a forced compaction before giving up.
         // The pre-turn transformContext check uses estimated tokens, which can
         // underestimate code-heavy content. When the API confirms overflow we
@@ -897,6 +960,17 @@ export async function* agentLoop(
           toolPairingRepaired = true;
           diag("tool_pairing_repair", { error: errMsg.slice(0, 200) });
           repairToolPairingAdjacent(messages);
+          turn--;
+          continue;
+        }
+        // Thinking-block integrity 400: a signed thinking block in the latest
+        // assistant message couldn't be validated (commonly a partial signature
+        // from an interrupted stream). Strip thinking from history — preserving
+        // the reasoning as text — and retry once.
+        if (isThinkingBlockError(err) && !thinkingBlocksStripped) {
+          thinkingBlocksStripped = true;
+          diag("thinking_block_repair", { error: errMsg.slice(0, 200) });
+          stripThinkingBlocks(messages);
           turn--;
           continue;
         }
@@ -1550,5 +1624,31 @@ function repairToolPairingAdjacent(messages: Message[]): void {
         (msg as { content: ToolResult[] }).content = filtered;
       }
     }
+  }
+}
+
+/**
+ * Strip thinking / redacted_thinking content from every assistant message in
+ * place. Last-resort recovery when Anthropic rejects the request for a
+ * thinking-block integrity violation (e.g. a corrupt signature from an
+ * interrupted stream). Reasoning text is preserved as a plain text block so no
+ * conversational context is lost; tool_call/tool_result pairing is untouched.
+ */
+function stripThinkingBlocks(messages: Message[]): void {
+  for (const msg of messages) {
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    const next: ContentPart[] = [];
+    for (const part of msg.content as ContentPart[]) {
+      if (part.type === "thinking") {
+        if (part.text) next.push({ type: "text", text: part.text });
+        continue;
+      }
+      if (part.type === "raw") {
+        const t = (part.data as { type?: string }).type;
+        if (t === "thinking" || t === "redacted_thinking") continue;
+      }
+      next.push(part);
+    }
+    (msg as { content: ContentPart[] }).content = next;
   }
 }

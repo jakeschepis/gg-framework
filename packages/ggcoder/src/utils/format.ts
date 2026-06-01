@@ -142,6 +142,10 @@ function summarizeResult(name: string, result: string, isError: boolean): string
       return result.split("\n")[0] || "done";
     case "web_fetch": {
       if (result.startsWith("Error")) return result.split("\n")[0];
+      const urlSections = (result.match(/^## https?:\/\//gm) ?? []).length;
+      if (urlSections > 1) return `${urlSections} urls`;
+      if (result.startsWith("[PDF")) return result.split("\n")[0].replace(/[[\]]/g, "");
+      if (result.startsWith("[llms.txt")) return "llms.txt";
       const lines = result.split("\n").filter((line) => line.length > 0);
       return `${lines.length} lines`;
     }

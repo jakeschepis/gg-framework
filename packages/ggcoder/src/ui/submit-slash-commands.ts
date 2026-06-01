@@ -6,7 +6,6 @@ interface UiSlashCommandActions {
   openThemeSelector: () => void;
   toggleMarkdown: () => void;
   clearApprovedPlan: () => void;
-  openGoalsPicker: () => void;
   /** User-facing entry point to plan mode. Optional objective seeds the first agent turn. */
   enterPlanMode: (objective: string) => Promise<void>;
   /** Open the PlanOverlay browser for past plans in .gg/plans/. */
@@ -49,11 +48,6 @@ export async function handleUiSlashCommand(
 
   if (trimmed === "/clearplan") {
     actions.clearApprovedPlan();
-    return true;
-  }
-
-  if (trimmed === "/goals") {
-    actions.openGoalsPicker();
     return true;
   }
 

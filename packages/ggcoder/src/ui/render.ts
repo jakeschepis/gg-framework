@@ -6,13 +6,10 @@ import type { ProcessManager } from "../core/process-manager.js";
 import type { MCPClientManager } from "../core/mcp/index.js";
 import type { AuthStorage } from "../core/auth-storage.js";
 import type { Skill } from "../core/skills.js";
+import type { CheckpointStore } from "../core/checkpoint-store.js";
 import { App, type CompletedItem, type DoneStatus } from "./App.js";
 import { createTerminalHistoryPrinter } from "./terminal-history.js";
-import type { GoalStatusEntry } from "./components/GoalStatusBar.js";
-import { shutdownGoalWorkers } from "../core/goal-worker.js";
 import type { PlanStep } from "../utils/plan-steps.js";
-import type { GoalReference, GoalRun } from "../core/goal-store.js";
-import type { GoalMode } from "../core/runtime-mode.js";
 import { ThemeContext, SetThemeContext, loadTheme, type ThemeName } from "./theme/theme.js";
 import { detectTheme } from "./theme/detect-theme.js";
 import { AnimationProvider } from "./components/AnimationContext.js";
@@ -36,6 +33,7 @@ export interface RenderAppConfig {
   version: string;
   theme?: "auto" | ThemeName;
   showTokenUsage?: boolean;
+  idealReviewEnabled?: boolean;
   onSlashCommand?: (input: string) => Promise<string | null>;
   loggedInProviders?: Provider[];
   credentialsByProvider?: Record<
@@ -50,12 +48,11 @@ export interface RenderAppConfig {
   settingsFile?: string;
   mcpManager?: MCPClientManager;
   authStorage?: AuthStorage;
-  goalModeRef?: { current: GoalMode };
   planModeRef?: { current: boolean };
   skills?: Skill[];
-  initialOverlay?: "pixel" | "goal";
+  checkpointStore?: CheckpointStore;
+  initialOverlay?: "pixel";
   rebuildToolsForCwd?: (cwd: string) => AgentTool[];
-  goalReferencesRef?: { current: readonly GoalReference[] | undefined };
   connectInitialMcpTools?: () => Promise<AgentTool[]>;
   planCallbacks?: {
     onEnterPlan?: (reason?: string) => void | Promise<void>;
@@ -87,7 +84,7 @@ interface RuntimeState {
  * as our reset mechanism (the only thing that actually escapes Ink's
  * cumulative live-area drift).
  */
-type OverlayKind = "model" | "goal" | "skills" | "plan" | "theme" | "pixel" | null;
+type OverlayKind = "model" | "skills" | "plan" | "theme" | "pixel" | null;
 
 export interface SessionStore {
   messages: Message[];
@@ -102,7 +99,7 @@ export interface SessionStore {
   sessionId?: string;
   sessionTitle?: string;
   sessionTitleGenerated: boolean;
-  /** Which overlay (Goal, Skills, Plan, Pixel, Theme, Model) is open. */
+  /** Which overlay (Skills, Plan, Pixel, Theme, Model) is open. */
   overlay?: OverlayKind;
   /** Plan overlay auto-expand-newest flag (only meaningful when overlay==='plan'). */
   planAutoExpand?: boolean;
@@ -119,8 +116,6 @@ export interface SessionStore {
      *  plan_event item instead of the bland info row. */
     planEvent?: { event: "approved" | "rejected" | "dismissed"; detail?: string };
   };
-  /** Goal run to activate immediately after a visual remount clears review scrollback. */
-  pendingGoalRun?: GoalRun;
   /**
    * True while the agent loop is running. Mirrored by App.tsx so renderApp's
    * resize handler can skip the unmount/remount that would abort the agent
@@ -142,12 +137,10 @@ export interface SessionStore {
    * Without this, the second fix onward loses the chaining intent.
    */
   runAllPixel?: boolean;
-  /** Active goal status bar entries. Preserved across Goal pane open/close remounts. */
-  goalStatusEntries?: GoalStatusEntry[];
-  /** Goal orchestration mode display state. */
-  goalMode?: GoalMode;
   /** Plan mode display/restriction state. */
   planMode?: boolean;
+  /** Whether pre-final ideal review is enabled for this UI session. */
+  idealReviewEnabled?: boolean;
 }
 
 export interface ResetUIOptions {
@@ -208,6 +201,29 @@ const INK_OPTIONS = {
   exitOnCtrlC: false,
 };
 
+// Fullscreen alt-screen render tuning. Two settings work together to make
+// scrolling smooth instead of jumpy/flickery:
+//
+//  - incrementalRendering: Ink's default "standard" renderer erases ALL of the
+//    previous frame's lines (ansiEscapes.eraseLines) and rewrites the whole
+//    frame every tick. For a full-height fullscreen frame that means redrawing
+//    the footer/input/status rows — which never change during a scroll — on
+//    every step, and that erase-then-refill is the visible flicker. Ink's
+//    incremental renderer rewrites ONLY the lines that actually changed (the
+//    transcript region), leaving the controls untouched. No erase pass = no
+//    flicker. It also has explicit handling for the no-trailing-newline
+//    fullscreen frame, so it's the intended mode for this layout.
+//
+//  - maxFps: the default 30fps cap (~33ms/frame) makes the coalesced scroll
+//    updates feel stepped. A higher cap lets paints keep up for a smooth glide;
+//    combined with incremental rendering each paint is cheap (only the changed
+//    rows are written). Ink wraps each frame in synchronized output (BSU/ESU)
+//    on a TTY, so higher fps doesn't tear.
+//
+// The legacy scrollback path keeps the conservative defaults (it appends to
+// native scrollback, so there's no repaint to optimize).
+const FULLSCREEN_INK_OPTIONS = { ...INK_OPTIONS, maxFps: 120, incrementalRendering: true };
+
 // XTMODKEYS "off" — turns off xterm's modifyOtherKeys=2 mode where Shift+Enter,
 // Ctrl+letters, etc. arrive as ESC[27;<mod>;<keycode>~. Some terminals
 // (Terminal.app, tmux passthrough, certain xterm configs) leave this enabled
@@ -222,6 +238,26 @@ const DISABLE_MODIFY_OTHER_KEYS = "\x1b[>4;0m";
 const DISABLE_FOCUS_REPORTING = "\x1b[?1004l";
 const SCREEN_CLEAR = DISABLE_MODIFY_OTHER_KEYS + "\x1b[2J\x1b[3J\x1b[H";
 const VIEWPORT_CLEAR = DISABLE_MODIFY_OTHER_KEYS + "\x1b[2J\x1b[H";
+// Alternate screen buffer (smcup/rmcup). Entering gives a fresh blank screen
+// with no native scrollback, so nothing can ever scroll Ink's live frame —
+// this is what makes the footer a truly fixed bottom region. Leaving restores
+// the user's original shell screen + scrollback intact.
+const ALT_SCREEN_ENTER = "\x1b[?1049h";
+const ALT_SCREEN_LEAVE = "\x1b[?1049l";
+
+/**
+ * Fullscreen alternate-screen viewport mode. Default OFF: native terminal
+ * scrollback is the default (smooth, GPU-accelerated, real mouse-wheel scroll).
+ * Set `GG_FULLSCREEN=1` to opt into the alternate-screen in-Ink viewport
+ * (pinned footer, but no native scrollback). Non-TTY / CI / print modes never
+ * use it.
+ */
+export function isFullscreenViewportEnabled(): boolean {
+  if (process.env.GG_FULLSCREEN === "1") {
+    return Boolean(process.stdout.isTTY && process.stdin.isTTY);
+  }
+  return false;
+}
 
 export function getResetClearMode(
   options: Pick<ResetUIOptions, "wipeSession" | "history" | "resizeRedraw"> | undefined,
@@ -232,10 +268,14 @@ export function getResetClearMode(
 export async function renderApp(config: RenderAppConfig): Promise<void> {
   const themeSetting = config.theme ?? "auto";
   const resolvedTheme = themeSetting === "auto" ? await detectTheme() : themeSetting;
+  const fullscreen = isFullscreenViewportEnabled();
 
   // Clear screen + scrollback so old commands don't appear above the TUI.
-  // Also disables modifyOtherKeys (see DISABLE_MODIFY_OTHER_KEYS).
-  process.stdout.write(SCREEN_CLEAR);
+  // Also disables modifyOtherKeys (see DISABLE_MODIFY_OTHER_KEYS). In fullscreen
+  // mode we first switch to the alternate screen buffer so the entire viewport
+  // (bounded transcript + pinned controls) is owned by Ink and nothing written
+  // around it can scroll the frame.
+  process.stdout.write((fullscreen ? ALT_SCREEN_ENTER : "") + SCREEN_CLEAR);
 
   // Belt-and-suspenders cleanup: tmux can re-enable modifyOtherKeys when it
   // forwards keyboard mode changes, and Ink's unmount path doesn't touch this
@@ -244,7 +284,11 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
   // that confuse the parent shell.
   const onProcessExit = (): void => {
     try {
-      process.stdout.write(DISABLE_MODIFY_OTHER_KEYS + DISABLE_FOCUS_REPORTING);
+      // Leave the alternate screen LAST so the user's original shell scrollback
+      // returns intact, with no leftover artifacts from the fullscreen viewport.
+      process.stdout.write(
+        DISABLE_MODIFY_OTHER_KEYS + DISABLE_FOCUS_REPORTING + (fullscreen ? ALT_SCREEN_LEAVE : ""),
+      );
     } catch {
       // stdout may already be torn down; nothing useful to do here.
     }
@@ -280,13 +324,12 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
     overlay: config.initialOverlay ?? null,
     planAutoExpand: false,
     pendingAction: undefined,
-    pendingGoalRun: undefined,
-    goalStatusEntries: [],
-    goalMode: config.goalModeRef?.current ?? "off",
     planMode: config.planModeRef?.current ?? false,
+    idealReviewEnabled: config.idealReviewEnabled ?? true,
   };
 
   const terminalHistoryPrinter = createTerminalHistoryPrinter();
+  const inkOptions = fullscreen ? FULLSCREEN_INK_OPTIONS : INK_OPTIONS;
   const ref: { instance: InkInstance | null } = { instance: null };
 
   const buildElement = (): React.ReactElement =>
@@ -295,7 +338,7 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
       { initial: resolvedTheme },
       React.createElement(
         TerminalSizeProvider,
-        { isAgentRunning: () => !!sessionStore.isAgentRunning },
+        { isAgentRunning: () => !!sessionStore.isAgentRunning, fullscreen },
         React.createElement(
           AnimationProvider,
           null,
@@ -314,6 +357,7 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
             cwd: config.cwd,
             version: config.version,
             showTokenUsage: config.showTokenUsage,
+            idealReviewEnabled: sessionStore.idealReviewEnabled,
             onSlashCommand: config.onSlashCommand,
             loggedInProviders: config.loggedInProviders,
             credentialsByProvider: config.credentialsByProvider,
@@ -325,15 +369,15 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
             settingsFile: config.settingsFile,
             mcpManager: config.mcpManager,
             authStorage: config.authStorage,
-            goalModeRef: config.goalModeRef,
             planModeRef: config.planModeRef,
             skills: config.skills,
+            checkpointStore: config.checkpointStore,
             initialOverlay: config.initialOverlay,
             rebuildToolsForCwd: config.rebuildToolsForCwd,
-            goalReferencesRef: config.goalReferencesRef,
             connectInitialMcpTools: config.connectInitialMcpTools,
             planCallbacks: config.planCallbacks,
             terminalHistoryPrinter,
+            fullscreen,
             resetUI,
             onRuntimeStateChange,
             sessionStore,
@@ -361,8 +405,6 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
       sessionStore.planSteps = [];
       sessionStore.sessionTitle = undefined;
       sessionStore.sessionTitleGenerated = false;
-      sessionStore.goalStatusEntries = [];
-      if (config.goalReferencesRef) config.goalReferencesRef.current = undefined;
     }
     if (options?.messages) sessionStore.messages = options.messages;
     if (options?.history) {
@@ -383,6 +425,14 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
     if (options?.resizeRedraw) {
       terminalHistoryPrinter.resetPrinted();
     }
+    // Fullscreen alt-screen mode owns the entire screen and renders the
+    // transcript inside Ink, so there is no native scrollback to preserve or
+    // repaint — "clear" is just a screen wipe + cursor home before re-render.
+    if (fullscreen) {
+      process.stdout.write(VIEWPORT_CLEAR);
+      ref.instance = render(buildElement(), inkOptions);
+      return;
+    }
     // Resize can leave log-update frames at the old width in the visible viewport.
     // Repaint the durable transcript after a full clear so messages don't appear
     // to vanish on maximize and old input/status frames don't stack as duplicates.
@@ -398,10 +448,10 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
         cwd: config.cwd,
       });
     }
-    ref.instance = render(buildElement(), INK_OPTIONS);
+    ref.instance = render(buildElement(), inkOptions);
   }
 
-  ref.instance = render(buildElement(), INK_OPTIONS);
+  ref.instance = render(buildElement(), inkOptions);
 
   // Terminal resize → full unmount/remount. Completed transcript rows are real
   // terminal output now, so resetUI() only rebuilds the live Ink controls unless
@@ -410,6 +460,10 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
   // cancelled by its own useEffect cleanup when the old instance unmounts.
   let resizeTimer: ReturnType<typeof setTimeout> | null = null;
   const onTerminalResize = (): void => {
+    // Fullscreen alt-screen mode owns a full-height frame that Ink repaints in
+    // place on dimension changes (handled inside TerminalSizeProvider). No
+    // unmount/remount is needed — and doing one would flash the whole screen.
+    if (fullscreen) return;
     if (resizeTimer) clearTimeout(resizeTimer);
     resizeTimer = setTimeout(() => {
       resizeTimer = null;
@@ -445,12 +499,13 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
     process.stdout.off("resize", onTerminalResize);
     if (resizeTimer) clearTimeout(resizeTimer);
     process.off("exit", onProcessExit);
-    shutdownGoalWorkers(config.cwd);
     // Final cleanup on normal exit — also covered by the "exit" handler,
     // but writing here ensures the disable lands before Node tears stdout
     // down on process termination.
     try {
-      process.stdout.write(DISABLE_MODIFY_OTHER_KEYS + DISABLE_FOCUS_REPORTING);
+      process.stdout.write(
+        DISABLE_MODIFY_OTHER_KEYS + DISABLE_FOCUS_REPORTING + (fullscreen ? ALT_SCREEN_LEAVE : ""),
+      );
     } catch {
       // ignored
     }

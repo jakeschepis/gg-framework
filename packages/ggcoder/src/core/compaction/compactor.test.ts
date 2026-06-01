@@ -332,13 +332,18 @@ describe("prepareMessagesForSummary", () => {
     expect(text).toContain("truncated");
   });
 
-  it("truncates long user messages", () => {
-    const longContent = "x".repeat(5000);
-    const msgs = [makeMessage("user", longContent)];
-    const prepared = prepareMessagesForSummary(msgs);
+  it("truncates very long user messages but preserves moderately long ones", () => {
+    // Moderately long user messages (under the 8k user cap) are kept verbatim —
+    // user turns are the highest-signal content for resuming work.
+    const moderate = "x".repeat(5000);
+    const keptUnchanged = prepareMessagesForSummary([makeMessage("user", moderate)]);
+    expect(keptUnchanged[0].content as string).toBe(moderate);
 
-    expect((prepared[0].content as string).length).toBeLessThan(longContent.length);
-    expect(prepared[0].content as string).toContain("truncated");
+    // Pathologically long user messages are still capped.
+    const huge = "x".repeat(20000);
+    const truncated = prepareMessagesForSummary([makeMessage("user", huge)]);
+    expect((truncated[0].content as string).length).toBeLessThan(huge.length);
+    expect(truncated[0].content as string).toContain("truncated");
   });
 
   it("truncates long assistant text parts", () => {

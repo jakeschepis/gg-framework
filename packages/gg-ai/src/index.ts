@@ -45,12 +45,21 @@ export type {
 
 // Classes
 export { StreamResult, EventStream } from "./utils/event-stream.js";
-export { GGAIError, ProviderError, formatError, formatErrorForDisplay } from "./errors.js";
+export {
+  GGAIError,
+  ProviderError,
+  formatError,
+  formatErrorForDisplay,
+  isUsageLimitError,
+} from "./errors.js";
 export type { ErrorSource, FormattedError } from "./errors.js";
 
 // Provider-level diagnostics (raw SSE event types, etc.)
 export { setProviderDiagnostic } from "./utils/diag.js";
 export type { ProviderDiagnosticFn } from "./utils/diag.js";
+
+// Provider request transforms (exposed for request-building + verification)
+export { toAnthropicMessages, toOpenAIMessages } from "./providers/transform.js";
 
 // Palsu provider (testing)
 export {
