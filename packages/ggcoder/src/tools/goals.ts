@@ -32,7 +32,7 @@ import {
   type GoalVerificationStatus,
 } from "../core/goal-store.js";
 import { referencesRequiringAcknowledgement } from "../core/goal-references.js";
-import { getActiveGoalMode, type GoalMode } from "../core/runtime-mode.js";
+import { getActiveGoalMode, isPlanModeActive, type GoalMode } from "../core/runtime-mode.js";
 
 const PrerequisiteInput = z.object({
   id: z.string().optional().describe("Stable prerequisite id"),
@@ -529,6 +529,7 @@ export function createGoalsTool(
   cwd: string,
   goalModeRef?: { current: GoalMode },
   getGoalReferences?: () => readonly GoalReference[] | undefined,
+  planModeRef?: { current: boolean },
 ): AgentTool<typeof GoalsParams> {
   const storageCwd = goalStorageCwd(cwd);
   return {
@@ -538,6 +539,13 @@ export function createGoalsTool(
     parameters: GoalsParams,
     executionMode: "sequential",
     async execute(args) {
+      // Mutex: goal orchestration and plan mode are mutually exclusive. The
+      // user-facing entry points (goal picker, /goal command) enforce this too;
+      // this guard closes the model-facing path so the goals tool cannot start
+      // or mutate a goal while plan mode is active.
+      if (isPlanModeActive(planModeRef)) {
+        return "Error: goals is restricted in plan mode. Submit your plan via exit_plan (or run /clearplan) before orchestrating a goal.";
+      }
       if (getActiveGoalMode(goalModeRef) === "planner") {
         return "Error: goals is restricted in Goal planner mode. Emit a compact GOAL_PLAN block only; setup creates durable Goal state.";
       }

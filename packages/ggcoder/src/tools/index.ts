@@ -82,7 +82,7 @@ export function createTools(cwd: string, opts?: CreateToolsOptions): CreateTools
     createTaskOutputTool(processManager),
     createTaskStopTool(processManager),
     createTasksTool(cwd),
-    createGoalsTool(cwd, goalModeRef, opts?.getGoalReferences),
+    createGoalsTool(cwd, goalModeRef, opts?.getGoalReferences, planModeRef),
   ];
 
   // Add web search tool for providers without reliable native web search

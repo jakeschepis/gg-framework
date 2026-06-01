@@ -2353,6 +2353,13 @@ export function App(props: AppProps) {
       { name: "compact", aliases: ["c"], description: "Compact context", sectionTitle: "built-in" },
       { name: "clear", aliases: [], description: "Clear session", sectionTitle: "built-in" },
       { name: "theme", aliases: ["t"], description: "Switch theme", sectionTitle: "built-in" },
+      {
+        name: "plan",
+        aliases: ["p"],
+        description: "Enter plan mode — research then implement",
+        sectionTitle: "built-in",
+      },
+      { name: "plans", aliases: [], description: "Open the plan browser", sectionTitle: "built-in" },
       ...orderedPromptCommands,
       ...remainingPromptCommands,
       ...customCommands.map((cmd) => ({
