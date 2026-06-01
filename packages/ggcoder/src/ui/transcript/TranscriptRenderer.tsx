@@ -136,7 +136,9 @@ export function renderTranscriptItem({
       );
     }
     case "ideal_hook":
-      return withTranscriptSpacing(<IdealHookMessage key={item.id} text={item.text} />);
+      return withTranscriptSpacing(
+        <IdealHookMessage key={item.id} text={item.text} tone={item.tone} />,
+      );
     case "tool_start":
     case "tool_done":
     case "tool_group":

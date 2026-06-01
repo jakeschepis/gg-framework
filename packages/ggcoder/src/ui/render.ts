@@ -214,6 +214,12 @@ const INK_OPTIONS = {
 //    flicker. It also has explicit handling for the no-trailing-newline
 //    fullscreen frame, so it's the intended mode for this layout.
 //
+//    NOTE: incremental rendering is fullscreen-ONLY. In the default scrollback
+//    path it desyncs against writeToStdout's log.clear()/scrollback flushes —
+//    the renderer's line cache no longer matches the terminal, so the input
+//    row gets re-emitted instead of diffed and the prompt duplicates down the
+//    screen. Keep it out of INK_OPTIONS.
+//
 //  - maxFps: the default 30fps cap (~33ms/frame) makes the coalesced scroll
 //    updates feel stepped. A higher cap lets paints keep up for a smooth glide;
 //    combined with incremental rendering each paint is cheap (only the changed

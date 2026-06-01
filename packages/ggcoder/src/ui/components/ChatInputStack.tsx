@@ -70,7 +70,7 @@ export function ChatInputStack({
         width={columns}
         height={0}
       />
-      {activityVisible && activityPhase !== "generating" && liveToolFeed.length > 0 && (
+      {activityVisible && liveToolFeed.length > 0 && (
         <>
           <LiveToolPanel entries={liveToolFeed} columns={columns} />
           <Box

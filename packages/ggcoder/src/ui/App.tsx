@@ -91,6 +91,8 @@ import { buildUserContentWithAttachments } from "./prompt-routing.js";
 import { submitPromptCommand } from "./submit-prompt-command.js";
 import { handleUiSlashCommand } from "./submit-slash-commands.js";
 import { buildIdealReviewMessage, evaluateIdealReview } from "../core/ideal-review.js";
+import { buildLoopBreakMessage, evaluateLoopBreak } from "../core/loop-breaker.js";
+import { buildRegroundingMessage } from "../core/regrounding.js";
 import { getNextThinkingLevel, isThinkingLevelSupported } from "./thinking-level.js";
 import {
   getDoneFlushDecision,
@@ -142,7 +144,12 @@ import type {
 } from "./app-items.js";
 
 export type { CompletedItem, ToolGroupItem } from "./app-items.js";
-import { IDEAL_HOOK_NOTICE_TEXT, lastVisibleTranscriptItem } from "./app-items.js";
+import {
+  IDEAL_HOOK_NOTICE_TEXT,
+  LOOP_BREAK_NOTICE_TEXT,
+  REGROUNDING_NOTICE_TEXT,
+  lastVisibleTranscriptItem,
+} from "./app-items.js";
 export type { DoneStatus } from "./layout-decisions.js";
 export { buildUserContentWithAttachments, routePromptCommandInput } from "./prompt-routing.js";
 export { getNextThinkingLevel } from "./thinking-level.js";
@@ -875,9 +882,31 @@ export function App(props: AppProps) {
         });
         setLiveItems((prev) => [
           ...prev,
-          { kind: "ideal_hook", text: IDEAL_HOOK_NOTICE_TEXT, id: getId() },
+          { kind: "ideal_hook", text: IDEAL_HOOK_NOTICE_TEXT, tone: "review", id: getId() },
         ]);
         return buildIdealReviewMessage(decision.reasons);
+      },
+      getLoopBreakMessage: (stats) => {
+        if (!idealReviewEnabledRef.current) return null;
+        const decision = evaluateLoopBreak(stats);
+        if (!decision.shouldBreak) return null;
+        log("INFO", "loop-break", "Injecting loop-break nudge", {
+          reasons: decision.reasons.join(", "),
+        });
+        setLiveItems((prev) => [
+          ...prev,
+          { kind: "ideal_hook", text: LOOP_BREAK_NOTICE_TEXT, tone: "warning", id: getId() },
+        ]);
+        return buildLoopBreakMessage(decision.reasons);
+      },
+      getRegroundingMessage: (originalRequest) => {
+        if (!idealReviewEnabledRef.current) return null;
+        log("INFO", "reground", "Injecting re-grounding after compaction", {});
+        setLiveItems((prev) => [
+          ...prev,
+          { kind: "ideal_hook", text: REGROUNDING_NOTICE_TEXT, tone: "info", id: getId() },
+        ]);
+        return buildRegroundingMessage(originalRequest);
       },
     },
     {

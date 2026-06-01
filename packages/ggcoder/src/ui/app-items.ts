@@ -102,15 +102,42 @@ export const UPDATE_NOTICE_TEXT = "KEN HAS PUSHED A NEW GG CODER UPDATE";
 /** Copy shown when the automatic pre-final ideal-review hook engages. */
 export const IDEAL_HOOK_NOTICE_TEXT = "Hook engaged — running an ideal review before finalizing.";
 
+/** Copy shown when the loop-breaker hook fires because the agent looks stuck. */
+export const LOOP_BREAK_NOTICE_TEXT =
+  "Hook engaged — breaking a stuck loop and rethinking the approach.";
+
+/** Copy shown when the post-compaction re-grounding hook re-pins the request. */
+export const REGROUNDING_NOTICE_TEXT =
+  "Hook engaged — re-grounding on the original request after compaction.";
+
+/**
+ * Semantic tone for an agent-hook notice. Each maps to a theme color so the
+ * three hooks read distinctly: a reflective review, a corrective break, and
+ * an informational re-orientation.
+ *  - "review"  → secondary (ideal review, a quality pass)
+ *  - "warning" → warning   (loop-breaker, the agent was stuck)
+ *  - "info"    → primary   (re-grounding after compaction)
+ */
+export type HookTone = "review" | "warning" | "info";
+
+/** Theme color key for each hook tone. Shared by every render path (live Ink,
+ *  Static scrollback, transcript) so colors stay consistent. */
+export const HOOK_TONE_COLOR: Record<HookTone, "secondary" | "warning" | "primary"> = {
+  review: "secondary",
+  warning: "warning",
+  info: "primary",
+};
+
 /**
  * Rendered like an assistant message (same prefix dot, left padding and
- * spacing) but in a distinct color so it's obvious the ideal-review hook
- * just took over the turn. Pushed when `getIdealReviewMessage` injects the
- * review prompt before the agent's final response.
+ * spacing) but in a tone-specific color so it's obvious which hook just took
+ * over the turn. Pushed when an agent hook injects a message into the loop.
  */
 export interface IdealHookItem {
   kind: "ideal_hook";
   text: string;
+  /** Defaults to "review" when omitted. */
+  tone?: HookTone;
   id: string;
 }
 

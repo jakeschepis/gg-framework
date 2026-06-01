@@ -4,7 +4,7 @@ import wrapAnsi from "wrap-ansi";
 import type { Provider } from "@kenkaiiii/gg-ai";
 import { getModel } from "../core/model-registry.js";
 import type { CompletedItem } from "./App.js";
-import { isPanelReplacedToolItem } from "./app-items.js";
+import { HOOK_TONE_COLOR, isPanelReplacedToolItem, type HookTone } from "./app-items.js";
 import type { PasteInfo } from "./components/InputArea.js";
 import { BLACK_CIRCLE, RETURN_SYMBOL } from "./constants/figures.js";
 import { SPINNER_FRAMES } from "./spinner-frames.js";
@@ -260,7 +260,7 @@ export function serializeCompletedItemToTerminalHistory(
     case "assistant":
       return renderAssistant(item.text, context, item.continuation);
     case "ideal_hook":
-      return renderIdealHook(item.text, context);
+      return renderIdealHook(item.text, item.tone ?? "review", context);
     case "tool_start":
       if (item.name === "enter_plan") return "";
       return renderToolStart(item.name, item.args, item.progressOutput, context);
@@ -535,11 +535,13 @@ function renderAssistant(
   return lines.join("\n");
 }
 
-function renderIdealHook(text: string, context: TerminalHistoryContext): string {
-  // Same dot prefix + indent as an assistant row, but in the secondary color
-  // (bold) so the ideal-review hook visibly stands apart from normal output.
-  const body = color(context.theme.secondary, text, true);
-  return prefixFirstLine(body, ` ${color(context.theme.secondary, BLACK_CIRCLE)} `, "   ");
+function renderIdealHook(text: string, tone: HookTone, context: TerminalHistoryContext): string {
+  // Same dot prefix + indent as an assistant row, but in the tone's color
+  // (bold) so each agent hook visibly stands apart from normal output and
+  // from the other hooks.
+  const toneColor = context.theme[HOOK_TONE_COLOR[tone]];
+  const body = color(toneColor, text, true);
+  return prefixFirstLine(body, ` ${color(toneColor, BLACK_CIRCLE)} `, "   ");
 }
 
 function renderPlanModeLogo(_context: TerminalHistoryContext): string {

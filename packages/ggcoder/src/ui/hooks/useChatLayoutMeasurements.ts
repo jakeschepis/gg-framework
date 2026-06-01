@@ -77,13 +77,12 @@ export function useChatLayoutMeasurements({
     updatePending,
   });
   const activityVisible = agentRunning && activityPhase !== "idle";
-  // The pinned LiveToolPanel renders while the activity bar is visible, there is
-  // at least one tool in the feed, and the agent is NOT yet streaming its reply.
-  // Once the model transitions to "generating", the panel is hidden so the reply
-  // area above the activity bar keeps its full breathing height instead of being
-  // clamped smaller by the panel's rows. Keep this predicate identical to
-  // ChatInputStack's render gate so the budget and the rendered rows never differ.
-  const liveToolPanelVisible = activityVisible && activityPhase !== "generating";
+  // The pinned LiveToolPanel renders for the whole active turn: as soon as the
+  // feed has a tool it stays visible — including while the agent streams
+  // intermediate replies between tool calls — and only disappears when the run
+  // ends (activity goes idle). Keep this predicate identical to ChatInputStack's
+  // render gate so the budget and the rendered rows never differ.
+  const liveToolPanelVisible = activityVisible;
   const liveToolPanelRows =
     liveToolPanelVisible && liveToolFeedCount > 0 ? Math.min(liveToolFeedCount, 3) : 0;
   const stallStatusVisible = !activityVisible && !!stallError;

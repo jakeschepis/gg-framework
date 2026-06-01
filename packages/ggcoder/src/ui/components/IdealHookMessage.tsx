@@ -3,9 +3,11 @@ import { Text, Box } from "ink";
 import { useTheme } from "../theme/theme.js";
 import { useTerminalSize } from "../hooks/useTerminalSize.js";
 import { BLACK_CIRCLE } from "../constants/figures.js";
+import { HOOK_TONE_COLOR, type HookTone } from "../app-items.js";
 
 interface IdealHookMessageProps {
   text: string;
+  tone?: HookTone;
 }
 
 // Mirror AssistantMessage's layout so the row lines up with normal assistant
@@ -22,6 +24,7 @@ const PREFIX_WIDTH = 2;
  */
 export const IdealHookMessage = React.memo(function IdealHookMessage({
   text,
+  tone = "review",
 }: IdealHookMessageProps) {
   const theme = useTheme();
   const { columns } = useTerminalSize();
@@ -29,14 +32,15 @@ export const IdealHookMessage = React.memo(function IdealHookMessage({
     10,
     columns - RESPONSE_LEFT_PADDING - PREFIX_WIDTH - RESPONSE_RIGHT_GUARD,
   );
+  const toneColor = theme[HOOK_TONE_COLOR[tone]];
 
   return (
     <Box flexDirection="row" paddingLeft={RESPONSE_LEFT_PADDING} flexShrink={1}>
       <Box width={PREFIX_WIDTH} flexShrink={0}>
-        <Text color={theme.secondary}>{BLACK_CIRCLE + " "}</Text>
+        <Text color={toneColor}>{BLACK_CIRCLE + " "}</Text>
       </Box>
       <Box width={contentWidth} flexShrink={1}>
-        <Text color={theme.secondary} bold>
+        <Text color={toneColor} bold>
           {text}
         </Text>
       </Box>
