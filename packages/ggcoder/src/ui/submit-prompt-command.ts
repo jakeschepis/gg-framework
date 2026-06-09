@@ -42,16 +42,24 @@ export async function submitPromptCommand({
   const { cmdName, cmdArgs, fullPrompt } = promptCommandRoute;
   log("INFO", "command", `Prompt command: /${cmdName}${cmdArgs ? ` (args: ${cmdArgs})` : ""}`);
 
-  const hasImages = inputImages.length > 0;
+  const imageCount = inputImages.filter((img) => img.kind === "image").length;
+  const videoCount = inputImages.filter((img) => img.kind === "video").length;
 
   const modelInfo = getModel(currentModel);
   const modelSupportsImages = modelInfo?.supportsImages ?? true;
-  const userContent = buildUserContentWithAttachments(fullPrompt, inputImages, modelSupportsImages);
+  const modelSupportsVideo = modelInfo?.supportsVideo ?? false;
+  const userContent = buildUserContentWithAttachments(
+    fullPrompt,
+    inputImages,
+    modelSupportsImages,
+    modelSupportsVideo,
+  );
 
   const userItem: UserItem = {
     kind: "user",
     text: trimmed,
-    imageCount: hasImages ? inputImages.length : undefined,
+    imageCount: imageCount > 0 ? imageCount : undefined,
+    videoCount: videoCount > 0 ? videoCount : undefined,
     id: getId(),
   };
   setLastUserMessage(trimmed);

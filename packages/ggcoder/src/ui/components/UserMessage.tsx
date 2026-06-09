@@ -12,10 +12,12 @@ const USER_MESSAGE_BOTTOM_FILL = "▀";
 export function UserMessage({
   text,
   imageCount,
+  videoCount,
   pasteInfo,
 }: {
   text: string;
   imageCount?: number;
+  videoCount?: number;
   pasteInfo?: PasteInfo;
 }) {
   const theme = useTheme();
@@ -26,6 +28,11 @@ export function UserMessage({
     imageCount != null && imageCount > 0
       ? Array.from({ length: imageCount }, (_, i) => `[Image #${i + 1}]`)
       : [];
+  const videoLabels =
+    videoCount != null && videoCount > 0
+      ? Array.from({ length: videoCount }, (_, i) => `[Video #${i + 1}]`)
+      : [];
+  const mediaLabels = [...imageLabels, ...videoLabels];
   const messageWidth = Math.max(1, stdout.columns ?? 80);
 
   const renderUserMessageEdge = (fill: string): React.ReactNode => (
@@ -69,7 +76,7 @@ export function UserMessage({
                 </Text>
               </React.Fragment>
             ))}
-            {imageLabels.map((label) => (
+            {mediaLabels.map((label) => (
               <Text key={label} color={theme.accent} backgroundColor={USER_MESSAGE_BACKGROUND}>
                 {` ${label}`}
               </Text>

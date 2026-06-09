@@ -139,11 +139,17 @@ export function presentStopped(item: StoppedItem): StatusPresentation {
 }
 
 export function presentQueued(item: QueuedItem): QueuedPresentation {
+  const imageSuffix = item.imageCount
+    ? ` (+${item.imageCount} image${item.imageCount > 1 ? "s" : ""})`
+    : "";
+  const videoSuffix = item.videoCount
+    ? ` (+${item.videoCount} video${item.videoCount > 1 ? "s" : ""})`
+    : "";
   return {
     glyph: "• ",
     label: "Queued: ",
     text: item.text || "(empty)",
-    suffix: item.imageCount ? ` (+${item.imageCount} image${item.imageCount > 1 ? "s" : ""})` : "",
+    suffix: `${imageSuffix}${videoSuffix}`,
   };
 }
 
@@ -151,11 +157,20 @@ export function presentUpdateNotice(_item?: UpdateNoticeItem): UpdateNoticePrese
   return { text: UPDATE_NOTICE_TEXT };
 }
 
+/** Max chars shown for a step-done description before ellipsis. Kept short so
+ *  the "✓ Step N done — …" status line stays on one terminal row. */
+const STEP_DONE_DESC_MAX = 48;
+
 export function presentStepDone(item: StepDoneItem): StepDonePresentation {
+  let description: string | undefined;
+  if (item.description) {
+    const trimmed = item.description.trim();
+    description = ` — ${trimmed.length > STEP_DONE_DESC_MAX ? `${trimmed.slice(0, STEP_DONE_DESC_MAX - 1)}…` : trimmed}`;
+  }
   return {
     glyph: "✓ ",
     text: `Step ${item.stepNum} done`,
-    description: item.description ? ` — ${item.description}` : undefined,
+    description,
   };
 }
 

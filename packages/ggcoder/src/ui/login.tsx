@@ -1,11 +1,7 @@
 import chalk from "chalk";
 import type { Provider } from "@kenkaiiii/gg-ai";
+import { renderLogoBlock } from "../cli/shared.js";
 
-const LOGO_LINES = [
-  " \u2584\u2580\u2580\u2580 \u2584\u2580\u2580\u2580",
-  " \u2588 \u2580\u2588 \u2588 \u2580\u2588",
-  " \u2580\u2584\u2584\u2580 \u2580\u2584\u2584\u2580",
-];
 // Defaults — ggcoder branding. ggeditor passes its own palette.
 const DEFAULT_GRADIENT = [
   "#60a5fa",
@@ -23,7 +19,6 @@ const DEFAULT_GRADIENT = [
 ];
 const DEFAULT_PRIMARY = "#60a5fa";
 const DEFAULT_ACCENT = "#a78bfa";
-const GAP = "   ";
 const TEXT = "#e2e8f0";
 const TEXT_DIM = "#64748b";
 
@@ -37,42 +32,30 @@ const PROVIDERS: { label: string; value: Provider; description: string }[] = [
   { label: "Anthropic", value: "anthropic", description: "Claude Opus 4.8, Sonnet 4.6, Haiku 4.5" },
   { label: "OpenAI", value: "openai", description: "GPT-5.5, GPT-5.5 Pro, GPT-5.4, GPT-5.3 Codex" },
   { label: "Gemini", value: "gemini", description: "Gemini 3.1 Flash Lite Preview" },
-  { label: "Moonshot", value: "moonshot", description: "Kimi K2.6" },
+  { label: "Moonshot", value: "moonshot", description: "Kimi K2.6 · OAuth or API key" },
   { label: "Z.AI (GLM)", value: "glm", description: "GLM-5.1, GLM-4.7, GLM-4.7 Flash" },
-  { label: "MiniMax", value: "minimax", description: "MiniMax M2.7, M2.7 Highspeed" },
+  { label: "MiniMax", value: "minimax", description: "MiniMax M3" },
   { label: "Xiaomi (MiMo)", value: "xiaomi", description: "MiMo-V2-Pro" },
   { label: "DeepSeek", value: "deepseek", description: "DeepSeek V4 Pro, V4 Flash" },
   { label: "OpenRouter", value: "openrouter", description: "Qwen3.6-Plus, multi-provider gateway" },
 ];
 
-function gradientLine(text: string): string {
-  let result = "";
-  let colorIdx = 0;
-  for (const ch of text) {
-    if (ch === " ") {
-      result += ch;
-    } else {
-      const color = _gradient[Math.min(colorIdx, _gradient.length - 1)];
-      result += chalk.hex(color)(ch);
-      colorIdx++;
-    }
-  }
-  return result;
-}
-
 function renderScreen(selectedIndex: number): string {
   const lines: string[] = [];
 
-  lines.push(
-    gradientLine(LOGO_LINES[0]!) +
-      GAP +
+  for (const row of renderLogoBlock(
+    [
       chalk.hex(_primary).bold(_brand) +
-      (_version ? chalk.hex(TEXT_DIM)(` v${_version}`) : "") +
-      chalk.hex(TEXT_DIM)(" · By ") +
-      chalk.hex(TEXT).bold("Ken Kai"),
-  );
-  lines.push(gradientLine(LOGO_LINES[1]!) + GAP + chalk.hex(_accent)("Login"));
-  lines.push(gradientLine(LOGO_LINES[2]!) + GAP + chalk.hex(TEXT_DIM)("Select a provider"));
+        (_version ? chalk.hex(TEXT_DIM)(` v${_version}`) : "") +
+        chalk.hex(TEXT_DIM)(" · By ") +
+        chalk.hex(TEXT).bold("Ken Kai"),
+      chalk.hex(_accent)("Login"),
+      chalk.hex(TEXT_DIM)("Select a provider"),
+    ],
+    { gradient: _gradient },
+  )) {
+    lines.push(row);
+  }
   lines.push("");
 
   for (let i = 0; i < PROVIDERS.length; i++) {

@@ -124,6 +124,62 @@ describe("streamGemini", () => {
     });
   });
 
+  it("delivers tool-result video as an inlineData part (read on a .mp4)", async () => {
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          response: {
+            candidates: [{ content: { parts: [{ text: "ok" }] }, finishReason: "STOP" }],
+            usageMetadata: { promptTokenCount: 10, candidatesTokenCount: 2, totalTokenCount: 12 },
+          },
+        }),
+        { status: 200, headers: { "content-type": "application/json" } },
+      ),
+    );
+    globalThis.fetch = fetchMock;
+
+    const result = streamGemini({
+      provider: "gemini",
+      model: "gemini-3-flash-preview",
+      projectId: "test-project",
+      apiKey: "access-token",
+      streaming: false,
+      messages: [
+        {
+          role: "assistant",
+          content: [
+            { type: "tool_call", id: "call_v", name: "read", args: { file_path: "c.mp4" } },
+          ],
+        },
+        {
+          role: "tool",
+          content: [
+            {
+              type: "tool_result",
+              toolCallId: "call_v",
+              content: [
+                { type: "text", text: "Read video file c.mp4 [video/mp4]" },
+                { type: "video", mediaType: "video/mp4", data: "QUJD" },
+              ],
+            },
+          ],
+        },
+      ],
+    });
+
+    await result.response;
+
+    const [, init] = fetchMock.mock.calls[0] as [URL, RequestInit];
+    const body = JSON.parse(init.body as string) as {
+      request: { contents: Array<{ role: string; parts: unknown[] }> };
+    };
+    const toolTurn = body.request.contents.find((c) => c.role === "user");
+    // functionResponse carries the text marker; the video rides as inlineData.
+    expect(toolTurn?.parts).toContainEqual({
+      inlineData: { mimeType: "video/mp4", data: "QUJD" },
+    });
+  });
+
   it("still sends Code Assist requests for Code Assist-only preview models", async () => {
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -224,6 +280,58 @@ describe("streamGemini", () => {
     await responsePromise;
 
     expect(fetchMock).toHaveBeenCalledTimes(2);
+  });
+
+  it("surfaces a hard quota exhaustion 429 as a usage-limit error", async () => {
+    const body = JSON.stringify({
+      error: {
+        code: 429,
+        status: "RESOURCE_EXHAUSTED",
+        message: "You have exhausted your capacity on this model.",
+      },
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(body, { status: 429 }));
+
+    const result = streamGemini({
+      provider: "gemini",
+      model: "gemini-3-flash-preview",
+      projectId: "test-project",
+      apiKey: "access-token",
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    await expect(result.response).rejects.toThrow(/usage limit reached/i);
+  });
+
+  it("stamps resetsAt from RetryInfo.retryDelay on a transient throttle 429", async () => {
+    const body = JSON.stringify({
+      error: { code: 429, status: "RESOURCE_EXHAUSTED", message: "Quota will reset shortly." },
+      details: [{ "@type": "type.googleapis.com/google.rpc.RetryInfo", retryDelay: "18s" }],
+    });
+    globalThis.fetch = vi.fn().mockResolvedValue(new Response(body, { status: 429 }));
+
+    const before = Math.floor(Date.now() / 1000);
+    const result = streamGemini({
+      provider: "gemini",
+      model: "gemini-3-flash-preview",
+      projectId: "test-project",
+      apiKey: "access-token",
+      messages: [{ role: "user", content: "hi" }],
+    });
+
+    await result.response.then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (err: unknown) => {
+        expect(err).toBeInstanceOf(Error);
+        // Not a hard usage-limit error — it's retriable.
+        expect((err as Error).message).not.toMatch(/usage limit reached/i);
+        const resetsAt = (err as Error & { resetsAt?: number }).resetsAt;
+        expect(resetsAt).toBeGreaterThanOrEqual(before + 18);
+        expect(resetsAt).toBeLessThanOrEqual(before + 20);
+      },
+    );
   });
 
   it("explains unsupported Gemini OAuth models without calling paid endpoints", async () => {

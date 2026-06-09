@@ -8,13 +8,14 @@ import { AuthStorage } from "../core/auth-storage.js";
 import { loginAnthropic } from "../core/oauth/anthropic.js";
 import { loginOpenAI } from "../core/oauth/openai.js";
 import { loginGemini } from "../core/oauth/gemini.js";
+import { loginKimi } from "../core/oauth/kimi.js";
+import { MOONSHOT_OAUTH_KEY } from "@kenkaiiii/gg-core";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "../core/oauth/types.js";
 import {
   CLI_VERSION,
-  LOGO_LINES,
   clearVisibleScreen,
   displayName,
-  gradientLine,
+  renderLogoBlock,
   openBrowser,
   requireInteractiveTTY,
 } from "./shared.js";
@@ -64,8 +65,25 @@ export async function runLogin(): Promise<void> {
       },
     };
 
+    // Moonshot supports two auth methods: Kimi Code OAuth (preferred) and a
+    // Moonshot Open Platform API key. Let the user pick; OAuth credentials are
+    // stored under a distinct key so both can coexist (OAuth wins at runtime).
+    let kimiViaOAuth = false;
+    if (provider === "moonshot") {
+      const choice = (
+        await rl.question(
+          chalk.hex("#60a5fa")("Sign in with (1) Kimi OAuth [default] or (2) API key? "),
+        )
+      ).trim();
+      kimiViaOAuth = choice === "" || choice === "1";
+    }
+
     let creds;
-    if (
+    let storageKey: string = provider;
+    if (provider === "moonshot" && kimiViaOAuth) {
+      creds = await loginKimi(callbacks);
+      storageKey = MOONSHOT_OAUTH_KEY;
+    } else if (
       provider === "glm" ||
       provider === "moonshot" ||
       provider === "xiaomi" ||
@@ -105,7 +123,7 @@ export async function runLogin(): Promise<void> {
             : await loginOpenAI(callbacks);
     }
 
-    await authStorage.setCredentials(provider, creds);
+    await authStorage.setCredentials(storageKey, creds);
     log("INFO", "auth", `Login succeeded for ${displayName(provider)}`);
     console.log(chalk.hex("#4ade80")(`\n✓ Logged in to ${displayName(provider)} successfully!`));
   } finally {
@@ -128,18 +146,17 @@ export async function runDoctor(): Promise<void> {
   const bad = chalk.hex("#ef4444");
 
   // ── Banner ──────────────────────────────────────────────────
-  const LOGO = LOGO_LINES;
-  const GAP = "   ";
   console.log();
-  console.log(
-    `  ${gradientLine(LOGO[0]!)}${GAP}` +
-      primary.bold("GG Coder") +
+  for (const row of renderLogoBlock([
+    primary.bold("GG Coder") +
       dim(` v${CLI_VERSION}`) +
       dim(" · By ") +
       chalk.white.bold("Ken Kai"),
-  );
-  console.log(`  ${gradientLine(LOGO[1]!)}${GAP}` + accent("Doctor"));
-  console.log(`  ${gradientLine(LOGO[2]!)}${GAP}` + dim("Diagnose & Fix"));
+    accent("Doctor"),
+    dim("Diagnose & Fix"),
+  ])) {
+    console.log(row);
+  }
   console.log();
 
   const home = os.homedir();

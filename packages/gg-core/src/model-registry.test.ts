@@ -43,6 +43,7 @@ describe("model registry invariants", () => {
       ).toBeLessThanOrEqual(model.contextWindow);
       expect(typeof model.supportsThinking, `${model.id} supportsThinking`).toBe("boolean");
       expect(typeof model.supportsImages, `${model.id} supportsImages`).toBe("boolean");
+      expect(typeof model.supportsVideo, `${model.id} supportsVideo`).toBe("boolean");
       expect(COST_TIERS, `${model.id} costTier`).toContain(model.costTier);
       expect(THINKING_LEVELS, `${model.id} maxThinkingLevel`).toContain(model.maxThinkingLevel);
       if (!model.supportsThinking) {
@@ -91,6 +92,19 @@ describe("model registry context windows", () => {
     expect(
       getContextWindow("claude-sonnet-4-6", { provider: "anthropic", accountId: "acct_123" }),
     ).toBe(1_000_000);
+  });
+
+  it("defaults MiniMax to the multimodal M3 with a 1M context window", () => {
+    expect(getDefaultModel("minimax")).toMatchObject({
+      id: "MiniMax-M3",
+      name: "MiniMax M3",
+      provider: "minimax",
+      contextWindow: 1_000_000,
+      supportsImages: true,
+      supportsVideo: true,
+    });
+    expect(getModelsForProvider("minimax").map((model) => model.id)).toEqual(["MiniMax-M3"]);
+    expect(getContextWindow("MiniMax-M3", { provider: "minimax" })).toBe(1_000_000);
   });
 
   it("registers a Code Assist-supported Gemini default", () => {

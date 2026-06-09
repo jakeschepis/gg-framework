@@ -6,10 +6,11 @@ import type {
   StreamResponse,
   ToolCall,
 } from "../types.js";
-import { ProviderError } from "../errors.js";
+import { ProviderError, readHeader, isHardBillingMessage } from "../errors.js";
 import { StreamResult } from "../utils/event-stream.js";
 import {
   downgradeUnsupportedImages,
+  downgradeUnsupportedVideos,
   normalizeOpenAIStopReason,
   toOpenAIMessages,
   toOpenAIReasoningEffort,
@@ -17,6 +18,7 @@ import {
   toOpenAITools,
 } from "./transform.js";
 import { normalizePromptCacheKey } from "./prompt-cache-key.js";
+import { uploadMoonshotVideos } from "./moonshot-video.js";
 import { parseToolArguments } from "../utils/json.js";
 import { getEnvironment } from "../utils/env.js";
 
@@ -62,11 +64,12 @@ function createClient(options: StreamOptions): OpenAI {
     apiKey: options.apiKey,
     ...(options.baseUrl ? { baseURL: options.baseUrl } : {}),
     ...(options.fetch ? { fetch: options.fetch } : {}),
+    ...(options.defaultHeaders ? { defaultHeaders: options.defaultHeaders } : {}),
   });
 }
 
 export function streamOpenAI(options: StreamOptions): StreamResult {
-  return new StreamResult(runStream(options));
+  return new StreamResult(runStream(options), options.signal);
 }
 
 async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, StreamResponse> {
@@ -79,7 +82,23 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   const usesThinkingParam =
     options.provider === "glm" || options.provider === "moonshot" || options.provider === "xiaomi";
 
-  const downgradedMessages = downgradeUnsupportedImages(options.messages, options.supportsImages);
+  const downgradedImages = downgradeUnsupportedImages(options.messages, options.supportsImages);
+  const downgradedMessages = downgradeUnsupportedVideos(downgradedImages, options.supportsVideo);
+  // Moonshot/Kimi requires video uploaded to the file service and referenced by
+  // `ms://<id>` — inline base64 is rejected. Kimi's endpoint also only accepts
+  // the resulting `video_url` part inside a tool result (not user content), so
+  // ggcoder routes attached video through the read tool. This uploads every
+  // video part (in user OR tool-result content) and caches the id so multi-turn
+  // sessions don't re-upload. Done in-place before the transform.
+  if (options.provider === "moonshot") {
+    try {
+      await uploadMoonshotVideos(client, downgradedMessages, options.signal);
+    } catch (err) {
+      // Surface upload failures through the same provider-error classification
+      // as the chat call (this runs before the stream try/catch below).
+      throw toError(err, providerName);
+    }
+  }
   const messages = toOpenAIMessages(downgradedMessages, {
     provider: options.provider,
     thinking: !!options.thinking,
@@ -190,67 +209,79 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   let outputTokens = 0;
   let cacheRead = 0;
   let finishReason: string | null = null;
+  let receivedAnyChunk = false;
 
-  for await (const chunk of stream) {
-    const choice = chunk.choices?.[0];
+  try {
+    for await (const chunk of stream) {
+      receivedAnyChunk = true;
+      const choice = chunk.choices?.[0];
 
-    if (chunk.usage) {
-      ({ inputTokens, outputTokens, cacheRead } = extractOpenAIUsage(chunk.usage));
-    }
-
-    if (!choice) continue;
-
-    if (choice.finish_reason) {
-      finishReason = choice.finish_reason;
-    }
-
-    const delta = choice.delta;
-
-    // Reasoning/thinking delta (GLM, Moonshot, Xiaomi MiMo, DeepSeek)
-    // Always accumulate reasoning_content for round-tripping in multi-turn
-    // conversations (models like DeepSeek Reasoner require it on assistant
-    // messages).  Only yield thinking_delta to the UI when thinking is enabled
-    // — reasoning models like MiMo always return reasoning_content even when
-    // thinking is "off", which would cause a permanent "Thinking" indicator.
-    const reasoningContent = (delta as Record<string, unknown>).reasoning_content;
-    if (typeof reasoningContent === "string" && reasoningContent) {
-      thinkingAccum += reasoningContent;
-      if (options.thinking) {
-        yield { type: "thinking_delta", text: reasoningContent };
+      if (chunk.usage) {
+        ({ inputTokens, outputTokens, cacheRead } = extractOpenAIUsage(chunk.usage));
       }
-    }
 
-    // Text delta
-    if (delta.content) {
-      textAccum += delta.content;
-      yield { type: "text_delta", text: delta.content };
-    }
+      if (!choice) continue;
 
-    // Tool call deltas
-    if (delta.tool_calls) {
-      for (const tc of delta.tool_calls) {
-        let accum = toolCallAccum.get(tc.index);
-        if (!accum) {
-          accum = {
-            id: tc.id ?? "",
-            name: tc.function?.name ?? "",
-            argsJson: "",
-          };
-          toolCallAccum.set(tc.index, accum);
-        }
-        if (tc.id) accum.id = tc.id;
-        if (tc.function?.name) accum.name = tc.function.name;
-        if (tc.function?.arguments) {
-          accum.argsJson += tc.function.arguments;
-          yield {
-            type: "toolcall_delta",
-            id: accum.id,
-            name: accum.name,
-            argsJson: tc.function.arguments,
-          };
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason;
+      }
+
+      const delta = choice.delta;
+
+      // Reasoning/thinking delta (GLM, Moonshot, Xiaomi MiMo, DeepSeek)
+      // Always accumulate reasoning_content for round-tripping in multi-turn
+      // conversations (models like DeepSeek Reasoner require it on assistant
+      // messages).  Only yield thinking_delta to the UI when thinking is enabled
+      // — reasoning models like MiMo always return reasoning_content even when
+      // thinking is "off", which would cause a permanent "Thinking" indicator.
+      const reasoningContent = (delta as Record<string, unknown>).reasoning_content;
+      if (typeof reasoningContent === "string" && reasoningContent) {
+        thinkingAccum += reasoningContent;
+        if (options.thinking) {
+          yield { type: "thinking_delta", text: reasoningContent };
         }
       }
+
+      // Text delta
+      if (delta.content) {
+        textAccum += delta.content;
+        yield { type: "text_delta", text: delta.content };
+      }
+
+      // Tool call deltas
+      if (delta.tool_calls) {
+        for (const tc of delta.tool_calls) {
+          let accum = toolCallAccum.get(tc.index);
+          if (!accum) {
+            accum = {
+              id: tc.id ?? "",
+              name: tc.function?.name ?? "",
+              argsJson: "",
+            };
+            toolCallAccum.set(tc.index, accum);
+          }
+          if (tc.id) accum.id = tc.id;
+          if (tc.function?.name) accum.name = tc.function.name;
+          if (tc.function?.arguments) {
+            accum.argsJson += tc.function.arguments;
+            yield {
+              type: "toolcall_delta",
+              id: accum.id,
+              name: accum.name,
+              argsJson: tc.function.arguments,
+            };
+          }
+        }
+      }
     }
+  } catch (err) {
+    throw toError(err, providerName);
+  }
+
+  if (!receivedAnyChunk) {
+    throw new ProviderError(providerName, "Stream ended without producing any chunks.", {
+      statusCode: 504,
+    });
   }
 
   // Finalize thinking content (GLM, Moonshot, Xiaomi reasoning_content)
@@ -411,6 +442,32 @@ function completionToResponse(completion: OpenAI.ChatCompletion): StreamResponse
   };
 }
 
+/**
+ * Classify an OpenAI-compatible error as a hard usage/quota stop, a transient
+ * throttle, or neither. "hard" stops must NOT be retried (credit/balance/quota
+ * exhaustion); "transient" 429s are retriable (per-minute throttle).
+ */
+function classifyOpenAICompatLimit(args: {
+  status: number | undefined;
+  code: string | undefined;
+  type: string | undefined;
+  message: string;
+}): "hard" | "transient" | null {
+  const { status, code, type, message } = args;
+  const codeType = `${code ?? ""} ${type ?? ""}`.toLowerCase();
+  const isHard =
+    status === 402 || codeType.includes("insufficient_quota") || isHardBillingMessage(message);
+  if (isHard) return "hard";
+  if (
+    status === 429 ||
+    codeType.includes("rate_limit_exceeded") ||
+    codeType.includes("too_many_requests")
+  ) {
+    return "transient";
+  }
+  return null;
+}
+
 function toError(err: unknown, provider: string = "openai"): ProviderError {
   if (err instanceof OpenAI.APIError) {
     const body = err.error as Record<string, unknown> | undefined;
@@ -429,6 +486,47 @@ function toError(err: unknown, provider: string = "openai"): ProviderError {
     const requestId =
       (err as unknown as { request_id?: string }).request_id ??
       (typeof body?.request_id === "string" ? body.request_id : undefined);
+
+    const code = typeof err.code === "string" ? err.code : undefined;
+    const type = typeof err.type === "string" ? err.type : undefined;
+    const limit = classifyOpenAICompatLimit({
+      status: err.status,
+      code,
+      type,
+      message: cleanMessage,
+    });
+
+    if (limit === "hard") {
+      // Stamp the canonical "usage limit reached" token so downstream retry
+      // logic surfaces it once instead of burning quota on doomed retries.
+      const message = /usage limit reached/i.test(cleanMessage)
+        ? cleanMessage
+        : `usage limit reached: ${cleanMessage}`;
+      return new ProviderError(provider, message, {
+        statusCode: err.status,
+        ...(requestId ? { requestId } : {}),
+        ...(hint ? { hint } : {}),
+        cause: err,
+      });
+    }
+
+    if (limit === "transient") {
+      // Honor a server-stated Retry-After (seconds) so the loop waits the right
+      // amount through the existing serverResetDelayMs() path.
+      const retryAfterRaw = readHeader(err.headers, "retry-after");
+      const retryAfterSec = retryAfterRaw != null ? Number(retryAfterRaw) : Number.NaN;
+      const resetsAt =
+        Number.isFinite(retryAfterSec) && retryAfterSec > 0
+          ? Math.floor(Date.now() / 1000) + retryAfterSec
+          : undefined;
+      return new ProviderError(provider, cleanMessage, {
+        statusCode: err.status,
+        ...(requestId ? { requestId } : {}),
+        ...(hint ? { hint } : {}),
+        ...(resetsAt ? { resetsAt } : {}),
+        cause: err,
+      });
+    }
 
     return new ProviderError(provider, cleanMessage, {
       statusCode: err.status,

@@ -9,6 +9,7 @@ import {
   type Usage,
   type ContentPart,
   type AssistantMessage,
+  isHardBillingMessage,
 } from "@kenkaiiii/gg-ai";
 import type {
   AgentEvent,
@@ -61,6 +62,12 @@ export function isAbortError(err: unknown): boolean {
  */
 export function isContextOverflow(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
+  // 402 is always credit/payment exhaustion — never a context overflow. Guards
+  // against e.g. OpenRouter's 402 "requires more credits, or fewer max_tokens...
+  // you requested up to N tokens" being misread as overflow and triggering
+  // futile compaction retries.
+  const overflowStatus = (err as Error & { statusCode?: unknown }).statusCode;
+  if (overflowStatus === 402) return false;
   if (isBillingError(err)) return false;
   const msg = err.message.toLowerCase();
   return (
@@ -136,19 +143,13 @@ export function extractContextOverflowDetails(err: unknown): ContextOverflowDeta
  */
 export function isBillingError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
-  const msg = err.message.toLowerCase();
-  return (
-    msg.includes("insufficient balance") ||
-    msg.includes("no resource package") ||
-    msg.includes("quota exceeded") ||
-    msg.includes("billing") ||
-    msg.includes("recharge") ||
-    msg.includes("subscription plan") ||
-    msg.includes("does not yet include access") ||
-    msg.includes("token quota") ||
-    msg.includes("exceeded_current_quota_error") ||
-    msg.includes("check your account balance")
-  );
+  // HTTP 402 (Payment Required) is always a hard credit/payment stop across our
+  // provider set (DeepSeek, OpenRouter, ...). Never retriable.
+  const statusCode = (err as Error & { statusCode?: unknown }).statusCode;
+  if (statusCode === 402) return true;
+  // Shared marker list (single source of truth in @kenkaiiii/gg-ai) so the
+  // provider boundary and this classifier can't drift apart.
+  return isHardBillingMessage(err.message);
 }
 
 /**
@@ -161,6 +162,20 @@ export function isBillingError(err: unknown): boolean {
 export function isUsageLimitError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return /usage limit reached/i.test(err.message);
+}
+
+/**
+ * Read a provider-stated reset time off the error and convert it to a delay in
+ * milliseconds from now. Providers like Gemini return a short `retryDelay` for a
+ * transient per-minute throttle, which gg-ai stamps onto the ProviderError as
+ * `resetsAt` (unix seconds). Returns undefined when absent or already elapsed.
+ */
+export function serverResetDelayMs(err: unknown): number | undefined {
+  if (!(err instanceof Error)) return undefined;
+  const resetsAt = (err as Error & { resetsAt?: unknown }).resetsAt;
+  if (typeof resetsAt !== "number" || !Number.isFinite(resetsAt)) return undefined;
+  const delayMs = resetsAt * 1000 - Date.now();
+  return delayMs > 0 ? delayMs : undefined;
 }
 
 /**
@@ -221,6 +236,8 @@ export function classifyOverload(
   const errorWithStatus = err as Error & { statusCode?: unknown };
   const statusCode =
     typeof errorWithStatus.statusCode === "number" ? errorWithStatus.statusCode : undefined;
+  // 402 is billing/credits — never retry, never treat as overload.
+  if (statusCode === 402) return null;
   if (
     statusCode === 429 ||
     msg.includes("rate_limit") ||
@@ -578,9 +595,11 @@ export async function* agentLoop(
           promptCacheKey: options.promptCacheKey,
           serviceTier: options.serviceTier,
           supportsImages: options.supportsImages,
+          supportsVideo: options.supportsVideo,
           compaction: options.compaction,
           clearToolUses: options.clearToolUses,
           userAgent: options.userAgent,
+          defaultHeaders: options.defaultHeaders,
           // Flip to non-streaming fallback after repeated stream stalls.
           ...(useNonStreamingFallback ? { streaming: false } : {}),
         });
@@ -846,10 +865,18 @@ export async function* agentLoop(
         const overloadKind = classifyOverload(err);
         if (overloadRetries < MAX_OVERLOAD_RETRIES && overloadKind) {
           overloadRetries++;
-          const delayMs = Math.min(
-            OVERLOAD_BASE_DELAY_MS * 2 ** (overloadRetries - 1),
-            OVERLOAD_MAX_DELAY_MS,
-          );
+          // Honor a server-stated reset time (e.g. Gemini's RetryInfo.retryDelay)
+          // when present, so we wait exactly as long as the provider asked
+          // instead of guessing with blind exponential backoff. Fall back to
+          // exponential backoff otherwise.
+          const serverDelayMs = serverResetDelayMs(err);
+          const delayMs =
+            serverDelayMs !== undefined
+              ? Math.min(serverDelayMs, OVERLOAD_MAX_DELAY_MS)
+              : Math.min(
+                  OVERLOAD_BASE_DELAY_MS * 2 ** (overloadRetries - 1),
+                  OVERLOAD_MAX_DELAY_MS,
+                );
           diag("retry", {
             reason: overloadKind,
             attempt: overloadRetries,

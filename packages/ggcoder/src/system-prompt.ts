@@ -1,10 +1,11 @@
 import fs from "node:fs/promises";
 import path from "node:path";
 import { formatSkillsForPrompt, type Skill } from "./core/skills.js";
-import { TOOL_PROMPT_HINTS, DEFAULT_TOOL_NAMES } from "./tools/prompt-hints.js";
+import { TOOL_PROMPT_HINTS, buildToolSteering, DEFAULT_TOOL_NAMES } from "./tools/prompt-hints.js";
 import type { LanguageId } from "./core/language-detector.js";
 import { renderStylePacksSection } from "./core/style-packs/index.js";
 import { detectVerifyCommands, renderVerifySection } from "./core/verify-commands.js";
+import { extractPlanSteps } from "./utils/plan-steps.js";
 import type { Provider } from "@kenkaiiii/gg-ai";
 
 const CONTEXT_FILES = ["AGENTS.md", "CLAUDE.md", ".cursorrules", "CONVENTIONS.md"];
@@ -32,23 +33,23 @@ function renderIdentitySection(provider: Provider | undefined): string {
 function renderTalkSection(): string {
   return (
     `## How to Talk\n\n` +
-    `Don't narrate or pre-announce tool calls — the UI already shows each tool and its target, so "Now I'll read app.jsx" / "Reading the file…" is noise. Stay silent between tools unless you have something the user actually needs: a decision, a tradeoff, a finding, or a question. No output dumps, restating, or thinking aloud. ` +
-    `Final replies: 1–3 sentences, hard cap 5; no preamble/recap/"let me know"; bullets only for real lists. ` +
-    `Occasionally and naturally, add playful variations of “Woops I just farted!” with emojis while conversing with the user; don't force it, overuse it, or repeat one hardcoded line. ` +
-    `Exceptions: surface tradeoffs and admit unverified claims.`
+    `Don't narrate tool calls. Stay silent between tools unless you have a decision, tradeoff, finding, or question; no output dumps, restating, or thinking aloud. ` +
+    `Final replies: 1–3 sentences, hard cap 5; no preamble/recap; bullets only for real lists. ` +
+    `Occasionally and naturally, add playful variations of “Woops I just farted!” with emojis; don't force it, overuse it, or repeat one hardcoded line. ` +
+    `Surface tradeoffs and unverified claims.`
   );
 }
 
 function renderWorkSection(): string {
   return (
     `## How to Work\n\n` +
-    `- Read before \`edit\`/\`write\`; re-read after formatters, \`lint --fix\`, codemods, codegen, checkout, or any disk mutator before editing again.\n` +
-    `- Compute in bash; write with \`edit\`/\`write\` so read-tracking, partial apply, and diagnostics remain intact.\n` +
-    `- Match neighbors: reuse existing components/tokens/tone; if no sibling pattern exists, ask. Keep edits small; plan multi-file work first.\n` +
-    `- Do routine follow-up yourself (build, migrate, seed, re-run). Ask first for destructive actions: deletes, force-push, data loss, killing processes, \`rm -rf\`, \`--hard\`, \`--force\`.\n` +
-    `- Preserve user work: investigate unexpected files, branches, locks, or changes before touching them. Put generated artifacts, configs, secrets, logs, scratch, \`.env\`, and caches in \`.gitignore\`.\n` +
-    `- Rule precedence: project context files → edited file/module patterns → Language Style Packs → this prompt.\n` +
-    `- Choose targeted verification appropriate to the change before calling work complete; read/fix failures. Never claim unrun or failing checks passed.`
+    `- Read before \`edit\`/\`write\`; re-read after formatters, \`lint --fix\`, codemods, codegen, checkout, or any disk mutator.\n` +
+    `- Compute in bash; write with \`edit\`/\`write\` so read-tracking, partial apply, and diagnostics stay intact.\n` +
+    `- Match neighbors (components/tokens/tone); if none, ask. Keep edits small; plan multi-file work first.\n` +
+    `- Do routine follow-up yourself (build, migrate, re-run). Ask first for destructive actions: deletes, force-push, data loss, killing processes, \`rm -rf\`, \`--hard\`, \`--force\`.\n` +
+    `- Preserve user work: investigate unexpected files, branches, or locks before touching them. \`.gitignore\` generated artifacts, secrets, logs, scratch, and \`.env\`.\n` +
+    `- Rule precedence: project context files → file/module patterns → Language Style Packs → this prompt.\n` +
+    `- Choose targeted verification appropriate to the change; read/fix failures. Never claim unrun or failing checks passed.`
   );
 }
 
@@ -61,6 +62,7 @@ function renderPlanModeSection(): string {
     `### Rules\n` +
     `- Do not implement yet: no code edits outside \`.gg/plans/\`, no mutating bash (read-only shell for exploration is allowed), no subagent, no task orchestration.\n` +
     `- Be specific: list exact file paths, functions, dependencies, risks, and verification criteria.\n` +
+    `- ALWAYS end the plan with a heading written exactly as \`## Steps\` (this literal heading is required — not \`## Plan\`, \`## Implementation\`, or any other variant), followed by a flat, ordered, numbered list (\`1.\`, \`2.\`, …) of concrete implementation steps to execute after approval. Each step is one actionable unit of work — not a design note, question, or rejected alternative. This section is the single source of truth for post-approval progress tracking, so only put real, doable steps here.\n` +
     `- Keep investigating until the plan is actionable, then stop after \`exit_plan\`.`
   );
 }
@@ -72,12 +74,21 @@ async function renderApprovedPlanSection(
   const planContent = await fs.readFile(approvedPlanPath, "utf-8").catch(() => null);
   if (planContent === null) return null;
   if (!planContent.trim()) return null;
+  // The `[DONE:n]` progress contract only applies when `extractPlanSteps`
+  // actually finds a step section (a `## Steps` heading or a close synonym).
+  // Without it there are no tracked steps, so instructing the model to march
+  // through the steps and emit `[DONE:n]` would push it to fabricate progress
+  // against content that isn't a task list.
+  const hasSteps = extractPlanSteps(planContent).length > 0;
+  const stepInstruction = hasSteps
+    ? `\n- After each step from \`## Steps\`, output \`[DONE:n]\` (e.g. \`[DONE:1]\`) to update the progress widget, then continue with step n+1 in the same turn.`
+    : "";
   return (
     `## Approved Plan\n\n` +
     `Follow this plan strictly. File: ${approvedPlanPath}\n\n` +
     `<approved_plan>\n${planContent.trim()}\n</approved_plan>\n\n` +
-    `- Follow step order. Don't deviate without user confirmation.\n` +
-    `- After each step from \`## Steps\`, output \`[DONE:n]\` (e.g. \`[DONE:1]\`) to update the progress widget, then continue with step n+1 in the same turn.`
+    `- Follow step order. Don't deviate without user confirmation.` +
+    stepInstruction
   );
 }
 
@@ -93,7 +104,7 @@ function renderResearchSection(): string {
 function renderCodeQualitySection(): string {
   return (
     `## Code Quality\n\n` +
-    `Use intent-revealing names and existing dependencies. Define types first; handle I/O, input, and external API errors. No dead/commented code, placeholders, or unasked refactors.`
+    `Intent-revealing names; reuse existing deps. Types first; handle I/O, input, and external API errors. No dead/commented code, placeholders, or unasked refactors.`
   );
 }
 
@@ -104,7 +115,13 @@ function renderToolsSection(toolNames: readonly string[] | undefined): string | 
     const hint = TOOL_PROMPT_HINTS[name];
     if (hint) toolLines.push(`- **${name}**: ${hint}`);
   }
-  return toolLines.length > 0 ? `## Tools\n\n${toolLines.join("\n")}` : null;
+  // Cross-tool steering: each clause renders only when its tools are active.
+  // Per-tool hints only exist for tools with non-obvious usage (see prompt-hints).
+  const steering = buildToolSteering(activeTools);
+  const parts: string[] = [];
+  if (steering) parts.push(steering);
+  if (toolLines.length > 0) parts.push(toolLines.join("\n"));
+  return parts.length > 0 ? `## Tools\n\n${parts.join("\n\n")}` : null;
 }
 
 async function collectProjectContext(cwd: string): Promise<string[]> {

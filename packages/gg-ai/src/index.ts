@@ -13,6 +13,7 @@ export type {
   TextContent,
   ThinkingContent,
   ImageContent,
+  VideoContent,
   ToolCall,
   ToolResult,
   ToolResultContent,
@@ -51,8 +52,10 @@ export {
   formatError,
   formatErrorForDisplay,
   isUsageLimitError,
+  isHardBillingMessage,
 } from "./errors.js";
 export type { ErrorSource, FormattedError } from "./errors.js";
+export { classifyProviderError } from "./error-classification.js";
 
 // Provider-level diagnostics (raw SSE event types, etc.)
 export { setProviderDiagnostic } from "./utils/diag.js";

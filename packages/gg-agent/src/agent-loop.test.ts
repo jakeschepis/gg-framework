@@ -5,9 +5,11 @@ import {
   agentLoop,
   classifyOverload,
   extractContextOverflowDetails,
+  isBillingError,
   isContextOverflow,
   isThinkingBlockError,
   isUsageLimitError,
+  serverResetDelayMs,
 } from "./agent-loop.js";
 import type { AgentEvent, AgentResult, AgentTool } from "./types.js";
 import type { Message, StreamOptions } from "@kenkaiiii/gg-ai";
@@ -228,6 +230,58 @@ describe("isUsageLimitError", () => {
   it("returns false for non-Error values", () => {
     expect(isUsageLimitError("Claude usage limit reached")).toBe(false);
     expect(isUsageLimitError(null)).toBe(false);
+  });
+
+  it("treats a Gemini hard quota exhaustion as a non-retriable usage limit", () => {
+    const err = new ProviderError(
+      "gemini",
+      'Gemini quota exhausted — usage limit reached. Gemini API error (429): {"error":{"status":"RESOURCE_EXHAUSTED","message":"You have exhausted your capacity on this model."}}',
+      { statusCode: 429 },
+    );
+    expect(isUsageLimitError(err)).toBe(true);
+    // Non-retriable: kept out of the rate-limit backoff bucket.
+    expect(classifyOverload(err)).toBeNull();
+  });
+
+  it("still treats a transient Gemini per-minute throttle as a retriable rate limit", () => {
+    const err = new ProviderError(
+      "gemini",
+      'Gemini API error (429): {"error":{"status":"RESOURCE_EXHAUSTED"},"details":[{"retryDelay":"18s"}]}',
+      { statusCode: 429, resetsAt: Math.floor(Date.now() / 1000) + 18 },
+    );
+    expect(isUsageLimitError(err)).toBe(false);
+    expect(classifyOverload(err)).toBe("rate_limit");
+  });
+});
+
+describe("serverResetDelayMs", () => {
+  it("returns the delay until resetsAt in ms", () => {
+    const err = new ProviderError("gemini", "rate limited", {
+      statusCode: 429,
+      resetsAt: Math.floor(Date.now() / 1000) + 18,
+    });
+    const delay = serverResetDelayMs(err);
+    expect(delay).toBeGreaterThan(15_000);
+    expect(delay).toBeLessThanOrEqual(18_000);
+  });
+
+  it("returns undefined when resetsAt is absent or already elapsed", () => {
+    expect(
+      serverResetDelayMs(new ProviderError("gemini", "x", { statusCode: 429 })),
+    ).toBeUndefined();
+    expect(
+      serverResetDelayMs(
+        new ProviderError("gemini", "x", {
+          statusCode: 429,
+          resetsAt: Math.floor(Date.now() / 1000) - 5,
+        }),
+      ),
+    ).toBeUndefined();
+  });
+
+  it("returns undefined for non-Error values", () => {
+    expect(serverResetDelayMs(null)).toBeUndefined();
+    expect(serverResetDelayMs("resetsAt")).toBeUndefined();
   });
 });
 
@@ -454,6 +508,59 @@ describe("agentLoop", () => {
     );
     // No retry bucket — the stream is attempted exactly once.
     expect(mockStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("surfaces a 402 insufficient-balance error immediately without retrying", async () => {
+    const err402 = new ProviderError("deepseek", "usage limit reached: Insufficient Balance", {
+      statusCode: 402,
+    });
+    mockStream.mockReturnValue(mockErrorResult(err402) as unknown as ReturnType<typeof stream>);
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+
+    await expect(collectLoop(messages, { provider: "deepseek", model: "test" })).rejects.toThrow(
+      /insufficient balance/i,
+    );
+    expect(mockStream).toHaveBeenCalledTimes(1);
+  });
+
+  it("does not compact an OpenRouter 402 requires-more-credits error", async () => {
+    const err402 = new ProviderError(
+      "openrouter",
+      "This request requires more credits, or fewer max_tokens. You requested up to 225702 tokens.",
+      { statusCode: 402 },
+    );
+    mockStream.mockReturnValue(mockErrorResult(err402) as unknown as ReturnType<typeof stream>);
+    const transformContext = vi.fn().mockImplementation((msgs: Message[]) => msgs);
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+
+    await expect(
+      collectLoop(messages, { provider: "openrouter", model: "test", transformContext }),
+    ).rejects.toThrow(/more credits/i);
+    expect(mockStream).toHaveBeenCalledTimes(1);
+    // The pre-turn transform may run once, but the 402 must NOT trigger the
+    // overflow-driven force-compaction retry.
+    expect(
+      transformContext.mock.calls.some(
+        (c) => (c[1] as { force?: boolean } | undefined)?.force === true,
+      ),
+    ).toBe(false);
+  });
+
+  it("classifies a 402 error as non-retriable billing, not overload or overflow", () => {
+    const err402 = new ProviderError("openrouter", "This request requires more credits.", {
+      statusCode: 402,
+    });
+    expect(isBillingError(err402)).toBe(true);
+    expect(classifyOverload(err402)).toBeNull();
+    expect(isContextOverflow(err402)).toBe(false);
   });
 
   it("polls getSteeringMessages before the first LLM call", async () => {

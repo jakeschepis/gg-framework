@@ -128,13 +128,20 @@ describe("buildSystemPrompt", () => {
 
     const prompt = await buildSystemPrompt(cwd, undefined, false, undefined, [
       "read",
+      "write",
+      "edit",
       "web_search",
       "not_a_tool",
     ]);
     const renderedTools = toolsSection(prompt);
-    expect(renderedTools).toContain("**read**");
+    // Core file tools (read/write/edit) no longer carry a per-tool hint — they
+    // rely on their schema description plus the cross-tool steering line (which
+    // renders here because edit + write are both active). Tools with non-obvious
+    // usage (web_search) still render a hint. Unknown tools never do.
+    expect(renderedTools).toContain("Prefer `edit` over `write`");
     expect(renderedTools).toContain("**web_search**");
     expect(renderedTools).not.toContain("not_a_tool");
+    expect(renderedTools).not.toContain("**read**");
     expect(renderedTools).not.toContain("**edit**");
   });
 

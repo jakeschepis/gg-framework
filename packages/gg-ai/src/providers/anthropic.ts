@@ -8,13 +8,14 @@ import type {
   StreamResponse,
   ToolCall,
 } from "../types.js";
-import { ProviderError, readHeader } from "../errors.js";
+import { ProviderError, readHeader, isHardBillingMessage } from "../errors.js";
 import { StreamResult } from "../utils/event-stream.js";
 import {
   downgradeUnsupportedImages,
   normalizeAnthropicStopReason,
   toAnthropicCacheControl,
   toAnthropicMessages,
+  downgradeUnsupportedVideos,
   toAnthropicThinking,
   toAnthropicToolChoice,
   toAnthropicTools,
@@ -30,10 +31,10 @@ function createClient(options: StreamOptions): Anthropic {
       : { apiKey: options.apiKey }),
     ...(options.baseUrl ? { baseURL: options.baseUrl } : {}),
     ...(options.fetch ? { fetch: options.fetch } : {}),
-    // Allow SDK retries for connection-level failures (socket hang up, 500s,
-    // connection refused).  Our stall detection handles abort-initiated retries
-    // separately — SDK retries only fire on genuine transport errors.
-    maxRetries: 2,
+    // Disable SDK retries — the agent loop has its own stall/overload retry
+    // logic that surfaces errors properly. SDK retries on 429s can cause
+    // multi-minute hangs when the provider stops responding mid-retry.
+    maxRetries: 0,
     ...(isOAuth
       ? {
           defaultHeaders: {
@@ -49,7 +50,7 @@ function createClient(options: StreamOptions): Anthropic {
 }
 
 export function streamAnthropic(options: StreamOptions): StreamResult {
-  return new StreamResult(runStream(options));
+  return new StreamResult(runStream(options), options.signal);
 }
 
 async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, StreamResponse> {
@@ -60,7 +61,8 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   const cacheControl = toAnthropicCacheControl(options.cacheRetention, options.baseUrl);
   const supportsFirstPartyToolExtras =
     !options.baseUrl || options.baseUrl.includes("api.anthropic.com");
-  const downgradedMessages = downgradeUnsupportedImages(options.messages, options.supportsImages);
+  const downgradedImages = downgradeUnsupportedImages(options.messages, options.supportsImages);
+  const downgradedMessages = downgradeUnsupportedVideos(downgradedImages, options.supportsVideo);
   const { system: rawSystem, messages } = toAnthropicMessages(downgradedMessages, cacheControl);
 
   // OAuth tokens require Claude Code identity in the system prompt
@@ -177,8 +179,6 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     }
   }
 
-  const stream = client.messages.stream(params, requestOptions);
-
   // ── Accumulation state ──────────────────────────────────
   const contentParts: ContentPart[] = [];
 
@@ -205,9 +205,21 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   let stopReason: string | null = null;
 
   const keepalive = { type: "keepalive" as const };
+  let receivedAnyEvent = false;
 
   try {
-    for await (const event of stream as AsyncIterable<Anthropic.MessageStreamEvent>) {
+    // Use the low-level streaming request instead of the SDK's `messages.stream()`
+    // helper. The helper starts its request immediately; if Anthropic rejects the
+    // request before our async iterator attaches listeners, its iterator can miss
+    // the already-emitted error/end event and wait forever. That surfaced as the
+    // CLI sitting on "Working..." when an OAuth account ran out of usage.
+    const stream = (await client.messages.create(
+      params as Anthropic.MessageCreateParamsStreaming,
+      requestOptions,
+    )) as AsyncIterable<Anthropic.MessageStreamEvent>;
+
+    for await (const event of stream) {
+      receivedAnyEvent = true;
       switch (event.type) {
         case "message_start": {
           const usage = event.message.usage;
@@ -246,9 +258,10 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
             accum.toolId = (block as unknown as { id: string }).id;
             accum.toolName = (block as unknown as { name: string }).name;
             accum.input = (block as unknown as { input: unknown }).input;
-          } else if (block.type === "redacted_thinking") {
-            // Encrypted thinking block — capture the raw data for round-tripping.
-            // The API requires these to be sent back verbatim in multi-turn conversations.
+          } else if (block.type !== "text" && block.type !== "thinking") {
+            // Preserve unknown/encrypted blocks from their start event. We no longer
+            // use the SDK MessageStream helper's `currentMessage` snapshot because
+            // it can miss early request errors and hang its iterator.
             accum.raw = block as unknown as Record<string, unknown>;
           }
 
@@ -331,11 +344,26 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
               args: tc.args,
             };
           } else if (accum.type === "server_tool_use") {
+            // Server tools (e.g. native web_search) stream their input via
+            // input_json_delta the same way client tool_use does. The block-start
+            // `input` is empty `{}` and only the accumulated `argsJson` carries
+            // the real arguments (e.g. the search query). Prefer the parsed
+            // streamed JSON, falling back to the block-start input only when
+            // argsJson is absent/malformed -- otherwise the query is dropped and
+            // Anthropic rejects the call with `invalid_tool_input`.
+            let input: unknown = accum.input;
+            if (accum.argsJson) {
+              try {
+                input = JSON.parse(accum.argsJson);
+              } catch {
+                // malformed JSON -- keep the block-start input fallback
+              }
+            }
             const stc: ServerToolCall = {
               type: "server_tool_call",
               id: accum.toolId,
               name: accum.toolName,
-              input: accum.input,
+              input,
             };
             contentParts.push(stc);
             yield {
@@ -348,12 +376,7 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
             contentParts.push({ type: "raw", data: accum.raw });
             yield keepalive;
           } else {
-            // Retrieve the full block from the SDK's accumulated message
-            // for block types we don't explicitly accumulate (e.g. web_search_tool_result)
-            const msg = stream.currentMessage;
-            const rawBlock = msg?.content[event.index] as unknown as
-              | Record<string, unknown>
-              | undefined;
+            const rawBlock = accum.raw;
             if (rawBlock) {
               const blockType = rawBlock.type as string;
               if (blockType === "web_search_tool_result") {
@@ -405,6 +428,16 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     }
   } catch (err) {
     throw toError(err);
+  }
+
+  // Race-condition safety: if the SDK's stream ended (or error'd) before the
+  // first event was yielded, the loop exits silently with an empty response.
+  // Treat that as a transport failure so the agent loop retries instead of
+  // presenting a phantom empty reply.
+  if (!receivedAnyEvent) {
+    throw new ProviderError("anthropic", "Stream ended without producing any events.", {
+      statusCode: 504,
+    });
   }
 
   const normalizedStop = normalizeAnthropicStopReason(stopReason);
@@ -606,6 +639,22 @@ function toError(err: unknown): ProviderError {
           cause: err,
         });
       }
+    }
+
+    // Hard billing/quota stop, regardless of status code. MiniMax (Anthropic
+    // transport) returns these as HTTP 500 `api_error` "insufficient balance";
+    // the Anthropic API key path returns a 400 "credit balance is too low".
+    // Both would otherwise be treated as transient and retried — stamp the
+    // canonical "usage limit reached" token so the loop surfaces it once.
+    if (isHardBillingMessage(message)) {
+      const usageMessage = /usage limit reached/i.test(message)
+        ? message
+        : `usage limit reached: ${message}`;
+      return new ProviderError("anthropic", usageMessage, {
+        statusCode: err.status,
+        ...(requestId ? { requestId } : {}),
+        cause: err,
+      });
     }
 
     return new ProviderError("anthropic", message, {

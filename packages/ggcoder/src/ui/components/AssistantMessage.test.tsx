@@ -544,7 +544,7 @@ describe("AssistantMessage live layout", () => {
     );
 
     expect(lines.some((line) => line.includes("Bash"))).toBe(true);
-    expect(lines.some((line) => line.includes("… +1 lines"))).toBe(true);
+    expect(lines.some((line) => line.includes("1 lines hidden"))).toBe(true);
     for (const line of lines) {
       expect(stringWidth(line)).toBeLessThanOrEqual(TERMINAL_COLUMNS);
     }

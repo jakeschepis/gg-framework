@@ -52,3 +52,6 @@ scripts/goal-deep-audit/*.json
 scripts/goal-deep-audit/*.log
 .gg/ideal-sim/
 packages/ggcoder/ideal-sim/
+
+# prompt-bench scratch sandboxes
+experiments/prompt-bench/.bench-sandbox-*

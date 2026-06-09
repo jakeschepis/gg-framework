@@ -14,7 +14,12 @@ interface ChatInputStackProps {
   activityVisible: boolean;
   stallStatusVisible: boolean;
   liveToolFeed: readonly LiveToolEntry[];
-  doneStatus: { verb: string; durationMs: number } | null;
+  doneStatus: {
+    verb: string;
+    durationMs: number;
+    counts?: Record<string, number>;
+    tokens?: number;
+  } | null;
   activityPhase: ActivityPhase;
   elapsedMs: number;
   runStartRef: React.RefObject<number>;

@@ -11,6 +11,7 @@ import { loadCustomCommands } from "./custom-commands.js";
 import { SettingsManager } from "./settings-manager.js";
 import { AuthStorage } from "./auth-storage.js";
 import { getClaudeCliUserAgent } from "./claude-code-version.js";
+import { kimiCodingHeaders, isKimiCodingEndpoint } from "./oauth/kimi.js";
 import { SessionManager, type MessageEntry, type BranchInfo } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
@@ -20,7 +21,7 @@ import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
 import { buildSystemPrompt } from "../system-prompt.js";
 import { createTools, createWebSearchTool, type ProcessManager } from "../tools/index.js";
-import { MCPClientManager, getMCPServers } from "./mcp/index.js";
+import { MCPClientManager, getMCPServers, getAllMcpServers } from "./mcp/index.js";
 import { log } from "./logger.js";
 import { setEstimatorModel } from "./compaction/token-estimator.js";
 import { discoverAgents } from "./agents.js";
@@ -355,6 +356,7 @@ export class AgentSession {
 
     const runAgentLoop = async (apiKey: string, accountId?: string, projectId?: string) => {
       const modelInfo = getModel(this.model);
+      const effectiveBaseUrl = this.baseUrl ?? creds.baseUrl;
       const generator = agentLoop(loopMessages, {
         provider: this.provider,
         model: this.model,
@@ -363,13 +365,20 @@ export class AgentSession {
         maxTokens: this.maxTokens,
         thinking: this.thinkingLevel,
         apiKey,
-        baseUrl: this.baseUrl,
+        baseUrl: effectiveBaseUrl,
         signal: this.opts.signal,
         accountId,
         projectId,
+        // Kimi For Coding gates the managed endpoint on coding-agent identity
+        // headers; attach them only when the Kimi OAuth token is in use.
+        defaultHeaders:
+          this.provider === "moonshot" && isKimiCodingEndpoint(effectiveBaseUrl)
+            ? kimiCodingHeaders()
+            : undefined,
         cacheRetention: "short",
         promptCacheKey: this.getPromptCacheKey(),
         supportsImages: modelInfo?.supportsImages,
+        supportsVideo: modelInfo?.supportsVideo,
         userAgent,
         // clearToolUses disabled — causes model to output unsolicited context summaries
         // Single tool result shouldn't exceed 30% of context window (in chars)
@@ -391,17 +400,12 @@ export class AgentSession {
         return;
       }
       if (err instanceof ProviderError && err.statusCode === 401) {
-        // API-key providers (GLM, Moonshot) have no refresh mechanism — retrying
-        // with the same key is pointless. Clear the credential and let the error
-        // surface so the user knows to re-login with a valid key.
-        if (
-          this.provider === "glm" ||
-          this.provider === "moonshot" ||
-          this.provider === "minimax" ||
-          this.provider === "xiaomi" ||
-          this.provider === "deepseek" ||
-          this.provider === "openrouter"
-        ) {
+        // Static API-key providers (GLM, Moonshot API key, etc.) have no refresh
+        // mechanism — retrying with the same key is pointless. Clear the
+        // credential and surface the error so the user re-logins. Kimi OAuth
+        // (active for `moonshot` when present) is refreshable, so it falls
+        // through to the force-refresh path below.
+        if (await this.authStorage.isStaticApiKey(this.provider)) {
           log("WARN", "auth", `Got 401 for ${this.provider} — API key is invalid or revoked`);
           await this.authStorage.clearCredentials(this.provider);
           throw err;
@@ -443,8 +447,13 @@ export class AgentSession {
         this.tools.push(createWebSearchTool());
       }
 
-      // Reconnect MCP servers (e.g. GLM needs Z.AI tools, others don't)
-      if (this.mcpManager) {
+      // Reconnect MCP servers ONLY when GLM is involved on either side — GLM
+      // is the only provider with a different server set (Z.AI tools), so a
+      // non-GLM switch keeps the identical set. Skipping the dispose/reconnect
+      // there avoids tearing down a live stdio child (e.g. kencode-search) and
+      // gambling on a `npx` re-spawn that could fail and drop the tools.
+      const glmInvolved = this.provider === "glm" || prevProvider === "glm";
+      if (this.mcpManager && glmInvolved) {
         // Remove old MCP tools
         this.tools = this.tools.filter((t) => !t.name.startsWith("mcp__"));
 
@@ -462,7 +471,9 @@ export class AgentSession {
               // GLM not configured — skip Z.AI MCP servers
             }
           }
-          const mcpTools = await this.mcpManager.connectAll(getMCPServers(this.provider, apiKey));
+          // Use getAllMcpServers so user-configured servers survive the reconnect.
+          const servers = await getAllMcpServers(this.provider, apiKey, this.cwd);
+          const mcpTools = await this.mcpManager.connectAll(servers);
           this.tools.push(...mcpTools);
         } catch (err) {
           log(

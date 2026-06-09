@@ -14,7 +14,7 @@
  *     → This is a ggcoder bug — please report it.
  */
 
-export type ErrorSource = "provider" | "ggcoder" | "network" | "auth";
+export type ErrorSource = "provider" | "ggcoder" | "network" | "auth" | "capability";
 
 /**
  * Probe a web `Headers` object or a plain header record for the first present
@@ -79,6 +79,18 @@ export class GGAIError extends Error {
     this.source = options?.source ?? "ggcoder";
     this.requestId = options?.requestId;
     this.hint = options?.hint;
+  }
+}
+
+/**
+ * The active model can't handle some content in the request (e.g. a video block
+ * left in history after switching from a video model to a text-only one). A
+ * clean, user-facing capability error — not a bug, not a provider outage.
+ */
+export class VideoUnsupportedError extends GGAIError {
+  constructor() {
+    super("This model can't analyze video.", { source: "capability" });
+    this.name = "VideoUnsupportedError";
   }
 }
 
@@ -153,6 +165,36 @@ function providerDisplayName(provider: string): string {
 export function isUsageLimitError(err: unknown): boolean {
   if (!(err instanceof Error)) return false;
   return /usage limit reached/i.test(err.message);
+}
+
+/**
+ * Substrings that mark a hard, non-retriable billing/quota stop on ANY provider
+ * (credit exhaustion, balance too low, plan quota spent). Single source of truth
+ * shared across the OpenAI-compatible and Anthropic provider boundaries and the
+ * agent-loop retry classifier, so the lists can't drift. Matched case-insensitively.
+ */
+export function isHardBillingMessage(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("insufficient balance") ||
+    lower.includes("insufficient credits") ||
+    lower.includes("more credits") ||
+    lower.includes("insufficient_quota") ||
+    lower.includes("exceeded your current quota") ||
+    lower.includes("quota exceeded") ||
+    lower.includes("no resource package") ||
+    lower.includes("recharge") ||
+    lower.includes("balance is too low") ||
+    lower.includes("out of credits") ||
+    lower.includes("arrears") ||
+    lower.includes("arrearage") ||
+    lower.includes("token quota") ||
+    lower.includes("exceeded_current_quota_error") ||
+    lower.includes("check your account balance") ||
+    lower.includes("does not yet include access") ||
+    lower.includes("subscription plan") ||
+    lower.includes("billing")
+  );
 }
 
 /** Format a unix-seconds reset timestamp for display, e.g. "3:45 PM". */
@@ -238,6 +280,16 @@ function finaliseBySource(
         source,
         message,
         guidance: hint ?? providerGuidance(undefined, message, undefined),
+        ...(requestId ? { requestId } : {}),
+      };
+    case "capability":
+      return {
+        headline: message,
+        source,
+        message: "",
+        guidance:
+          hint ??
+          "Only Kimi, Gemini, MiniMax, and MiMo-V2.5 can analyze video. Switch with /model.",
         ...(requestId ? { requestId } : {}),
       };
     case "ggcoder":

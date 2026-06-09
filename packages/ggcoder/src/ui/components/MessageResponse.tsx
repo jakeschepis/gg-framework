@@ -7,6 +7,12 @@ import { RETURN_SYMBOL } from "../constants/figures.js";
 interface Props {
   children: React.ReactNode;
   height?: number;
+  /**
+   * Optional tone color for the `⎿` gutter. Rendered with `dimColor` so it
+   * reads as a quiet accent that ties the output block to its tool, rather
+   * than a loud line. Defaults to the all-dim gutter when omitted.
+   */
+  accentColor?: string;
 }
 
 /**
@@ -33,7 +39,7 @@ const MessageResponseContext = createContext(false);
  * - Wrapped in Ratchet (lock="offscreen") to prevent height shrinking
  *   during streaming re-parses, unless an explicit height is provided.
  */
-export function MessageResponse({ children, height }: Props): React.ReactNode {
+export function MessageResponse({ children, height, accentColor }: Props): React.ReactNode {
   const isNested = useContext(MessageResponseContext);
 
   // Prevent double brackets in nested tool results
@@ -45,7 +51,7 @@ export function MessageResponse({ children, height }: Props): React.ReactNode {
     <MessageResponseContext value={true}>
       <Box flexDirection="row" height={height} overflowY="hidden">
         <NoSelect fromLeftEdge flexShrink={0}>
-          <Text dimColor>
+          <Text color={accentColor} dimColor>
             {"  "}
             {RETURN_SYMBOL}
             {"  "}

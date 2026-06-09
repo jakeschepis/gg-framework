@@ -1,16 +1,16 @@
 /**
- * One-line prompt hints for each tool. These are shown in the system prompt's
- * Tools section to orient the model. Full parameter docs live on each tool's
- * JSON schema description (sent separately via the tool definition), so these
- * hints stay short and focus on non-obvious usage.
+ * One-line prompt hints for each tool, shown in the system prompt's Tools
+ * section. Full parameter docs live on each tool's JSON schema description
+ * (sent separately via the tool definition), so these hints stay short.
+ *
+ * Hints exist ONLY for tools whose correct usage is NOT obvious from their
+ * schema description alone. The core file/nav/exec tools (read/write/edit/
+ * bash/find/grep/ls) deliberately have NO hint: an ablation (experiments/
+ * prompt-bench, Opus n=12) showed dropping their hints did not change tool
+ * selection — the schema description already carries when/how to use them.
+ * Cross-tool preferences for those tools live in TOOL_STEERING instead.
  */
 export const TOOL_PROMPT_HINTS: Record<string, string> = {
-  read: "Read file contents. Use offset/limit for large files.",
-  write: "Create or overwrite files; read existing files first. Prefer edit for changes.",
-  edit: "Apply surgical { old_text, new_text } edits from a prior read. Use exact text; retry only failed edits; replace_all for renames.",
-  bash: "Run shell commands from project root; use for computation and long/background processes, not direct file rewrites.",
-  find: "Find files/dirs by name pattern. Faster than bash find, respects .gitignore.",
-  grep: "Regex search across files. Use for usages, definitions, imports.",
   source_path:
     "Resolve installed package/repo source via opensrc. Use before assuming dependency APIs; inspect returned absolute path with read/grep/find/ls.",
   web_search:
@@ -19,6 +19,8 @@ export const TOOL_PROMPT_HINTS: Record<string, string> = {
     "Fetch page content as Markdown (or text/html). Pass `urls` to fetch many at once; reads PDFs, follows safe redirects, and prefers a site's /llms.txt for docs.",
   task_output: "Read new output from a background process by id.",
   task_stop: "Stop a background process by id.",
+  tasks:
+    "Manage the project task list. Do not use this tool proactively — only manage the task list when the user explicitly requests it.",
   enter_plan:
     "Enter read-only plan mode for complex/risky tasks before implementation; draft a plan under .gg/plans/.",
   exit_plan: "Submit a .gg/plans/ markdown plan for user approval and leave plan mode.",
@@ -31,6 +33,32 @@ export const TOOL_PROMPT_HINTS: Record<string, string> = {
   "mcp__kencode-search__searchCode":
     "Verify public GitHub code by literal text or RE2 regex; NOT semantic. Put code/import/API tokens in `query`; `path` is a literal file-path substring, not a concept. Start broad/peek, then narrow by repo/path. RE2 multi-line needs `(?s)`.",
 };
+
+/**
+ * Cross-tool selection guidance that no single tool's own schema description
+ * can state (it's relational). Each clause only renders when its tools are
+ * actually active, so the line never references an unavailable tool. Proven
+ * equivalent to the full per-tool hint list in the prompt-bench ablation
+ * while costing ~95% fewer words.
+ */
+export const TOOL_STEERING_CLAUSES: ReadonlyArray<{ needs: readonly string[]; text: string }> = [
+  {
+    needs: ["edit", "write"],
+    text: "Prefer `edit` over `write` for changes to existing files.",
+  },
+  {
+    needs: ["bash", "find", "grep"],
+    text: "Use `find`/`grep` rather than `bash` to locate files and search content.",
+  },
+];
+
+/** Build the steering line from whichever clauses apply to the active tools. */
+export function buildToolSteering(activeTools: readonly string[]): string {
+  const active = new Set(activeTools);
+  return TOOL_STEERING_CLAUSES.filter((c) => c.needs.every((n) => active.has(n)))
+    .map((c) => c.text)
+    .join(" ");
+}
 
 /** Tools always rendered when no explicit tool list is provided. */
 export const DEFAULT_TOOL_NAMES: readonly string[] = [

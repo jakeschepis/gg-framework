@@ -112,10 +112,10 @@ const TARGETS = [
     }),
   },
   {
-    name: "xiaomi / mimo-v2-pro",
+    name: "xiaomi / mimo-v2.5-pro",
     options: () => ({
       provider: "xiaomi",
-      model: "mimo-v2-pro",
+      model: "mimo-v2.5-pro",
       apiKey: auth.xiaomi.accessToken,
       messages: [
         { role: "system", content: SYSTEM },

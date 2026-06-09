@@ -5,7 +5,7 @@ import { useTheme } from "../theme/theme.js";
 import { useFocusedAnimation, deriveFrame } from "./AnimationContext.js";
 import { useTerminalSize } from "../hooks/useTerminalSize.js";
 import type { ImageAttachment } from "../../utils/image.js";
-import { extractImagePaths, readImageFile, getClipboardImage } from "../../utils/image.js";
+import { extractMediaPaths, readMediaFile, getClipboardImage } from "../../utils/image.js";
 import { SlashCommandMenu, filterCommands, type SlashCommandInfo } from "./SlashCommandMenu.js";
 import { TaskPickerMenu } from "./TaskPickerMenu.js";
 import { stripTerminalFocusSequences } from "../utils/terminal-input.js";
@@ -447,15 +447,15 @@ export function InputArea({
     if (!value || extractingRef.current) return;
     const timer = setTimeout(() => {
       extractingRef.current = true;
-      extractImagePaths(value, cwd)
+      extractMediaPaths(value, cwd)
         .then(async ({ imagePaths, cleanText }) => {
           if (imagePaths.length === 0) return;
           const newImages: ImageAttachment[] = [];
           for (const imgPath of imagePaths) {
             try {
-              newImages.push(await readImageFile(imgPath));
+              newImages.push(await readMediaFile(imgPath));
             } catch {
-              // Not a valid image file — leave in text
+              // Not a valid media file — leave in text
             }
           }
           if (newImages.length > 0) {
@@ -1564,11 +1564,17 @@ export function InputArea({
         {images.length > 0 && (
           <Box>
             <Text color={theme.accent}>
-              {images
-                .map((img, i) =>
-                  img.kind === "text" ? `[File: ${img.fileName}]` : `[Image #${i + 1}]`,
-                )
-                .join(" ")}
+              {(() => {
+                let imageNum = 0;
+                let videoNum = 0;
+                return images
+                  .map((img) => {
+                    if (img.kind === "text") return `[File: ${img.fileName}]`;
+                    if (img.kind === "video") return `[🎬 Video #${++videoNum}]`;
+                    return `[Image #${++imageNum}]`;
+                  })
+                  .join(" ");
+              })()}
             </Text>
           </Box>
         )}

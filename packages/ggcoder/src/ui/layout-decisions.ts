@@ -78,6 +78,10 @@ export interface DoneStatus {
   durationMs: number;
   toolsUsed: string[];
   verb: string;
+  /** Per-run tool-call counts keyed by tool name (for the vital-signs line). */
+  counts?: Record<string, number>;
+  /** Per-run output-token total. */
+  tokens?: number;
 }
 
 export function getScrollStabilizationDecision({

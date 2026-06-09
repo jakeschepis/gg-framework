@@ -73,12 +73,14 @@ Switch mid-conversation with `/model`. Not locked to anyone.
 | **OpenAI** | GPT-5.5, GPT-5.5 Pro, GPT-5.4, GPT-5.3 Codex | OAuth |
 | **Moonshot** | Kimi K2.6 | API key |
 | **Z.AI (GLM)** | GLM-5.1, GLM-4.7, GLM-4.7 Flash | API key |
-| **MiniMax** | MiniMax M2.7, M2.7 Highspeed | API key |
-| **Xiaomi (MiMo)** | MiMo-V2-Pro | API key |
+| **MiniMax** | MiniMax M3 (image + video) | API key |
+| **Xiaomi (MiMo)** | MiMo-V2.5-Pro, MiMo-V2.5 (image + video) | API key |
 | **DeepSeek** | DeepSeek V4 Pro, V4 Flash | API key |
 | **OpenRouter** | Qwen3.6-Plus + multi-provider gateway | API key |
 
 The same conversation, the same tools, the same project context — only the model changes. Use a strong reasoning model when you need it, swap to a fast cheap one for grunt work, never restart your session.
+
+**Attachments.** Drag, paste, or type a path to attach images and video in the chat input. Video is sent natively to models that support it (Gemini 3.x, Kimi K2.6, MiniMax M3, MiMo-V2.5); for other models the video is saved to a temp file and the model is told to inspect it with ffmpeg or its own tools.
 
 ---
 

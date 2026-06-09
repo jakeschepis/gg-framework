@@ -38,9 +38,13 @@ function queuedItem(overrides: Partial<Extract<CompletedItem, { kind: "queued" }
 }
 
 function renderQueuedLiveItem(item: Extract<CompletedItem, { kind: "queued" }>, itemTheme: Theme) {
-  const suffix = item.imageCount
+  const imageSuffix = item.imageCount
     ? ` (+${item.imageCount} image${item.imageCount > 1 ? "s" : ""})`
     : "";
+  const videoSuffix = item.videoCount
+    ? ` (+${item.videoCount} video${item.videoCount > 1 ? "s" : ""})`
+    : "";
+  const suffix = `${imageSuffix}${videoSuffix}`;
   return (
     <Box flexDirection="row" paddingLeft={1} marginTop={1} flexShrink={1}>
       <Box width={2} flexShrink={0}>

@@ -25,7 +25,7 @@ import {
   type ThinkingLevel,
   type TextContent,
 } from "@kenkaiiii/gg-ai";
-import { downscaleForPreview, extractImagePaths, type ImageAttachment } from "../utils/image.js";
+import { downscaleForPreview, extractMediaPaths, type ImageAttachment } from "../utils/image.js";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import { useAgentLoop, type StreamSnapshot, type UserContent } from "./hooks/useAgentLoop.js";
 import { useTranscriptHistory } from "./hooks/useTranscriptHistory.js";
@@ -44,7 +44,7 @@ import type { ProcessManager } from "../core/process-manager.js";
 import { useTheme, useSetTheme, type ThemeName } from "./theme/theme.js";
 import { useTerminalTitle } from "./hooks/useTerminalTitle.js";
 import { getGitBranch } from "../utils/git.js";
-import { getModel } from "../core/model-registry.js";
+import { getModel, getVideoByteLimit } from "../core/model-registry.js";
 import { SessionManager } from "../core/session-manager.js";
 import { log } from "../core/logger.js";
 import {
@@ -71,12 +71,13 @@ import {
   extractPlanSteps,
   findCompletedMarkers,
   markStepsCompleted,
+  rebasePlanSteps,
   segmentDisplayText,
   stripDoneMarkers,
   type PlanStep,
 } from "../utils/plan-steps.js";
 import type { MCPClientManager } from "../core/mcp/index.js";
-import { getMCPServers } from "../core/mcp/index.js";
+import { getAllMcpServers } from "../core/mcp/index.js";
 import type { AuthStorage } from "../core/auth-storage.js";
 import {
   trimFlushedItems,
@@ -84,7 +85,10 @@ import {
   flushOnTurnEnd,
   flushOverflow,
 } from "./live-item-flush.js";
-import { splitAssistantStreamingText } from "./utils/assistant-stream-split.js";
+import {
+  splitAssistantStreamingText,
+  estimateRenderedRows,
+} from "./utils/assistant-stream-split.js";
 import { getNextPendingTask, markTaskInProgress } from "../core/tasks-store.js";
 import type { TerminalHistoryPrinter } from "./terminal-history.js";
 import { buildUserContentWithAttachments } from "./prompt-routing.js";
@@ -225,6 +229,9 @@ export interface AppProps {
   checkpointStore?: CheckpointStore;
   initialOverlay?: "pixel";
   rebuildToolsForCwd?: (cwd: string) => AgentTool[];
+  /** Rebuild the `read` tool for a model (reuses the read tracker). Used on
+   *  model switch so the tool's video capability tracks the active model. */
+  rebuildReadTool?: (model: string) => AgentTool;
   connectInitialMcpTools?: () => Promise<AgentTool[]>;
   planCallbacks?: {
     onEnterPlan?: (reason?: string) => void | Promise<void>;
@@ -865,6 +872,8 @@ export function App(props: AppProps) {
       tools: currentTools,
       webSearch: props.webSearch,
       maxTokens: props.maxTokens,
+      supportsImages: getModel(currentModel)?.supportsImages ?? true,
+      supportsVideo: getModel(currentModel)?.supportsVideo ?? false,
       thinking: thinkingLevel,
       apiKey: activeApiKey,
       baseUrl: activeBaseUrl,
@@ -986,10 +995,31 @@ export function App(props: AppProps) {
           if (planStepsRef.current.length > 0) {
             const completed = findCompletedMarkers(text);
             if (completed.size > 0) {
-              const updated = markStepsCompleted(planStepsRef.current, completed);
-              if (updated !== planStepsRef.current) {
-                planStepsRef.current = updated;
-                setPlanSteps(updated);
+              const planPath = approvedPlanPathRef.current;
+              // The agent can rewrite/expand the approved plan mid-run, so the
+              // snapshot captured at approval goes stale (wrong total, and new
+              // [DONE:n] markers match nothing). Re-extract from the live plan
+              // file and re-base onto it before applying markers. The file read
+              // is async; apply markers inside the same async step to avoid a
+              // race with the snapshot. Fall back to the in-memory snapshot if
+              // there is no plan path or the read fails.
+              const applyMarkers = (base: PlanStep[]): void => {
+                const updated = markStepsCompleted(base, completed);
+                if (updated !== planStepsRef.current) {
+                  planStepsRef.current = updated;
+                  setPlanSteps(updated);
+                }
+              };
+              if (planPath) {
+                void import("node:fs/promises")
+                  .then(({ readFile }) => readFile(planPath, "utf-8"))
+                  .then((planContent) => {
+                    const fresh = extractPlanSteps(planContent);
+                    applyMarkers(rebasePlanSteps(planStepsRef.current, fresh));
+                  })
+                  .catch(() => applyMarkers(planStepsRef.current));
+              } else {
+                applyMarkers(planStepsRef.current);
               }
               // Real progress happened — reset the stuck-guard so the next
               // step gets its own fresh nudge budget.
@@ -1373,6 +1403,20 @@ export function App(props: AppProps) {
           log("INFO", "server_tool", `Server tool call: ${name}`, { id });
           const startedAt = Date.now();
           const animateUntil = startedAt + RUNNING_INDICATOR_ANIMATION_MS;
+          // Feed the pinned LiveToolPanel so provider-side tools (Anthropic's
+          // native web_search) appear in the same rolling window as client
+          // tools. `input` carries the tool args (e.g. { query }) the row reads.
+          setLiveToolFeed((prev) =>
+            [
+              ...prev,
+              {
+                id,
+                name,
+                args: (input ?? {}) as Record<string, unknown>,
+                status: "running" as const,
+              },
+            ].slice(-(LIVE_TOOL_PANEL_ROWS * 2)),
+          );
           // Flush completed items (including assistant text) before adding server
           // tool UI — same rationale as onToolStart.
           setLiveItems((prev) => {
@@ -1387,6 +1431,11 @@ export function App(props: AppProps) {
             if (flushed.length > 0) {
               queueFlush(flushed);
             }
+            // The pre-tool text was just pinned; the hook resets its streaming
+            // buffer at this same boundary. Reset the progressive-flush offset
+            // so post-tool text is measured from zero (stale flushedChars would
+            // otherwise slice into the fresh, shorter buffer).
+            streamedAssistantFlushRef.current = { flushedChars: 0, text: "" };
             return [
               ...remaining,
               {
@@ -1406,6 +1455,13 @@ export function App(props: AppProps) {
       onServerToolResult: useCallback(
         (toolUseId: string, resultType: string, data: unknown) => {
           log("INFO", "server_tool", `Server tool result`, { toolUseId, resultType });
+          // Mark the panel entry done. Aborts never reach here (handled in
+          // onAborted), so a result that arrives is always a normal completion.
+          setLiveToolFeed((prev) =>
+            prev.map((entry) =>
+              entry.id === toolUseId ? { ...entry, status: "done" as const } : entry,
+            ),
+          );
           setLiveItems((prev) => {
             let updated: CompletedItem[];
             const startIdx = prev.findIndex(
@@ -1486,86 +1542,99 @@ export function App(props: AppProps) {
         },
         [queueFlush],
       ),
-      onDone: useCallback((durationMs: number, toolsUsed: string[]) => {
-        log("INFO", "agent", `Agent done`, {
-          duration: `${durationMs}ms`,
-          toolsUsed: toolsUsed.join(",") || "none",
-        });
-        const doneDecision = getDoneFlushDecision({
-          planOverlayPending: planOverlayPendingRef.current,
-        });
-        // Don't show "done" status when the plan review pane is about to open —
-        // the agent loop finished but we're waiting for user approval/review.
-        // Still flush live transcript rows before the pane remounts; otherwise
-        // setup output remains in ephemeral liveItems and appears to vanish.
-        if (doneDecision.showDoneStatus) {
-          setDoneStatus({ durationMs, toolsUsed, verb: pickDurationVerb(toolsUsed) });
-          playNotificationSound();
-        }
-        // Keep the final assistant response mounted in the live frame after a
-        // normal chat turn finishes. Moving a large final response to terminal
-        // history at this moment writes many scrollback rows while the footer is
-        // still mounted, which visibly pushes the input/footer upward. The final
-        // response is flushed on the next submit before the new prompt is shown.
-        // Non-chat overlay transitions still flush so setup/plan output
-        // does not vanish during remounts.
-        if (doneDecision.flushLiveItems && !doneDecision.showDoneStatus) {
-          setLiveItems((prev) => {
-            if (prev.length > 0) queueFlush(prev);
-            return prev;
+      onDone: useCallback(
+        (
+          durationMs: number,
+          toolsUsed: string[],
+          runStats?: { counts: Record<string, number>; tokens: number },
+        ) => {
+          log("INFO", "agent", `Agent done`, {
+            duration: `${durationMs}ms`,
+            toolsUsed: toolsUsed.join(",") || "none",
           });
-        }
+          const doneDecision = getDoneFlushDecision({
+            planOverlayPending: planOverlayPendingRef.current,
+          });
+          // Don't show "done" status when the plan review pane is about to open —
+          // the agent loop finished but we're waiting for user approval/review.
+          // Still flush live transcript rows before the pane remounts; otherwise
+          // setup output remains in ephemeral liveItems and appears to vanish.
+          if (doneDecision.showDoneStatus) {
+            setDoneStatus({
+              durationMs,
+              toolsUsed,
+              verb: pickDurationVerb(toolsUsed),
+              counts: runStats?.counts,
+              tokens: runStats?.tokens,
+            });
+            playNotificationSound();
+          }
+          // Keep the final assistant response mounted in the live frame after a
+          // normal chat turn finishes. Moving a large final response to terminal
+          // history at this moment writes many scrollback rows while the footer is
+          // still mounted, which visibly pushes the input/footer upward. The final
+          // response is flushed on the next submit before the new prompt is shown.
+          // Non-chat overlay transitions still flush so setup/plan output
+          // does not vanish during remounts.
+          if (doneDecision.flushLiveItems && !doneDecision.showDoneStatus) {
+            setLiveItems((prev) => {
+              if (prev.length > 0) queueFlush(prev);
+              return prev;
+            });
+          }
 
-        // Run-all: auto-start next pending task after a short delay.
-        if (runAllTasksRef.current) {
-          setTimeout(() => {
-            const cwd = cwdRef.current;
-            const next = getNextPendingTask(cwd);
-            if (next) {
-              markTaskInProgress(cwd, next.id);
-              startTaskRef.current(next.title, next.prompt, next.id);
-            } else {
-              setRunAllTasks(false);
-              log("INFO", "tasks", "Run-all complete — no more pending tasks");
-            }
-          }, 500);
-        }
+          // Run-all: auto-start next pending task after a short delay.
+          if (runAllTasksRef.current) {
+            setTimeout(() => {
+              const cwd = cwdRef.current;
+              const next = getNextPendingTask(cwd);
+              if (next) {
+                markTaskInProgress(cwd, next.id);
+                startTaskRef.current(next.title, next.prompt, next.id);
+              } else {
+                setRunAllTasks(false);
+                log("INFO", "tasks", "Run-all complete — no more pending tasks");
+              }
+            }, 500);
+          }
 
-        // Pixel fix: observe branch + commits, patch status, optionally pick
-        // up the next open error if run-all is active.
-        const pendingFix = currentPixelFixRef.current;
-        if (pendingFix) {
-          currentPixelFixRef.current = null;
-          void (async () => {
-            try {
-              const { finalizePixelFix } = await import("../core/pixel-fix.js");
-              const result = await finalizePixelFix(pendingFix);
-              log("INFO", "pixel", `Pixel fix done: ${result.outcome}`, {
-                errorId: pendingFix.errorId,
-                reason: result.reason,
-              });
-            } catch (err) {
-              log("ERROR", "pixel", `Pixel finalize failed: ${(err as Error).message}`);
-            }
+          // Pixel fix: observe branch + commits, patch status, optionally pick
+          // up the next open error if run-all is active.
+          const pendingFix = currentPixelFixRef.current;
+          if (pendingFix) {
+            currentPixelFixRef.current = null;
+            void (async () => {
+              try {
+                const { finalizePixelFix } = await import("../core/pixel-fix.js");
+                const result = await finalizePixelFix(pendingFix);
+                log("INFO", "pixel", `Pixel fix done: ${result.outcome}`, {
+                  errorId: pendingFix.errorId,
+                  reason: result.reason,
+                });
+              } catch (err) {
+                log("ERROR", "pixel", `Pixel finalize failed: ${(err as Error).message}`);
+              }
 
-            if (runAllPixelRef.current) {
-              setTimeout(() => {
-                void (async () => {
-                  const { fetchPixelEntries } = await import("../core/pixel.js");
-                  const data = await fetchPixelEntries();
-                  const next = data.entries.find((e) => e.status === "open");
-                  if (next) {
-                    startPixelFixRef.current(next.errorId);
-                  } else {
-                    setRunAllPixel(false);
-                    log("INFO", "pixel", "Run-all complete — no more open errors");
-                  }
-                })();
-              }, 500);
-            }
-          })();
-        }
-      }, []),
+              if (runAllPixelRef.current) {
+                setTimeout(() => {
+                  void (async () => {
+                    const { fetchPixelEntries } = await import("../core/pixel.js");
+                    const data = await fetchPixelEntries();
+                    const next = data.entries.find((e) => e.status === "open");
+                    if (next) {
+                      startPixelFixRef.current(next.errorId);
+                    } else {
+                      setRunAllPixel(false);
+                      log("INFO", "pixel", "Run-all complete — no more open errors");
+                    }
+                  })();
+                }, 500);
+              }
+            })();
+          }
+        },
+        [],
+      ),
       onAborted: useCallback(() => {
         log("WARN", "agent", "Agent run aborted by user");
         setRunAllPixel(false);
@@ -1629,10 +1698,15 @@ export function App(props: AppProps) {
             typeof content === "string"
               ? undefined
               : content.filter((c) => c.type === "image").length || undefined;
+          const videoCount =
+            typeof content === "string"
+              ? undefined
+              : content.filter((c) => c.type === "video").length || undefined;
           const userItem: UserItem = {
             kind: "user",
             text: displayText,
             imageCount,
+            videoCount,
             id: getId(),
           };
           setLastUserMessage(displayText);
@@ -1668,6 +1742,15 @@ export function App(props: AppProps) {
               `or you genuinely need user input.`,
           },
         ];
+      }, []),
+      onRetry: useCallback(() => {
+        // Roll back any pending progressive flushes from the aborted attempt.
+        // Without this, a stall retry regenerates the preamble and the old
+        // flushed paragraph + the new one both end up in terminal history.
+        pendingHistoryFlushRef.current = pendingHistoryFlushRef.current.filter(
+          (item) => item.kind !== "assistant",
+        );
+        streamedAssistantFlushRef.current = { flushedChars: 0, text: "" };
       }, []),
     },
   );
@@ -1785,6 +1868,9 @@ export function App(props: AppProps) {
     void agentLoop.run(action.prompt).catch((err: unknown) => {
       const errMsg = err instanceof Error ? err.message : String(err);
       log("ERROR", "error", errMsg);
+      if (agentLoop.isRunning) {
+        agentLoop.reset();
+      }
       setLiveItems((prev) => [...prev, toErrorItem(err, getId())]);
     });
     // Intentional one-shot: run once on mount, never re-fire on re-render.
@@ -1967,9 +2053,17 @@ export function App(props: AppProps) {
 
       // ── Build user content (shared by normal + queued paths) ──
       const hasImages = inputImages.length > 0;
+      const imageCount = inputImages.filter((img) => img.kind === "image").length;
+      const videoCount = inputImages.filter((img) => img.kind === "video").length;
       const modelInfo = getModel(currentModel);
       const modelSupportsImages = modelInfo?.supportsImages ?? true;
-      const userContent = buildUserContentWithAttachments(input, inputImages, modelSupportsImages);
+      const modelSupportsVideo = modelInfo?.supportsVideo ?? false;
+      const userContent = buildUserContentWithAttachments(
+        input,
+        inputImages,
+        modelSupportsImages,
+        modelSupportsVideo,
+      );
 
       // ── Queue message if agent is already running ──
       if (agentLoop.isRunning) {
@@ -1981,23 +2075,24 @@ export function App(props: AppProps) {
         agentLoop.queueMessage(userContent, input);
         let displayText = input;
         if (hasImages) {
-          const { cleanText } = await extractImagePaths(input, props.cwd);
+          const { cleanText } = await extractMediaPaths(input, props.cwd);
           displayText = cleanText;
         }
         const queuedItem: QueuedItem = {
           kind: "queued",
           text: displayText,
-          imageCount: hasImages ? inputImages.length : undefined,
+          imageCount: imageCount > 0 ? imageCount : undefined,
+          videoCount: videoCount > 0 ? videoCount : undefined,
           id: getId(),
         };
         setLiveItems((prev) => [...prev, queuedItem]);
         return;
       }
 
-      // Build display text — strip image paths, show badges instead
+      // Build display text — strip image/video paths, show badges instead
       let displayText = input;
       if (hasImages) {
-        const { cleanText } = await extractImagePaths(input, props.cwd);
+        const { cleanText } = await extractMediaPaths(input, props.cwd);
         displayText = cleanText;
       }
       let imagePreviews: ImagePreview[] | undefined;
@@ -2015,7 +2110,8 @@ export function App(props: AppProps) {
       const userItem: UserItem = {
         kind: "user",
         text: displayText,
-        imageCount: hasImages ? inputImages.length : undefined,
+        imageCount: imageCount > 0 ? imageCount : undefined,
+        videoCount: videoCount > 0 ? videoCount : undefined,
         imagePreviews,
         pasteInfo,
         id: getId(),
@@ -2050,6 +2146,12 @@ export function App(props: AppProps) {
         const msg = err instanceof Error ? err.message : String(err);
         log("ERROR", "error", msg);
         const isAbort = msg.includes("aborted") || msg.includes("abort");
+        // If the agent loop threw but left isRunning in a stale true state
+        // (can happen when the finally block hasn't been processed by React
+        // yet), reset it so the user isn't deadlocked with a non-working UI.
+        if (agentLoop.isRunning) {
+          agentLoop.reset();
+        }
         setLiveItems((prev) => [
           ...prev,
           isAbort
@@ -2145,8 +2247,14 @@ export function App(props: AppProps) {
             return next;
           });
 
-          // Reconnect MCP servers
-          if (props.mcpManager) {
+          // Reconnect MCP servers ONLY when the resolved server set actually
+          // changes. GLM is the only provider with a different set (Z.AI
+          // servers), so a switch that doesn't involve GLM on either side
+          // keeps the identical set — tearing down a live stdio child (e.g.
+          // kencode-search) and re-spawning `npx` there only risks a failed
+          // re-spawn that would silently drop the tools.
+          const glmInvolved = newProvider === "glm" || prevProvider === "glm";
+          if (props.mcpManager && glmInvolved) {
             void (async () => {
               // Disconnect old MCP servers
               await props.mcpManager!.dispose();
@@ -2164,9 +2272,11 @@ export function App(props: AppProps) {
                 apiKey = props.credentialsByProvider?.["glm"]?.accessToken;
               }
               try {
-                const mcpTools = await props.mcpManager!.connectAll(
-                  getMCPServers(newProvider, apiKey),
-                );
+                // Use getAllMcpServers so user-configured servers (from
+                // ~/.gg/mcp.json and ./.gg/mcp.json) survive the reconnect —
+                // getMCPServers returns provider defaults only.
+                const servers = await getAllMcpServers(newProvider, apiKey, props.cwd);
+                const mcpTools = await props.mcpManager!.connectAll(servers);
                 setCurrentTools((prev) => {
                   const next = [...prev.filter((t) => !t.name.startsWith("mcp__")), ...mcpTools];
                   rebuildPromptWithTools(next);
@@ -2192,7 +2302,28 @@ export function App(props: AppProps) {
         return newProvider;
       });
 
-      setCurrentModel(newModelId);
+      // The `read` tool's video capability (its description + native-video
+      // execute path) is baked in at creation from the model's `maxVideoBytes`.
+      // Switching to/from a video-capable model (e.g. text-only MiMo-V2.5-Pro →
+      // omnimodal MiMo-V2.5) must rebuild it, or the tool keeps telling the model
+      // it can't watch video. Rebuild reuses the read tracker, so read-before-edit
+      // history survives. Provider-change rebuilds the prompt above; this covers
+      // same-provider model switches too.
+      setCurrentModel((prevModel) => {
+        if (
+          props.rebuildReadTool &&
+          getVideoByteLimit(prevModel) !== getVideoByteLimit(newModelId)
+        ) {
+          const newReadTool = props.rebuildReadTool(newModelId);
+          setCurrentTools((prev) => {
+            const next = prev.map((tool) => (tool.name === "read" ? newReadTool : tool));
+            currentToolsRef.current = next;
+            void replaceSystemPrompt({ tools: next });
+            return next;
+          });
+        }
+        return newModelId;
+      });
       const modelInfo = getModel(newModelId);
       const displayName = modelInfo?.name ?? newModelId;
       setLiveItems((prev) => [
@@ -2220,7 +2351,14 @@ export function App(props: AppProps) {
         });
       }
     },
-    [props.settingsFile, props.mcpManager, props.credentialsByProvider, props.authStorage],
+    [
+      props.settingsFile,
+      props.mcpManager,
+      props.credentialsByProvider,
+      props.authStorage,
+      props.rebuildReadTool,
+      replaceSystemPrompt,
+    ],
   );
 
   const handleThemeSelect = useCallback(
@@ -2460,6 +2598,9 @@ export function App(props: AppProps) {
       setDoneStatus(null);
       setLiveItems([taskItem]);
       void agentLoop.run(fullPrompt).catch((err: unknown) => {
+        if (agentLoop.isRunning) {
+          agentLoop.reset();
+        }
         setLiveItems((prev) => [...prev, toErrorItem(err, getId())]);
       });
     },
@@ -2520,16 +2661,41 @@ export function App(props: AppProps) {
   // every chunk boundary. Slicing by the prospective flush here keeps the live
   // frame height monotonic, so the footer never bounces.
   const alreadyFlushedChars = streamedAssistantFlushRef.current.flushedChars;
-  const pendingFlushChars = rawVisibleStreamingText
-    ? splitAssistantStreamingText(rawVisibleStreamingText.slice(alreadyFlushedChars)).flushedText
-        .length
+  // Retry-safety gate: don't commit streamed paragraphs to permanent scrollback
+  // while the text is still small enough to live entirely in the live region.
+  // A silent stall-retry (agent-loop.ts) restarts the LLM call from scratch and
+  // regenerates the opening text — reworded, so the byte-identical dedup can't
+  // catch it. Anything already printed to scrollback can't be un-written, so the
+  // regen appends as a second ⏺ bullet that paraphrases the first. Keeping short
+  // streamed text live (it clears via setStreamingText("") on retry) closes that
+  // hole. We only start flushing once the unflushed text would overflow the live
+  // area — the original anti-jump purpose, which only matters for long responses
+  // that are far less likely to be a stalled preamble. Once flushing has begun
+  // for this turn (alreadyFlushedChars > 0) we keep flushing every boundary so
+  // committed continuation paragraphs stay consistent with the live tail.
+  const unflushedStreamingRows = rawVisibleStreamingText
+    ? estimateRenderedRows(rawVisibleStreamingText.slice(alreadyFlushedChars), columns)
     : 0;
+  const shouldFlushStreamedText =
+    alreadyFlushedChars > 0 || unflushedStreamingRows > measuredLiveAreaRows;
+  const pendingFlushChars =
+    rawVisibleStreamingText && shouldFlushStreamedText
+      ? splitAssistantStreamingText(rawVisibleStreamingText.slice(alreadyFlushedChars)).flushedText
+          .length
+      : 0;
   useEffect(() => {
     if (!rawVisibleStreamingText) {
       streamedAssistantFlushRef.current = { flushedChars: 0, text: "" };
       return;
     }
     if (rawVisibleStreamingText === streamedAssistantFlushRef.current.text) return;
+    if (!shouldFlushStreamedText) {
+      streamedAssistantFlushRef.current = {
+        ...streamedAssistantFlushRef.current,
+        text: rawVisibleStreamingText,
+      };
+      return;
+    }
     const alreadyFlushed = streamedAssistantFlushRef.current.flushedChars;
     const unflushedText = rawVisibleStreamingText.slice(alreadyFlushed);
     const split = splitAssistantStreamingText(unflushedText);
@@ -2552,7 +2718,7 @@ export function App(props: AppProps) {
       ...streamedAssistantFlushRef.current,
       text: rawVisibleStreamingText,
     };
-  }, [rawVisibleStreamingText, queueFlush]);
+  }, [rawVisibleStreamingText, shouldFlushStreamedText, queueFlush]);
   const visibleStreamingText = stripDoneMarkers(
     rawVisibleStreamingText.slice(alreadyFlushedChars + pendingFlushChars),
   );
@@ -2889,6 +3055,9 @@ export function App(props: AppProps) {
     void agentLoop.run(rejectionMsg).catch((err: unknown) => {
       const errMsg = err instanceof Error ? err.message : String(err);
       log("ERROR", "error", errMsg);
+      if (agentLoop.isRunning) {
+        agentLoop.reset();
+      }
       setLiveItems((prev) => [...prev, toErrorItem(err, getId())]);
     });
   };

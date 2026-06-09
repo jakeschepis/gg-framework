@@ -53,6 +53,7 @@ export interface RenderAppConfig {
   checkpointStore?: CheckpointStore;
   initialOverlay?: "pixel";
   rebuildToolsForCwd?: (cwd: string) => AgentTool[];
+  rebuildReadTool?: (model: string) => AgentTool;
   connectInitialMcpTools?: () => Promise<AgentTool[]>;
   planCallbacks?: {
     onEnterPlan?: (reason?: string) => void | Promise<void>;
@@ -301,6 +302,33 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
   };
   process.on("exit", onProcessExit);
 
+  // Safety net: when the TUI is frozen (e.g. the stream hung and abort didn't
+  // work), the user must still be able to get out. Ink's exitOnCtrlC is false
+  // so the app can handle graceful abort, but if the app itself is stuck we
+  // need a process-level escape hatch.
+  let sigintCount = 0;
+  let sigintTimer: ReturnType<typeof setTimeout> | null = null;
+  const onSigint = (): void => {
+    sigintCount++;
+    if (sigintTimer) clearTimeout(sigintTimer);
+    sigintTimer = setTimeout(() => {
+      sigintCount = 0;
+    }, 2000);
+    if (sigintCount === 1) {
+      // First Ctrl+C: try to gracefully exit by unmounting Ink
+      try {
+        ref.instance?.unmount();
+      } catch {
+        // ignored
+      }
+      setTimeout(() => process.exit(130), 250);
+    } else {
+      // Second Ctrl+C: force exit immediately (130 = 128 + SIGINT)
+      process.exit(130);
+    }
+  };
+  process.on("SIGINT", onSigint);
+
   // Runtime state lives in this closure so unmount/remount doesn't lose
   // the user's runtime model/provider/thinking choices.
   const runtimeState: RuntimeState = {
@@ -380,6 +408,7 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
             checkpointStore: config.checkpointStore,
             initialOverlay: config.initialOverlay,
             rebuildToolsForCwd: config.rebuildToolsForCwd,
+            rebuildReadTool: config.rebuildReadTool,
             connectInitialMcpTools: config.connectInitialMcpTools,
             planCallbacks: config.planCallbacks,
             terminalHistoryPrinter,
@@ -505,6 +534,8 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
     process.stdout.off("resize", onTerminalResize);
     if (resizeTimer) clearTimeout(resizeTimer);
     process.off("exit", onProcessExit);
+    process.off("SIGINT", onSigint);
+    if (sigintTimer) clearTimeout(sigintTimer);
     // Final cleanup on normal exit — also covered by the "exit" handler,
     // but writing here ensures the disable lands before Node tears stdout
     // down on process termination.

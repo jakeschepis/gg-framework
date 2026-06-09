@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from "react";
+import React, { useEffect, useRef, useState } from "react";
 import { Text, Box } from "ink";
 import { useTheme } from "../theme/theme.js";
 import type { ActivityPhase, RetryInfo } from "../hooks/useAgentLoop.js";
@@ -158,16 +158,36 @@ export function getThinkingShimmerColor(themeName: string): string {
   return "#22c55e";
 }
 
-const ShimmerText: React.FC<{ text: string; color: string; shimmerPos: number }> = ({
-  text,
-  color,
-  shimmerPos,
-}) => (
+/**
+ * Dedicated hue for the "Working..." label shimmer. Deliberately distinct from
+ * the spinner cycle (cool purples/blues), the token accent (violet), the
+ * thinking shimmer (green), and the duration (gray) so the sweep reads as its
+ * own signal — a warm amber/coral.
+ */
+export function getWorkingShimmerColor(themeName: string): string {
+  if (themeName.includes("ansi")) return "#ffaf00";
+  if (themeName.startsWith("light")) return "#c2410c";
+  return "#fb923c";
+}
+
+const ShimmerText: React.FC<{
+  text: string;
+  color: string;
+  shimmerPos: number;
+  /** Optional color for the bright sweep band; falls back to `color` + no dim. */
+  brightColor?: string;
+  italic?: boolean;
+}> = ({ text, color, shimmerPos, brightColor, italic }) => (
   <Text>
     {text.split("").map((char, i) => {
       const isBright = Math.abs(i - shimmerPos) <= SHIMMER_WIDTH;
       return (
-        <Text color={color} dimColor={!isBright} key={i}>
+        <Text
+          color={isBright && brightColor ? brightColor : color}
+          dimColor={!isBright}
+          italic={italic}
+          key={i}
+        >
           {char}
         </Text>
       );
@@ -286,6 +306,7 @@ export function ActivityIndicator({
   const theme = useTheme();
   const reducedMotion = useReducedMotion();
   const thinkingShimmerColor = getThinkingShimmerColor(theme.name);
+  const workingShimmerColor = getWorkingShimmerColor(theme.name);
   const accentColors = getActivityAccentColors(theme.name);
 
   // Full animation uses the shared 100ms clock. Static display deliberately
@@ -375,13 +396,29 @@ export function ActivityIndicator({
     ? (tick % thinkingShimmerCycle) - SHIMMER_WIDTH
     : -SHIMMER_WIDTH;
 
-  // ── Plan progress bar ──────────────────────────────────
-  const planBar = useMemo(() => {
-    if (planTotal <= 0) return null;
-    const barWidth = Math.min(planTotal, 20);
-    const filledWidth = Math.round((planDone / planTotal) * barWidth);
-    return "\u2588".repeat(filledWidth) + "\u2591".repeat(barWidth - filledWidth);
-  }, [planDone, planTotal]);
+  // ── "Working..." label shimmer ─────────────────────────
+  // A slow sweep of brightness across the label, riding whichever animation
+  // clock is live: the 100ms tick in full mode, or the 80ms low-churn frame
+  // in the (static) status-row mode. Falls back to plain text when idle,
+  // unfocused, or reduced-motion so scrollback stays stable.
+  const WORKING_LABEL = "Working...";
+  const workingShimmerFrame = fullAnimationActive ? tick : lowChurnActive ? lowChurnFrame : null;
+  const workingShimmerCycle = WORKING_LABEL.length + SHIMMER_WIDTH * 2;
+  const workingShimmerPos =
+    workingShimmerFrame !== null
+      ? (workingShimmerFrame % workingShimmerCycle) - SHIMMER_WIDTH
+      : null;
+
+  // ── Plan progress label ────────────────────────────────
+  // "Plan Steps" gets the same green shimmer treatment as the thinking label,
+  // riding whichever animation clock is live. Falls back to a static sweep
+  // position when idle/unfocused/reduced-motion so scrollback stays stable.
+  const PLAN_LABEL = "Plan Steps";
+  const planShimmerCycle = PLAN_LABEL.length + SHIMMER_WIDTH * 2;
+  const planShimmerPos =
+    workingShimmerFrame !== null
+      ? (workingShimmerFrame % planShimmerCycle) - SHIMMER_WIDTH
+      : -SHIMMER_WIDTH;
 
   // ── Retry display ──────────────────────────────────────
   if (phase === "retrying" && retryInfo) {
@@ -413,9 +450,19 @@ export function ActivityIndicator({
       <Text color={spinnerColor}>
         {reducedMotion ? REDUCED_MOTION_DOT : GEMINI_DOTS_FRAMES[geminiSpinnerFrame]}{" "}
       </Text>
-      <Text color={theme.text} italic wrap="truncate-end">
-        {"Working..."}
-      </Text>
+      {workingShimmerPos !== null ? (
+        <ShimmerText
+          text={WORKING_LABEL}
+          color={theme.text}
+          brightColor={workingShimmerColor}
+          shimmerPos={workingShimmerPos}
+          italic
+        />
+      ) : (
+        <Text color={theme.text} italic wrap="truncate-end">
+          {WORKING_LABEL}
+        </Text>
+      )}
       {fullAnimationActive && isThinking && legacyMeta.thinking ? (
         <Text>
           <Text color={theme.textDim}>{"  ("}</Text>
@@ -438,10 +485,15 @@ export function ActivityIndicator({
           mutedColor={theme.textDim}
         />
       )}
-      {planBar && (
+      {planTotal > 0 && (
         <Text>
           {"  "}
-          <Text color={planDone === planTotal ? theme.success : theme.planPrimary}>{planBar}</Text>
+          <ShimmerText
+            text={PLAN_LABEL}
+            color={thinkingShimmerColor}
+            brightColor={thinkingShimmerColor}
+            shimmerPos={planShimmerPos}
+          />
           <Text color={theme.textDim}>
             {" "}
             {planDone}/{planTotal}

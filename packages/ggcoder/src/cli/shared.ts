@@ -1,19 +1,51 @@
-import { createRequire } from "node:module";
 import { execFile } from "node:child_process";
+import { readFileSync } from "node:fs";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 import chalk from "chalk";
 import type { Provider } from "@kenkaiiii/gg-ai";
 
-const _require = createRequire(import.meta.url);
-// This module lives one directory deeper than cli.ts (src/cli/ → dist/cli/),
-// so the package manifest is two levels up rather than one.
-export const CLI_VERSION = (_require("../../package.json") as { version: string }).version;
+// Resolve the package version by walking up from this module to the nearest
+// package.json. A bare `require("../../package.json")` breaks when this module
+// is re-bundled into a sibling package (e.g. gg-boss), where the relative path
+// no longer points at ggcoder's manifest — so it crashes the CLI. Walking up
+// from import.meta.url always finds a valid manifest and never throws.
+function resolveCliVersion(): string {
+  let dir = dirname(fileURLToPath(import.meta.url));
+  for (let i = 0; i < 6; i++) {
+    try {
+      const manifest = JSON.parse(readFileSync(join(dir, "package.json"), "utf8")) as {
+        version?: string;
+      };
+      if (manifest.version) return manifest.version;
+    } catch {
+      // no package.json at this level — keep walking up
+    }
+    const parent = dirname(dir);
+    if (parent === dir) break;
+    dir = parent;
+  }
+  return "0.0.0";
+}
 
-// ── Logo + gradient (mirrors Banner.tsx) ────────────────────────────
+export const CLI_VERSION = resolveCliVersion();
+
+// ── Logo + gradient (mirrors terminal-history.ts banner) ────────────
 export const LOGO_LINES = [
-  " \u2584\u2580\u2580\u2580 \u2584\u2580\u2580\u2580",
-  " \u2588 \u2580\u2588 \u2588 \u2580\u2588",
-  " \u2580\u2584\u2584\u2580 \u2580\u2584\u2584\u2580",
+  " \u2588\u2588\u2588\u2588\u2588\u2588\u2557  \u2588\u2588\u2588\u2588\u2588\u2588\u2557 ",
+  "\u2588\u2588\u2554\u2550\u2550\u2550\u2550\u255d \u2588\u2588\u2554\u2550\u2550\u2550\u2550\u255d ",
+  "\u2588\u2588\u2551  \u2588\u2588\u2588\u2557\u2588\u2588\u2551  \u2588\u2588\u2588\u2557",
+  "\u2588\u2588\u2551   \u2588\u2588\u2551\u2588\u2588\u2551   \u2588\u2588\u2551",
+  "\u255a\u2588\u2588\u2588\u2588\u2588\u2588\u2554\u255d\u255a\u2588\u2588\u2588\u2588\u2588\u2588\u2554\u255d",
+  " \u255a\u2550\u2550\u2550\u2550\u2550\u255d  \u255a\u2550\u2550\u2550\u2550\u2550\u255d",
 ];
+
+// Visible width of the logo block (glyph columns) and the gap before titles.
+export const LOGO_WIDTH = 17;
+export const LOGO_GAP = "   ";
+// Row index in the logo block where the title lines begin, so a 3-line title
+// block reads vertically centered beside the 6-line art.
+export const LOGO_TITLE_ANCHOR_ROW = 1;
 
 const GRADIENT = [
   "#60a5fa",
@@ -30,18 +62,43 @@ const GRADIENT = [
   "#6da1f9",
 ];
 
-export function gradientLine(text: string): string {
+export function gradientLineWith(text: string, gradient: readonly string[]): string {
+  const palette = gradient.length > 0 ? gradient : GRADIENT;
   let result = "";
   let colorIdx = 0;
   for (const ch of text) {
     if (ch === " ") {
       result += ch;
     } else {
-      result += chalk.hex(GRADIENT[colorIdx % GRADIENT.length])(ch);
+      const color = palette[colorIdx % palette.length] ?? palette[0] ?? "#60a5fa";
+      result += chalk.hex(color)(ch);
       colorIdx++;
     }
   }
   return result;
+}
+
+export function gradientLine(text: string): string {
+  return gradientLineWith(text, GRADIENT);
+}
+
+/**
+ * Render the GG logo with up to three title lines placed beside the
+ * vertically-centered rows of the (6-line) art. Returns one string per output
+ * row. `titleLines` are already-colored strings (brand, page name, subtitle).
+ */
+export function renderLogoBlock(
+  titleLines: readonly string[],
+  options?: { gradient?: readonly string[] },
+): string[] {
+  const gradient = options?.gradient ?? GRADIENT;
+  return LOGO_LINES.map((line, i) => {
+    const logo = gradientLineWith(line, gradient);
+    const titleIndex = i - LOGO_TITLE_ANCHOR_ROW;
+    const title =
+      titleIndex >= 0 && titleIndex < titleLines.length ? titleLines[titleIndex] : undefined;
+    return title === undefined ? logo : `${logo}${LOGO_GAP}${title}`;
+  });
 }
 
 export function clearVisibleScreen(): void {

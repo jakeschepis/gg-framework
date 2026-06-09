@@ -8,11 +8,25 @@ A modular TypeScript framework for building LLM-powered apps — from raw stream
 |---|---|---|
 | `packages/gg-ai` | `@kenkaiiii/gg-ai` | Unified LLM streaming API |
 | `packages/gg-agent` | `@kenkaiiii/gg-agent` | Agent loop with tool execution |
+| `packages/gg-core` | `@kenkaiiii/gg-core` | Provider-agnostic, UI-free shared foundation: model registry, thinking levels, app paths, OAuth + auth storage, file-writer logger core, telegram + voice transcription, self-updater |
 | `packages/ggcoder` | `@kenkaiiii/ggcoder` | CLI coding agent |
 | `packages/gg-pixel` | `@kenkaiiii/gg-pixel` | Universal error tracking SDK (Node + Browser + Deno + Workers) |
 | `packages/gg-pixel-server` | (private — Cloudflare Worker) | Ingest backend (Workers + D1) |
 
 **Install**: `npm i -g @kenkaiiii/ggcoder`
+
+## Models & Multimodal
+
+The MiniMax provider defaults to **MiniMax M3** (1M context, image + video). Video-capable
+models are Gemini 3.x, Kimi K2.6, MiniMax M3, and Xiaomi **MiMo-V2.5** (the omnimodal model;
+the coding-focused MiMo-V2.5-Pro is text-only) — these accept native video blocks (gg-ai's
+`VideoContent`). MiMo-V2.5 rides the OpenAI-compatible transport: video/image are sent as
+base64 data URLs (`video_url`/`image_url`), and its base64 payload cap is 50 MB (so the
+registry's `maxVideoBytes` is ~36 MB raw to stay under it after base64 inflation). Video
+attachments are supported in the chat input (drag, paste, or type a path);
+for non-video models the video is saved to a temp file and the model is told to inspect it with
+ffmpeg/its tools (mirrors the GLM image fallback). The `supportsVideo` capability flag lives in
+`packages/ggcoder/src/core/model-registry.ts`.
 
 ## Project Structure
 
@@ -54,7 +68,23 @@ packages/
 
 ## Package Dependencies
 
-`@kenkaiiii/gg-ai` (standalone) → `@kenkaiiii/gg-agent` (depends on ai) → `@kenkaiiii/ggcoder` (depends on both)
+```
+gg-ai → gg-agent → gg-core → { ggcoder, gg-boss, gg-editor, gg-voice }
+```
+
+- `@kenkaiiii/gg-ai` — standalone unified streaming API. Owns raw provider wording (`formatError`, `isHardBillingMessage`, `classifyProviderError`).
+- `@kenkaiiii/gg-agent` — agent loop; depends on gg-ai.
+- `@kenkaiiii/gg-core` — provider-agnostic, **UI-free** shared foundation; depends only on gg-ai (for `Provider` / `ThinkingLevel` types). Must NOT import gg-agent or React/Ink — it sits below every app. (The logger's `attachToEventBus` bridge, which needs the gg-agent `EventBus` type, stays in the apps; only the pure file-writer logger core lives in gg-core.)
+- Apps (ggcoder, gg-boss, gg-editor, gg-voice) keep only **UI + orchestration** and depend on gg-core.
+
+### One home for provider-coupled code
+
+Anything coupled to provider behavior — model registry, context windows, thinking
+levels, app paths, auth/OAuth — has exactly **one home in gg-core**. Raw provider
+error *wording* lives in **gg-ai** (`classifyProviderError`, `isHardBillingMessage`).
+Fix a model entry or an error string once and ggcoder, gg-boss, gg-editor, and
+gg-voice all inherit it on their next build. Do not re-add per-app copies; import
+from `@kenkaiiii/gg-core` (or `@kenkaiiii/gg-ai`) instead.
 
 ## Tech Stack
 
@@ -80,27 +110,33 @@ pnpm --filter @kenkaiiii/gg-agent build
 pnpm --filter @kenkaiiii/ggcoder build
 ```
 
-## Publishing to npm
+## Publishing to npm (Changesets)
 
-Must use `pnpm publish` (not `npm publish`) so `workspace:*` references resolve to real versions.
+Versioning + publishing is managed by [Changesets](https://github.com/changesets/changesets).
+Manual multi-package version bumping is gone — do **not** hand-edit `version` fields.
 
-### Steps
+The framework spine — `@kenkaiiii/gg-ai`, `@kenkaiiii/gg-agent`, `@kenkaiiii/gg-core`,
+`@kenkaiiii/ggcoder`, `@kenkaiiii/gg-boss` — is a **fixed group** in
+`.changeset/config.json`: a changeset touching any one bumps them all to the same
+version together (this is what kept drifting before). Dependents like gg-editor /
+gg-voice get an automatic patch bump.
 
-1. Bump version in all 3 `package.json` files (keep them in sync)
-2. Build all packages: `pnpm build`
-3. Publish in dependency order:
+### Flow
 
 ```bash
-pnpm --filter @kenkaiiii/gg-ai publish --no-git-checks
-pnpm --filter @kenkaiiii/gg-agent publish --no-git-checks
-pnpm --filter @kenkaiiii/ggcoder publish --no-git-checks
+pnpm changeset            # describe the change; pick bump level (patch/minor/major)
+pnpm changeset version    # apply bumps + update internal deps + write changelogs
+pnpm build                # rebuild with the new versions
+pnpm changeset publish    # publishes in topological order (uses pnpm under the hood)
 ```
+
+`pnpm changeset status` shows the pending release graph at any time.
 
 ### Auth
 
 - npm granular access token must be set: `npm set //registry.npmjs.org/:_authToken=<token>`
-- All packages use `"publishConfig": { "access": "public" }` (required for scoped packages)
-- `--no-git-checks` skips git dirty/tag checks (needed since we don't tag releases)
+- `access: public` is set in `.changeset/config.json` (and each package's `publishConfig`), required for scoped packages.
+- `workspace:*` references resolve to real versions at publish time because changesets publishes via pnpm.
 
 ### Verify
 
@@ -118,7 +154,8 @@ If `npm i` gets ETARGET after publishing, clear cache: `npm cache clean --force`
 - Providers → `providers/` directory in @kenkaiiii/gg-ai
 - Tools → `tools/` directory in @kenkaiiii/ggcoder, one file per tool
 - UI components → `ui/components/`, one component per file
-- OAuth flows → `core/oauth/`, one file per provider
+- OAuth flows, auth storage, model registry, app paths, logger core → `@kenkaiiii/gg-core` (`packages/gg-core/src/`), one file per provider under `oauth/`. ggcoder keeps thin re-export shims at `core/oauth/*`, `core/auth-storage.ts`, etc. so existing relative imports + subpath exports (`@kenkaiiii/ggcoder/auth`, `/models`) keep resolving.
+- Provider error classification → `@kenkaiiii/gg-ai` (`classifyProviderError` in `error-classification.ts`).
 - Tests → co-located with source files
 
 ## Code Quality

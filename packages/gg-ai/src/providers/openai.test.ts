@@ -5,8 +5,34 @@ import { streamOpenAI } from "./openai.js";
 
 const createMock = vi.fn();
 
+interface APIErrorArgs {
+  status?: number;
+  code?: string;
+  type?: string;
+  headers?: Record<string, string>;
+  message?: string;
+  error?: unknown;
+}
+
 vi.mock("openai", () => {
+  class APIError extends Error {
+    status: number | undefined;
+    code: string | undefined;
+    type: string | undefined;
+    headers: Headers | undefined;
+    error: unknown;
+    constructor(args: APIErrorArgs) {
+      super(args.message ?? "api error");
+      this.name = "APIError";
+      this.status = args.status;
+      this.code = args.code;
+      this.type = args.type;
+      this.headers = args.headers ? new Headers(args.headers) : undefined;
+      this.error = args.error ?? { message: args.message };
+    }
+  }
   class OpenAIMock {
+    static APIError = APIError;
     chat = {
       completions: {
         create: createMock,
@@ -15,6 +41,12 @@ vi.mock("openai", () => {
   }
   return { default: OpenAIMock };
 });
+
+async function makeApiError(args: APIErrorArgs): Promise<Error> {
+  const { default: OpenAI } = await import("openai");
+  const Ctor = (OpenAI as unknown as { APIError: new (a: APIErrorArgs) => Error }).APIError;
+  return new Ctor(args);
+}
 
 function createStreamingResult(argsJson: string): AsyncIterable<OpenAI.ChatCompletionChunk> {
   return (async function* () {
@@ -175,5 +207,119 @@ describe("streamOpenAI tool argument parsing", () => {
         args: { command: "echo ok" },
       },
     ]);
+  });
+});
+
+describe("streamOpenAI hard/transient limit classification", () => {
+  afterEach(() => {
+    createMock.mockReset();
+  });
+
+  function streamWithError(provider: Provider, err: unknown) {
+    createMock.mockRejectedValueOnce(err);
+    return streamOpenAI({
+      provider,
+      model: "test-model",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "token",
+    });
+  }
+
+  function streamWithIteratorError(provider: Provider, err: unknown) {
+    createMock.mockResolvedValueOnce({
+      [Symbol.asyncIterator](): AsyncIterator<OpenAI.ChatCompletionChunk> {
+        return {
+          async next(): Promise<IteratorResult<OpenAI.ChatCompletionChunk>> {
+            throw err;
+          },
+        };
+      },
+    });
+    return streamOpenAI({
+      provider,
+      model: "test-model",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "token",
+    });
+  }
+
+  it("stamps DeepSeek 402 Insufficient Balance as a usage limit", async () => {
+    const err = await makeApiError({ status: 402, message: "Insufficient Balance" });
+    const result = streamWithError("deepseek", err);
+    await expect(result.response).rejects.toThrow(/usage limit reached/i);
+  });
+
+  it("stamps OpenRouter 402 requires-more-credits as a usage limit", async () => {
+    const err = await makeApiError({
+      status: 402,
+      message: "This request requires more credits, or fewer max_tokens.",
+    });
+    const result = streamWithError("openrouter", err);
+    await expect(result.response).rejects.toThrow(/usage limit reached/i);
+  });
+
+  it("stamps OpenAI insufficient_quota 429 as a usage limit", async () => {
+    const err = await makeApiError({
+      status: 429,
+      type: "insufficient_quota",
+      message: "You exceeded your current quota, please check your plan and billing details.",
+    });
+    const result = streamWithError("openai", err);
+    await expect(result.response).rejects.toThrow(/usage limit reached/i);
+  });
+
+  it("normalizes OpenAI-compatible errors thrown while consuming the stream", async () => {
+    const err = await makeApiError({
+      status: 429,
+      type: "insufficient_quota",
+      message: "You exceeded your current quota, please check your plan and billing details.",
+    });
+    const result = streamWithIteratorError("openai", err);
+    await expect(result.response).rejects.toMatchObject({
+      provider: "openai",
+      statusCode: 429,
+    });
+    await expect(result.response).rejects.toThrow(/usage limit reached/i);
+  });
+
+  it("keeps a plain 429 retriable and stamps resetsAt from Retry-After", async () => {
+    const now = Math.floor(Date.now() / 1000);
+    const err = await makeApiError({
+      status: 429,
+      type: "rate_limit_exceeded",
+      message: "Rate limit reached for requests",
+      headers: { "retry-after": "30" },
+    });
+    const result = streamWithError("openai", err);
+    await result.response.then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (caught: unknown) => {
+        const e = caught as Error & { resetsAt?: number };
+        expect(e.message).not.toMatch(/usage limit reached/i);
+        expect(e.resetsAt).toBeGreaterThanOrEqual(now + 29);
+        expect(e.resetsAt).toBeLessThanOrEqual(now + 32);
+      },
+    );
+  });
+
+  it("keeps a 429 rate_limit_exceeded with no Retry-After retriable and unstamped", async () => {
+    const err = await makeApiError({
+      status: 429,
+      type: "rate_limit_exceeded",
+      message: "Rate limit reached for requests",
+    });
+    const result = streamWithError("glm", err);
+    await result.response.then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (caught: unknown) => {
+        const e = caught as Error & { resetsAt?: number };
+        expect(e.message).not.toMatch(/usage limit reached/i);
+        expect(e.resetsAt).toBeUndefined();
+      },
+    );
   });
 });

@@ -1,0 +1,55 @@
+{
+  "name": "@kenkaiiii/gg-core",
+  "version": "4.7.0",
+  "type": "module",
+  "description": "Provider-agnostic, UI-free shared foundation: model registry, auth, paths, telegram, voice",
+  "license": "MIT",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/kenkaiiii/gg-framework.git",
+    "directory": "packages/gg-core"
+  },
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "require": "./dist/index.cjs"
+    },
+    "./models": {
+      "types": "./dist/model-registry.d.ts",
+      "import": "./dist/model-registry.js",
+      "require": "./dist/model-registry.cjs"
+    },
+    "./paths": {
+      "types": "./dist/paths.d.ts",
+      "import": "./dist/paths.js",
+      "require": "./dist/paths.cjs"
+    }
+  },
+  "main": "./dist/index.cjs",
+  "module": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "files": [
+    "dist"
+  ],
+  "scripts": {
+    "build": "tsup",
+    "check": "tsc --noEmit",
+    "test": "vitest run"
+  },
+  "dependencies": {
+    "@kenkaiiii/gg-ai": "workspace:*"
+  },
+  "optionalDependencies": {
+    "@huggingface/transformers": "^3.6.0",
+    "ogg-opus-decoder": "^1.6.13"
+  },
+  "devDependencies": {
+    "@types/node": "^25.6.0",
+    "typescript": "^6.0.3",
+    "vitest": "^4.1.4"
+  },
+  "publishConfig": {
+    "access": "public"
+  }
+}

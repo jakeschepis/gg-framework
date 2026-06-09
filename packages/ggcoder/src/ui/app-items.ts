@@ -15,6 +15,7 @@ export interface UserItem {
   kind: "user";
   text: string;
   imageCount?: number;
+  videoCount?: number;
   pasteInfo?: PasteInfo;
   /** Inline previews for attached images, rendered after the user row. */
   imagePreviews?: ImagePreview[];
@@ -151,6 +152,7 @@ export interface QueuedItem {
   kind: "queued";
   text: string;
   imageCount?: number;
+  videoCount?: number;
   id: string;
 }
 
@@ -281,10 +283,19 @@ export interface ToolGroupItem {
  * overflow, and persistence logic is unchanged) but render to nothing in the
  * transcript — the panel above the activity bar is now their sole display.
  *
- * Server tools and sub-agent groups are intentionally excluded: they keep their
- * own richer transcript rows.
+ * Client tools (tool_*) and server tools (server_tool_*, e.g. Anthropic's
+ * native web_search) both feed the panel so search/fetch looks identical across
+ * providers. Sub-agent groups are intentionally excluded: their multi-line tree
+ * carries nested activity the single-row panel can't represent, so they keep
+ * their own richer transcript row.
  */
-const PANEL_REPLACED_TOOL_KINDS = new Set<string>(["tool_start", "tool_done", "tool_group"]);
+const PANEL_REPLACED_TOOL_KINDS = new Set<string>([
+  "tool_start",
+  "tool_done",
+  "tool_group",
+  "server_tool_start",
+  "server_tool_done",
+]);
 
 /**
  * True when an item's transcript row is replaced by the LiveToolPanel.

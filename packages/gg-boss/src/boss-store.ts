@@ -110,7 +110,7 @@ function isToolCall(p: ContentPart): p is ToolCall {
 }
 
 function userMessageText(
-  content: string | ({ type: "text"; text: string } | { type: "image" })[],
+  content: string | ({ type: "text"; text: string } | { type: "image" } | { type: "video" })[],
 ): string {
   if (typeof content === "string") return content;
   return content

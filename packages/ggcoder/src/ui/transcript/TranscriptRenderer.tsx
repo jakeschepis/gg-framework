@@ -105,6 +105,7 @@ export function renderTranscriptItem({
           key={item.id}
           text={item.text}
           imageCount={item.imageCount}
+          videoCount={item.videoCount}
           pasteInfo={item.pasteInfo}
         />,
       );
@@ -142,18 +143,19 @@ export function renderTranscriptItem({
     case "tool_start":
     case "tool_done":
     case "tool_group":
-      // Tool activity now lives in the pinned LiveToolPanel above the activity
-      // bar — suppress the in-transcript rows so they aren't shown twice.
-      // Image-bearing results (read/screenshot) are the exception: they keep
-      // their row so the inline preview still renders. Mirrors the scrollback
-      // printer + fullscreen viewport, which use the same predicate.
+    case "server_tool_start":
+    case "server_tool_done":
+      // Client and server tool activity now lives in the pinned LiveToolPanel
+      // above the activity bar — suppress the in-transcript rows so they aren't
+      // shown twice. Image-bearing results (read/screenshot) are the exception:
+      // they keep their row so the inline preview still renders. Mirrors the
+      // scrollback printer + fullscreen viewport, which use the same predicate.
       if (isPanelReplacedToolItem(item)) return null;
       if (item.kind === "tool_start") return withTranscriptSpacing(<ToolStartRow item={item} />);
       if (item.kind === "tool_done") return withTranscriptSpacing(<ToolDoneRow item={item} />);
-      return withTranscriptSpacing(<ToolGroupRow item={item} />);
-    case "server_tool_start":
-      return withTranscriptSpacing(<ServerToolStartRow item={item} />);
-    case "server_tool_done":
+      if (item.kind === "tool_group") return withTranscriptSpacing(<ToolGroupRow item={item} />);
+      if (item.kind === "server_tool_start")
+        return withTranscriptSpacing(<ServerToolStartRow item={item} />);
       return withTranscriptSpacing(<ServerToolDoneRow item={item} />);
     case "error":
       return withTranscriptSpacing(<ErrorRow item={item} />);
