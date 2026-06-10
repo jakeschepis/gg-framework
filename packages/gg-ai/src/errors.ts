@@ -210,10 +210,36 @@ function formatResetTime(resetsAt: number): string {
       });
 }
 
+/**
+ * Anthropic's Claude Mythos models are invitation-only (Project Glasswing) —
+ * unapproved accounts get a bare `not_found_error` from the API. Detect that
+ * case so we can explain the access model instead of echoing the raw error.
+ */
+function isMythosAccessError(message: string): boolean {
+  const lower = message.toLowerCase();
+  return (
+    lower.includes("mythos") &&
+    (lower.includes("not_found") || lower.includes("not found") || lower.includes("no access"))
+  );
+}
+
 export function formatError(err: unknown): FormattedError {
   if (err instanceof ProviderError) {
     const name = providerDisplayName(err.provider);
     const cleanMessage = cleanProviderMessage(err.message);
+    if (isMythosAccessError(cleanMessage)) {
+      return {
+        headline: "Claude Mythos 5 is invitation-only.",
+        source: "provider",
+        message:
+          "Your Anthropic account isn't approved for Project Glasswing, so the API reports the model as not found.",
+        provider: err.provider,
+        statusCode: err.statusCode,
+        ...(err.requestId ? { requestId: err.requestId } : {}),
+        guidance:
+          "Request access via your Anthropic account team (see platform.claude.com/docs/en/about-claude/models/overview), or switch to claude-fable-5 with /model — same underlying model, generally available.",
+      };
+    }
     if (isUsageLimitError(err)) {
       const resetClause = err.resetsAt ? ` It resets at ${formatResetTime(err.resetsAt)}.` : "";
       return {

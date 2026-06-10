@@ -33,7 +33,8 @@ export interface ModelInfo {
    * enabled to pick the strongest setting per model:
    *   - OpenAI GPT-5.5-era: `xhigh`
    *   - OpenAI Pro/Codex/old: clamped to what the model accepts
-   *   - Claude Opus 4.8 / 4.7 / 4.6 and Sonnet 4.6: `max`
+   *   - Claude Fable 5 / Mythos 5, Opus 4.8 / 4.7 / 4.6 and Sonnet 4.6: `max`
+   *     (Fable 5 / Mythos 5 use always-on adaptive thinking, low→max ladder)
    *   - Claude Haiku 4.5: `high` (no adaptive `max` tier)
    *   - GLM / Moonshot / Xiaomi / MiniMax / Qwen: `high` — binary-thinking
    *     providers ignore the level on the wire, so the value is cosmetic
@@ -46,6 +47,33 @@ export interface ModelInfo {
 // /model selector and login selector sort models identically.
 export const MODELS: ModelInfo[] = [
   // ── Anthropic ──────────────────────────────────────────
+  {
+    id: "claude-fable-5",
+    name: "Claude Fable 5",
+    provider: "anthropic",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    supportsThinking: true,
+    supportsImages: true,
+    supportsVideo: false,
+    costTier: "high",
+    maxThinkingLevel: "max",
+  },
+  {
+    // Mythos-class model offered through Project Glasswing (limited
+    // availability, invitation-only). Same underlying model as Fable 5 with
+    // some safeguards lifted; kept here so approved accounts can select it.
+    id: "claude-mythos-5",
+    name: "Claude Mythos 5",
+    provider: "anthropic",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    supportsThinking: true,
+    supportsImages: true,
+    supportsVideo: false,
+    costTier: "high",
+    maxThinkingLevel: "max",
+  },
   {
     id: "claude-opus-4-8",
     name: "Claude Opus 4.8",

@@ -55,6 +55,31 @@ describe("formatError usage limit", () => {
   });
 });
 
+describe("formatError Mythos access", () => {
+  it("explains invite-only access for a Mythos not_found_error", () => {
+    const formatted = formatError(
+      new ProviderError("anthropic", "not_found_error: model: claude-mythos-5", {
+        statusCode: 404,
+      }),
+    );
+    expect(formatted.headline).toBe("Claude Mythos 5 is invitation-only.");
+    expect(formatted.message).toContain("Project Glasswing");
+    expect(formatted.guidance).toContain(
+      "platform.claude.com/docs/en/about-claude/models/overview",
+    );
+    expect(formatted.guidance).toContain("claude-fable-5");
+  });
+
+  it("does not hijack not_found errors for other models", () => {
+    const formatted = formatError(
+      new ProviderError("anthropic", "not_found_error: model: claude-opus-9", {
+        statusCode: 404,
+      }),
+    );
+    expect(formatted.headline).toBe("Anthropic returned an error.");
+  });
+});
+
 describe("VideoUnsupportedError", () => {
   it("formats as a clean capability error naming video-capable models", () => {
     const f = formatError(new VideoUnsupportedError());

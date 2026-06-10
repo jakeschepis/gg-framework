@@ -1,4 +1,4 @@
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import stringWidth from "string-width";
 import {
   createTerminalHistoryPrinter,
@@ -6,6 +6,14 @@ import {
 } from "./terminal-history.js";
 import type { CompletedItem } from "./app-items.js";
 import { loadTheme } from "./theme/theme.js";
+import type * as figures from "./constants/figures.js";
+
+// BLACK_CIRCLE is platform-dependent (⏺ on macOS, ● elsewhere); pin it so
+// the hardcoded frame expectations pass on Linux/Windows CI too.
+vi.mock("./constants/figures.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof figures>()),
+  BLACK_CIRCLE: "\u23FA",
+}));
 
 const context = {
   theme: loadTheme("dark"),
@@ -573,8 +581,9 @@ describe("terminal history", () => {
       printer.print([item], context);
 
       expect(stripAnsi(output)).toContain("Read shot.png");
-      // kitty APC graphics sequence with the base64 payload.
-      expect(output).toContain("\u001b_Gf=100,a=T,m=0;QUJD\u001b\\");
+      // kitty APC graphics sequence with the base64 payload, height-constrained
+      // (r=…) with cursor ownership kept by the printer (C=1).
+      expect(output).toContain("\u001b_Gf=100,a=T,r=12,C=1,m=0;QUJD\u001b\\");
     } finally {
       if (prevKitty === undefined) delete process.env.KITTY_WINDOW_ID;
       else process.env.KITTY_WINDOW_ID = prevKitty;

@@ -42,6 +42,8 @@ interface FooterProps {
 
 // Model ID → short display name
 const MODEL_SHORT_NAMES: Record<string, string> = {
+  "claude-fable-5": "Fable",
+  "claude-mythos-5": "Mythos",
   "claude-opus-4-8": "Opus",
   "claude-sonnet-4-6": "Sonnet",
   "claude-haiku-4-5": "Haiku",

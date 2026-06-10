@@ -298,14 +298,52 @@ export function renderMarkdownToAnsiLines({
           renderInlineMarkdownToAnsi(stripUnsafeCharacters(cell), theme, theme.text),
         ),
       );
-      addLines(
-        renderAnsiTable({ headers: styledHeaders, rows: styledRows, terminalWidth: width, theme }),
-      );
+      const tableLines = renderAnsiTable({
+        headers: styledHeaders,
+        rows: styledRows,
+        terminalWidth: width,
+        theme,
+      });
+      // While streaming, a tall in-progress table must not overflow the live
+      // region: Ink can't erase rows that scroll past the terminal top, which
+      // strands stale lines in scrollback. Mirror addCodeBlock's clamp.
+      if (isPending && availableTerminalHeight !== undefined) {
+        const reservedLines = 2;
+        const maxTableLinesWhenPending = Math.max(0, availableTerminalHeight - reservedLines);
+        if (tableLines.length > maxTableLinesWhenPending) {
+          if (maxTableLinesWhenPending < 1) {
+            addLines([colorize("... table is being written ...", theme.textMuted)]);
+          } else {
+            addLines(tableLines.slice(0, maxTableLinesWhenPending));
+            addLines([colorize("... generating more ...", theme.textMuted)]);
+          }
+          inTable = false;
+          tableRows = [];
+          tableHeaders = [];
+          return;
+        }
+      }
+      addLines(tableLines);
     }
     inTable = false;
     tableRows = [];
     tableHeaders = [];
   };
+
+  // While streaming, trailing `|`-prefixed lines are an in-progress table tail
+  // (a partial row, or a header whose separator hasn't arrived). Rendering them
+  // raw flushes the half-built table and dumps pipe soup on every chunk — hold
+  // them back until they complete.
+  let pendingTableTailStart = lines.length;
+  if (isPending) {
+    while (
+      pendingTableTailStart > 0 &&
+      /^\s*\|/.test(lines[pendingTableTailStart - 1] ?? "") &&
+      lines.length - pendingTableTailStart < 2
+    ) {
+      pendingTableTailStart -= 1;
+    }
+  }
 
   lines.forEach((line, index) => {
     if (inCodeBlock) {
@@ -343,7 +381,7 @@ export function renderMarkdownToAnsiLines({
         inTable = true;
         tableHeaders = tableRowMatch[1]?.split("|").map((cell) => cell.trim()) ?? [];
         tableRows = [];
-      } else {
+      } else if (index < pendingTableTailStart) {
         addInlineLine(line);
       }
     } else if (inTable && tableSeparatorMatch) {
@@ -354,6 +392,11 @@ export function renderMarkdownToAnsiLines({
       if (cells.length > tableHeaders.length) cells.length = tableHeaders.length;
       tableRows.push(cells);
     } else if (inTable && !tableRowMatch) {
+      if (index >= pendingTableTailStart) {
+        // Partial row of the streaming table — keep the table open and drop
+        // the incomplete line; the next chunk completes it.
+        return;
+      }
       flushTable();
       if (line.trim().length > 0) addInlineLine(line);
     } else if (hrMatch) {
@@ -388,7 +431,7 @@ export function renderMarkdownToAnsiLines({
         output.push(EMPTY_RENDER_LINE);
         lastLineEmpty = true;
       }
-    } else {
+    } else if (index < pendingTableTailStart) {
       addInlineLine(line);
     }
   });

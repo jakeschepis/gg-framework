@@ -66,4 +66,20 @@ describe("estimateRenderedRows", () => {
   it("is resilient to non-positive column counts", () => {
     expect(estimateRenderedRows("abc", 0)).toBe(3);
   });
+
+  it("over-counts markdown table lines to flush before the live region overflows", () => {
+    const table = "| a | b |\n|---|---|\n| one | two |\n| three | four |";
+    const plain = "a b\nx y\none two\nthree four";
+    // Same raw line count, but the table must estimate strictly taller — the
+    // box-drawing renderer adds borders and cell wrapping.
+    expect(estimateRenderedRows(table, 80)).toBeGreaterThan(estimateRenderedRows(plain, 80));
+    // Border overhead (3) + 4 doubled lines = 11 for this table.
+    expect(estimateRenderedRows(table, 80)).toBeGreaterThanOrEqual(11);
+  });
+
+  it("charges border overhead once per table block", () => {
+    const twoTables = "| a |\n|---|\n| b |\n\n| c |\n|---|\n| d |";
+    const oneTable = "| a |\n|---|\n| b |\n| c |\n| d |";
+    expect(estimateRenderedRows(twoTables, 80)).toBeGreaterThan(estimateRenderedRows(oneTable, 80));
+  });
 });

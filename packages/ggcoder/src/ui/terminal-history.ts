@@ -14,7 +14,7 @@ import { buildToolGroupSummary } from "./tool-group-summary.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { renderMarkdownToAnsiLines } from "./utils/markdown-renderer.js";
-import { detectGraphicsProtocol, encodeInlineImage } from "./utils/terminal-graphics.js";
+import { detectGraphicsProtocol, encodeInlineImageBlock } from "./utils/terminal-graphics.js";
 import { createHyperlink } from "./utils/hyperlink.js";
 import { supportsHyperlinks } from "./utils/supports-hyperlinks.js";
 import { shouldSeparateTranscriptItems } from "./transcript/spacing.js";
@@ -224,7 +224,12 @@ export function createTerminalHistoryPrinter({
           const canLink = supportsHyperlinks();
           for (const preview of previews) {
             if (protocol !== "none") {
-              writeOutput(`\n${imageLeftPad}${encodeInlineImage(preview.base64, protocol)}\n`);
+              // Fixed-height block whose newline count equals its visual rows —
+              // a raw escape (many rows, zero newlines) desyncs Ink's live-frame
+              // erase math and strands orphaned rows around the image.
+              writeOutput(
+                `\n${encodeInlineImageBlock(preview.base64, protocol, { leftPad: imageLeftPad })}\n`,
+              );
             }
             // Clickable "open" affordance — Cmd/Ctrl-click opens the file in the
             // OS default viewer. The pixels themselves aren't clickable, so the

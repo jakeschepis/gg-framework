@@ -1,6 +1,6 @@
 import React from "react";
 import { Box, render, renderToString } from "ink";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import stringWidth from "string-width";
 import stripAnsi from "strip-ansi";
 import { AssistantMessage } from "./AssistantMessage.js";
@@ -9,6 +9,14 @@ import { ToolExecution } from "./ToolExecution.js";
 import { ToolGroupExecution } from "./ToolGroupExecution.js";
 import { ServerToolExecution } from "./ServerToolExecution.js";
 import { TerminalSizeProvider } from "../hooks/useTerminalSize.js";
+import type * as figures from "../constants/figures.js";
+
+// BLACK_CIRCLE is platform-dependent (⏺ on macOS, ● elsewhere); pin it so
+// the hardcoded frame expectations pass on Linux/Windows CI too.
+vi.mock("../constants/figures.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof figures>()),
+  BLACK_CIRCLE: "\u23FA",
+}));
 import {
   createTerminalHistoryPrinter,
   serializeCompletedItemToTerminalHistory,

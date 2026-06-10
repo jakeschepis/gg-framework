@@ -1,5 +1,10 @@
 import { describe, expect, it } from "vitest";
-import { detectGraphicsProtocol, encodeInlineImage } from "./terminal-graphics.js";
+import {
+  detectGraphicsProtocol,
+  encodeInlineImage,
+  encodeInlineImageBlock,
+  INLINE_IMAGE_ROWS,
+} from "./terminal-graphics.js";
 
 describe("detectGraphicsProtocol", () => {
   it("detects iTerm2 and WezTerm as the iterm protocol", () => {
@@ -67,5 +72,49 @@ describe("encodeInlineImage", () => {
     const chunks = out.split("\u001b\\").filter((c) => c.length > 0);
     expect(chunks).toHaveLength(1);
     expect(chunks[0].startsWith("\u001b_Gf=100,a=T,m=0;")).toBe(true);
+  });
+
+  it("constrains image height in cells when rows is given", () => {
+    expect(encodeInlineImage(base64, "iterm", 12)).toContain(";height=12:");
+    const kitty = encodeInlineImage(base64, "kitty", 12);
+    expect(kitty).toContain("r=12");
+    // C=1: the caller owns cursor movement.
+    expect(kitty).toContain("C=1");
+  });
+});
+
+describe("encodeInlineImageBlock", () => {
+  const base64 = Buffer.from("image bytes").toString("base64");
+
+  it("returns empty for the none protocol or empty payload", () => {
+    expect(encodeInlineImageBlock(base64, "none")).toBe("");
+    expect(encodeInlineImageBlock("", "kitty")).toBe("");
+  });
+
+  it("contains exactly `rows` newlines so visual height matches line count", () => {
+    for (const protocol of ["iterm", "kitty"] as const) {
+      const out = encodeInlineImageBlock(base64, protocol, { rows: 8 });
+      expect(out.split("\n")).toHaveLength(9); // 8 newlines
+      const defaultOut = encodeInlineImageBlock(base64, protocol);
+      expect(defaultOut.split("\n")).toHaveLength(INLINE_IMAGE_ROWS + 1);
+    }
+  });
+
+  it("reserves rows first, then draws the height-constrained image into them", () => {
+    const out = encodeInlineImageBlock(base64, "iterm", { rows: 8, leftPad: "   " });
+    const newlinesEnd = out.lastIndexOf("\n") + 1;
+    // All newlines precede the cursor choreography — nothing after them scrolls.
+    expect(out.slice(0, newlinesEnd)).toBe("\n".repeat(8));
+    const tail = out.slice(newlinesEnd);
+    const save = tail.indexOf("\u001b7");
+    const up = tail.indexOf("\u001b[8A");
+    const image = tail.indexOf("\u001b]1337");
+    const restore = tail.indexOf("\u001b8");
+    expect(save).toBeGreaterThanOrEqual(0);
+    expect(up).toBeGreaterThan(save);
+    expect(image).toBeGreaterThan(up);
+    expect(restore).toBeGreaterThan(image);
+    expect(tail).toContain(";height=8:");
+    expect(tail).toContain("   \u001b]1337");
   });
 });

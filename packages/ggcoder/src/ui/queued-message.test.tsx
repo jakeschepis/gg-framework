@@ -1,6 +1,6 @@
 import React from "react";
 import { renderToString } from "ink";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import stripAnsi from "strip-ansi";
 import stringWidth from "string-width";
 import {
@@ -13,6 +13,14 @@ import { loadTheme, ThemeContext } from "./theme/theme.js";
 import { TerminalSizeProvider } from "./hooks/useTerminalSize.js";
 import type { Theme } from "./theme/theme.js";
 import { Text, Box } from "ink";
+import type * as figures from "./constants/figures.js";
+
+// BLACK_CIRCLE is platform-dependent (⏺ on macOS, ● elsewhere); pin it so
+// the hardcoded frame expectations pass on Linux/Windows CI too.
+vi.mock("./constants/figures.js", async (importOriginal) => ({
+  ...(await importOriginal<typeof figures>()),
+  BLACK_CIRCLE: "\u23FA",
+}));
 import { ChatLivePane } from "./components/ChatLivePane.js";
 import { AssistantMessage } from "./components/AssistantMessage.js";
 import { QueuedRow } from "./transcript/MiscRows.js";

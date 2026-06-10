@@ -3,6 +3,11 @@ export interface AssistantStreamSplit {
   remainingText: string;
 }
 
+const TABLE_LINE_PATTERN = /^\s*\|/;
+// A rendered box-drawing table adds a top border, header separator, and bottom
+// border beyond the raw markdown line count.
+const TABLE_BORDER_OVERHEAD = 3;
+
 /**
  * Estimate how many terminal rows `text` occupies when wrapped at `columns`.
  *
@@ -11,13 +16,29 @@ export interface AssistantStreamSplit {
  * about to overflow the live region. Over-counting slightly is fine — it just
  * flushes marginally earlier. Each newline-separated line wraps independently;
  * an empty line still occupies one row.
+ *
+ * Markdown table lines are counted at double height plus a fixed border
+ * overhead per table block: the box-drawing renderer adds borders and column
+ * padding wraps cells onto extra rows, so raw character math systematically
+ * UNDER-counts tables. Under-counting here delays the mid-stream flush until
+ * the live region has already overflowed the terminal, which strands
+ * unerasable rows in scrollback (orphaned ⏺ lines above the redrawn frame).
  */
 export function estimateRenderedRows(text: string, columns: number): number {
   if (text.length === 0) return 0;
   const width = Math.max(1, Math.floor(columns));
   let rows = 0;
+  let inTable = false;
   for (const line of text.split("\n")) {
-    rows += line.length === 0 ? 1 : Math.ceil(line.length / width);
+    const isTableLine = TABLE_LINE_PATTERN.test(line);
+    if (isTableLine && !inTable) {
+      inTable = true;
+      rows += TABLE_BORDER_OVERHEAD;
+    } else if (!isTableLine) {
+      inTable = false;
+    }
+    const lineRows = line.length === 0 ? 1 : Math.ceil(line.length / width);
+    rows += isTableLine ? lineRows * 2 : lineRows;
   }
   return rows;
 }

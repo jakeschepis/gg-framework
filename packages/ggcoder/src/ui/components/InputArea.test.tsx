@@ -27,11 +27,17 @@ vi.mock("./AnimationContext.js", () => ({
   useFocusedAnimation: () => ({ active: false, tick: 0 }),
 }));
 
-vi.mock("../../utils/image.js", () => ({
-  extractImagePaths: async () => ({ imagePaths: [], cleanText: "" }),
-  getClipboardImage: async () => null,
-  readImageFile: async () => ({ kind: "text", fileName: "unused", content: "" }),
-}));
+vi.mock("../../utils/image.js", () => {
+  const extractImagePaths = async () => ({ imagePaths: [], cleanText: "" });
+  const readImageFile = async () => ({ kind: "text", fileName: "unused", content: "" });
+  return {
+    extractImagePaths,
+    extractMediaPaths: extractImagePaths,
+    getClipboardImage: async () => null,
+    readImageFile,
+    readMediaFile: readImageFile,
+  };
+});
 
 function renderInputArea(onSubmit = vi.fn()) {
   inputHandlers.length = 0;

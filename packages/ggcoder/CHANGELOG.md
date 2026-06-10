@@ -1,5 +1,32 @@
 # @kenkaiiii/ggcoder
 
+## 4.8.2
+
+### Patch Changes
+
+- Fix TUI scrollback corruption from streaming markdown tables and inline images: table-aware live-region row estimation, pending-table height clamping and partial-row hold-back in the markdown renderer, and fixed-height inline image blocks so Ink's live-frame erase math stays in sync (no more orphaned ⏺ rows).
+  - @kenkaiiii/gg-ai@4.8.2
+  - @kenkaiiii/gg-agent@4.8.2
+  - @kenkaiiii/gg-core@4.8.2
+
+## 4.8.1
+
+### Patch Changes
+
+- Fix ENOSPC crash when session transcript writes fail (disk full) — persistence now fails soft with a one-time warning instead of killing the live session. Add automatic session transcript pruning via new `sessionRetentionDays` setting (default 30 days, 0 disables).
+  - @kenkaiiii/gg-ai@4.8.1
+  - @kenkaiiii/gg-agent@4.8.1
+  - @kenkaiiii/gg-core@4.8.1
+
+## 4.8.0
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/gg-ai@4.8.0
+  - @kenkaiiii/gg-core@4.8.0
+  - @kenkaiiii/gg-agent@4.8.0
+
 ## 4.7.0
 
 ### Minor Changes

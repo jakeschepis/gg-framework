@@ -543,13 +543,13 @@ export function toAnthropicToolChoice(choice: ToolChoice): Anthropic.ToolChoice 
 }
 
 /**
- * Anthropic models with built-in adaptive thinking (Opus 4.8/4.7/4.6,
- * Sonnet 4.6). Matches both dashed (`opus-4-8`) and dotted (`opus-4.8`) forms
- * so callers don't have to enumerate variants. These models don't need the
- * `interleaved-thinking` beta header — it's built in.
+ * Anthropic models with built-in adaptive thinking (Fable 5, Mythos 5,
+ * Opus 4.8/4.7/4.6, Sonnet 4.6). Matches both dashed (`opus-4-8`) and dotted
+ * (`opus-4.8`) forms so callers don't have to enumerate variants. These models
+ * don't need the `interleaved-thinking` beta header — it's built in.
  */
 export function isAdaptiveThinkingModel(model: string): boolean {
-  return /opus-4[-.]8|opus-4[-.]7|opus-4[-.]6|sonnet-4[-.]6/.test(model);
+  return /opus-4[-.]8|opus-4[-.]7|opus-4[-.]6|sonnet-4[-.]6|fable-5|mythos-5/.test(model);
 }
 
 export function toAnthropicThinking(
