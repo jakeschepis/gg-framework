@@ -1,5 +1,14 @@
 # @kenkaiiii/ggcoder
 
+## 4.8.3
+
+### Patch Changes
+
+- Fix oversized pinned assistant items being cut off in the live area: flush tall finalized items (cumulative over the pinned set) to scrollback, and keep the height-clamp slice from starting on a blank line so the ⏺ prefix stays aligned.
+  - @kenkaiiii/gg-ai@4.8.3
+  - @kenkaiiii/gg-agent@4.8.3
+  - @kenkaiiii/gg-core@4.8.3
+
 ## 4.8.2
 
 ### Patch Changes
