@@ -126,6 +126,28 @@ describe("checkAndAutoUpdate", () => {
     expect(state?.lastUpdateAttempt).toBeDefined();
   });
 
+  it("does NOT auto-update fork/dev builds even when an update is pending", () => {
+    // A locally-built plan-mode fork must never be overwritten by the engine's
+    // background `npm install -g @kenkaiiii/ggcoder@latest`.
+    writeStateFile({
+      lastCheckedAt: Date.now(),
+      latestVersion: "2.0.0",
+      updatePending: true,
+    });
+
+    // Isolate from any spawn calls leaked by earlier tests (the module-level
+    // vi.mock factory keeps call history across tests).
+    vi.mocked(spawn).mockClear();
+
+    const result = checkAndAutoUpdate("1.0.0-plan-mode.dev");
+
+    expect(result).toBeNull();
+    expect(vi.mocked(spawn)).not.toHaveBeenCalled();
+    // State is left untouched (guard short-circuits before any write).
+    const state = readStateFile();
+    expect(state?.updatePending).toBe(true);
+  });
+
   it("schedules background check when last check was long ago", async () => {
     const fetchMock = vi.fn().mockResolvedValue({
       json: () => Promise.resolve({ version: "5.0.0" }),
