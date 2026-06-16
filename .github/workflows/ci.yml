@@ -63,3 +63,61 @@ jobs:
       - name: ggboss CLI smoke (extra belt-and-braces)
         run: node packages/gg-boss/dist/cli.js --help
         shell: bash
+
+  # Distribution-critical cross-OS job: stages the per-platform Node runtime,
+  # bundles the sidecar, boots it with the bundled runtime (smoke), and runs the
+  # Rust unit tests that gate path/window-chrome resolution. The full
+  # `tauri build` lives in release.yml; this keeps CI fast while still
+  # exercising the per-OS spawn path that breaks installed bundles.
+  app:
+    name: app · ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22.x
+          cache: pnpm
+
+      - uses: dtolnay/rust-toolchain@stable
+
+      - name: Linux system deps (tauri)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libgtk-3-dev librsvg2-dev patchelf libayatana-appindicator3-dev
+
+      - name: Install
+        run: pnpm install --frozen-lockfile
+
+      - name: Build framework packages
+        run: |
+          pnpm --filter @kenkaiiii/gg-ai build
+          pnpm --filter @kenkaiiii/gg-agent build
+          pnpm --filter @kenkaiiii/ggcoder build
+
+      - name: Stage node runtime + bundle sidecar
+        run: |
+          pnpm --filter gg-app stage:node
+          pnpm --filter gg-app bundle:sidecar
+        shell: bash
+
+      - name: Sidecar smoke (bundled runtime + bundle, per-OS)
+        run: node gg-app/scripts/smoke-sidecar.mjs
+        shell: bash
+
+      - name: Frontend platform-class test
+        run: pnpm --filter gg-app test
+
+      - name: Rust unit tests (path + window-chrome resolution)
+        working-directory: gg-app/src-tauri
+        run: cargo test

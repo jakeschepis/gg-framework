@@ -8,7 +8,14 @@ export interface BusEventMap {
   thinking_delta: { text: string };
   tool_call_start: { toolCallId: string; name: string; args: Record<string, unknown> };
   tool_call_update: { toolCallId: string; update: unknown };
-  tool_call_end: { toolCallId: string; result: string; isError: boolean; durationMs: number };
+  tool_call_end: {
+    toolCallId: string;
+    result: string;
+    isError: boolean;
+    durationMs: number;
+    /** Tool-specific extras (e.g. screenshot/read image previews). */
+    details?: unknown;
+  };
   turn_end: {
     turn: number;
     stopReason: string;
@@ -28,6 +35,10 @@ export interface BusEventMap {
   // Server tool events
   server_tool_call: { id: string; name: string; input: unknown };
   server_tool_result: { toolUseId: string; resultType: string; data: unknown };
+
+  // Agent self-correction hooks (ideal review / loop-break / re-grounding).
+  // Carries only the semantic kind; the presentation layer owns text + color.
+  hook: { kind: "ideal" | "loop_break" | "regrounding" };
 
   // Session lifecycle
   session_start: { sessionId: string };
@@ -115,6 +126,7 @@ export class EventBus {
           result: event.result,
           isError: event.isError,
           durationMs: event.durationMs,
+          details: event.details,
         });
         break;
       case "turn_end":

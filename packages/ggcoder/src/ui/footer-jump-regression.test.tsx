@@ -100,15 +100,20 @@ function SimTui({
 
 type Phase = "idle" | "stream-short" | "stream-fill" | "done";
 
-function Driver({ phase }: { phase: Phase }) {
+function Driver({ phase, enqueueStdout }: { phase: Phase; enqueueStdout: (data: string) => void }) {
   const { write: writeStdout } = useStdout();
   const [history, setHistory] = useState<CompletedItem[]>([]);
   const [liveItems, setLiveItems] = useState<CompletedItem[]>([]);
   const committedRef = useRef(false);
+  // Stable printer across renders — mirrors renderApp, where one printer
+  // instance (and its printed-id dedup set) lives for the whole app lifetime.
+  const printerRef = useRef<ReturnType<typeof createTerminalHistoryPrinter> | null>(null);
+  printerRef.current ??= createTerminalHistoryPrinter();
   const { queueFlush } = useTranscriptHistory({
-    terminalHistoryPrinter: createTerminalHistoryPrinter(),
+    terminalHistoryPrinter: printerRef.current,
     terminalHistoryContext: terminalContext,
     writeStdout,
+    enqueueStdout,
     sessionPathRef: { current: undefined },
     sessionManagerRef: { current: null },
     history,
@@ -183,34 +188,54 @@ describe("footer jump reproduction", () => {
     const recorder = new ScreenRecorder({ columns: COLUMNS, rows: ROWS });
     const sink = { raw: "" };
     const stdout = makeSpyStdout(recorder, sink);
-    const frames: { label: string; lines: string[]; repaints: number }[] = [];
+    const frames: { label: string; lines: string[]; full: string; repaints: number }[] = [];
     let lastRawLen = 0;
     const capture = (label: string) => {
       const slice = sink.raw.slice(lastRawLen);
       lastRawLen = sink.raw.length;
-      frames.push({ label, lines: viewport(recorder), repaints: countFullRepaints(slice) });
+      frames.push({
+        label,
+        lines: viewport(recorder),
+        full: stripAnsi(recorder.fullText()),
+        repaints: countFullRepaints(slice),
+      });
     };
 
-    const mounted = render(<Driver phase="idle" />, {
+    // Mirrors renderApp's enqueueHistoryWrite: read the (patched) instance at
+    // call time, fall back to a raw write when the API is unavailable.
+    const instanceRef: { current: { insertBeforeFrame?: (data: string) => void } | null } = {
+      current: null,
+    };
+    const enqueueStdout = (data: string): void => {
+      if (instanceRef.current?.insertBeforeFrame) {
+        instanceRef.current.insertBeforeFrame(data);
+      } else {
+        stdout.write(data);
+      }
+    };
+
+    const mounted = render(<Driver phase="idle" enqueueStdout={enqueueStdout} />, {
       stdout,
       columns: COLUMNS,
       rows: ROWS,
       patchConsole: false,
       maxFps: 1000,
     });
+    instanceRef.current = mounted as unknown as { insertBeforeFrame?: (data: string) => void };
     await tick();
     capture("Z: idle (before first turn)");
 
-    mounted.rerender(<Driver phase="stream-short" />);
+    mounted.rerender(<Driver phase="stream-short" enqueueStdout={enqueueStdout} />);
     await tick();
     capture("A: short streaming");
 
-    mounted.rerender(<Driver phase="stream-fill" />);
+    mounted.rerender(<Driver phase="stream-fill" enqueueStdout={enqueueStdout} />);
     await tick();
     capture("B: streaming fills the screen");
 
-    mounted.rerender(<Driver phase="done" />);
+    mounted.rerender(<Driver phase="done" enqueueStdout={enqueueStdout} />);
     await tick();
+    capture("C1: done, first settle");
     await tick();
     capture("C: done + committed final response");
 
@@ -229,8 +254,35 @@ describe("footer jump reproduction", () => {
     // repaint (eraseScreen + cursorTo top), which is what visibly shoves the
     // footer. Some repaints are unavoidable during clamp engagement while
     // streaming, but committing the finalized response must not repaint.
-    const doneFrame = frames.find((f) => f.label.startsWith("C:"));
-    expect(doneFrame?.repaints, "done transition full-screen repaints").toBe(0);
+    for (const label of ["C1:", "C:"]) {
+      const doneFrame = frames.find((f) => f.label.startsWith(label));
+      expect(doneFrame?.repaints, `${label} done transition full-screen repaints`).toBe(0);
+    }
+
+    // THE STRAND: the footer's absolute row in the terminal buffer must never
+    // move UP across frames. Scrollback growth pushes it down; an upward move
+    // means a shrink-write landed without its compensating scrollback bytes —
+    // the footer gets stranded mid-screen with blank rows below it. (Measured
+    // in the cumulative buffer, not the viewport, so Ink's trailing-newline
+    // convention — omitted only for exactly-fullscreen frames — can't skew it.)
+    let previousFooterRow = -1;
+    for (const f of frames) {
+      const bufferLines = f.full.split("\n");
+      const footerRow = bufferLines.findIndex((line) => line.includes(FOOTER_BOTTOM));
+      expect(
+        footerRow,
+        `${f.label}: footer buffer row never decreases (was ${previousFooterRow})`,
+      ).toBeGreaterThanOrEqual(previousFooterRow);
+      previousFooterRow = footerRow;
+    }
+
+    // NO DUPLICATION: the flushed response must never be visible twice (once in
+    // scrollback AND still in the live frame). The atomic insert erases the
+    // live copy in the same write that adds the scrollback copy.
+    for (const f of frames) {
+      const occurrences = f.full.split("SIM_LINE_01").length - 1;
+      expect(occurrences, `${f.label}: flushed content not duplicated`).toBeLessThanOrEqual(1);
+    }
 
     // THE START JUMP: with the status slot reserved unconditionally and the
     // controls height held constant, starting the first turn (idle → first

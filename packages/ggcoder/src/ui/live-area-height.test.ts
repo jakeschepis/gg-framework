@@ -48,6 +48,16 @@ describe("estimateLiveAreaRows", () => {
     });
     expect(rows).toBe(19);
   });
+
+  it("does not count null-rendering inactive plan transitions", () => {
+    const rows = estimateLiveAreaRows({
+      liveItems: [{ kind: "plan_transition", active: false, text: "", id: "plan" }],
+      streamingText: "short final answer",
+      columns: COLUMNS,
+      perItemBudget: 18,
+    });
+    expect(rows).toBe(2);
+  });
 });
 
 describe("getLiveAreaClampRows", () => {

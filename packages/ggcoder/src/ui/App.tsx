@@ -84,7 +84,7 @@ import {
   flushOnTurnText,
   flushOnTurnEnd,
   flushOverflow,
-  countOversizedFlushItems,
+  splitOversizedPinnedItems,
 } from "./live-item-flush.js";
 import {
   splitAssistantStreamingText,
@@ -239,6 +239,22 @@ export interface AppProps {
     onExitPlan?: (planPath: string) => Promise<string>;
   };
   terminalHistoryPrinter?: TerminalHistoryPrinter;
+  /**
+   * Wired by `renderApp`. Queues raw bytes through the patched Ink
+   * `insertBeforeFrame` so finalized transcript rows are folded atomically
+   * into the next frame write (erase old frame + scrollback bytes + new frame
+   * in one synchronized write). This is what keeps the footer pinned when
+   * flushed rows leave the live frame. Falls back to a raw stdout write when
+   * the patched API is unavailable.
+   */
+  enqueueHistoryWrite?: (data: string) => void;
+  /**
+   * Wired by `renderApp`. Enables/disables the patched Ink bottom-anchor pad
+   * creation. On while the agent runs (footer must not jump as the tool panel
+   * and status rows churn); off at idle so symmetric UI shrink (slash menu
+   * close, input collapse) lets the footer return up without leaving pads.
+   */
+  setFrameAnchorActive?: (active: boolean) => void;
   /**
    * When true, the UI runs in the alternate-screen fullscreen viewport: the
    * transcript is rendered inside Ink as a bounded, app-scrolled region above a
@@ -552,6 +568,9 @@ export function App(props: AppProps) {
     // accumulating in React state (still flushed + persisted) without any
     // stdout writes. The legacy scrollback path keeps the printer.
     terminalHistoryPrinter: props.fullscreen ? undefined : props.terminalHistoryPrinter,
+    // Atomic scrollback enqueue — only meaningful on the legacy scrollback
+    // path (fullscreen drops the printer entirely, so nothing is written).
+    enqueueStdout: props.fullscreen ? undefined : props.enqueueHistoryWrite,
     terminalHistoryContext: {
       theme,
       columns,
@@ -1119,19 +1138,22 @@ export function App(props: AppProps) {
             // The check is cumulative over the WHOLE pinned set (previously
             // pinned assistant items + this turn's, which [DONE:N]
             // segmentation can split into several): flush the leading prefix
-            // so the remaining suffix fits, preserving transcript order. The
-            // transcript-history layout effect removes the flushed ids from
-            // the live frame after printing.
+            // so the remaining suffix fits, preserving transcript order. Return
+            // only that suffix immediately; otherwise the just-flushed prefix
+            // keeps the live-area clamp engaged for one stale frame, reserving
+            // blank rows above a short final response.
             const pinned = [...assistantItems, ...nextItems];
             const layout = liveLayoutRef.current;
-            const oversizedCount = countOversizedFlushItems(
+            const oversizedSplit = splitOversizedPinnedItems(
               pinned,
               (itemText) => estimateRenderedRows(itemText, layout.columns),
               layout.liveAreaRows,
             );
-            if (oversizedCount > 0) queueFlush(pinned.slice(0, oversizedCount));
+            if (oversizedSplit.flushed.length > 0) {
+              queueFlush(oversizedSplit.flushed);
+            }
             streamedAssistantFlushRef.current = { flushedChars: 0, text: "" };
-            return pinned;
+            return oversizedSplit.remaining;
           });
         },
         [queueFlush],
@@ -1621,7 +1643,7 @@ export function App(props: AppProps) {
           if (doneDecision.flushLiveItems && !doneDecision.showDoneStatus) {
             setLiveItems((prev) => {
               if (prev.length > 0) queueFlush(prev);
-              return prev;
+              return [];
             });
           }
 
@@ -1862,6 +1884,22 @@ export function App(props: AppProps) {
       return () => clearTimeout(timer);
     }
   }, [agentLoop.isRunning, sessionStore, props.resetUI]);
+
+  // Bottom-anchor gating: pad creation on while the agent runs, off at idle.
+  // The idle transition is delayed 500ms so the finalization commits (done
+  // status swap, live-item clear, deferred flushes) all land while the anchor
+  // still protects them; only then does idle UI (slash menu open/close, input
+  // grow/shrink) regain natural symmetric footer movement.
+  const setFrameAnchorActive = props.setFrameAnchorActive;
+  useEffect(() => {
+    if (!setFrameAnchorActive) return;
+    if (agentLoop.isRunning) {
+      setFrameAnchorActive(true);
+      return;
+    }
+    const timer = setTimeout(() => setFrameAnchorActive(false), 500);
+    return () => clearTimeout(timer);
+  }, [agentLoop.isRunning, setFrameAnchorActive]);
 
   const showSessionSummaryAndExit = useCallback(() => {
     const summary = buildSessionSummary({
@@ -2697,14 +2735,13 @@ export function App(props: AppProps) {
   const isPixelView = overlay === "pixel";
   const hasLiveAssistantItem = liveItems.some((item) => item.kind === "assistant");
   const rawVisibleStreamingText = hasLiveAssistantItem ? "" : agentLoop.streamingText;
-  // Compute the prospective paragraph flush DURING render so the live frame
-  // immediately drops the prefix that is about to be written to scrollback.
-  // The queueFlush below runs in an effect (after paint), so if the live text
-  // were sliced only by the already-committed `flushedChars`, the just-flushed
-  // paragraph would render BOTH in scrollback and live for one frame — that
-  // transient extra height is what shoves the footer up and then back down on
-  // every chunk boundary. Slicing by the prospective flush here keeps the live
-  // frame height monotonic, so the footer never bounces.
+  // The live text is sliced by the COMMITTED `flushedChars` only. When the
+  // flush effect below queues a paragraph, queueFlush enqueues the rendered
+  // bytes through the patched Ink `insertBeforeFrame` (passive — no terminal
+  // write) and the generation bump re-renders with the advanced flushedChars;
+  // that commit's single frame write is `erase tall frame + paragraph bytes +
+  // shorter frame`, so no frame ever shows the paragraph in both scrollback
+  // and the live region, and the footer never bounces.
   const alreadyFlushedChars = streamedAssistantFlushRef.current.flushedChars;
   // Retry-safety gate: don't commit streamed paragraphs to permanent scrollback
   // while the text is still small enough to live entirely in the live region.
@@ -2723,11 +2760,6 @@ export function App(props: AppProps) {
     : 0;
   const shouldFlushStreamedText =
     alreadyFlushedChars > 0 || unflushedStreamingRows > measuredLiveAreaRows;
-  const pendingFlushChars =
-    rawVisibleStreamingText && shouldFlushStreamedText
-      ? splitAssistantStreamingText(rawVisibleStreamingText.slice(alreadyFlushedChars)).flushedText
-          .length
-      : 0;
   useEffect(() => {
     if (!rawVisibleStreamingText) {
       streamedAssistantFlushRef.current = { flushedChars: 0, text: "" };
@@ -2764,9 +2796,7 @@ export function App(props: AppProps) {
       text: rawVisibleStreamingText,
     };
   }, [rawVisibleStreamingText, shouldFlushStreamedText, queueFlush]);
-  const visibleStreamingText = stripDoneMarkers(
-    rawVisibleStreamingText.slice(alreadyFlushedChars + pendingFlushChars),
-  );
+  const visibleStreamingText = stripDoneMarkers(rawVisibleStreamingText.slice(alreadyFlushedChars));
   const lastLiveItem = liveItems.at(-1);
   // For spacing decisions, the previous row is the last item that actually
   // RENDERS. Panel-replaced tool items (now shown only in the LiveToolPanel)
@@ -2801,7 +2831,7 @@ export function App(props: AppProps) {
   // When earlier paragraphs of THIS response were already flushed to scrollback
   // mid-stream, the live remainder is the next paragraph — re-insert the blank
   // line that separated them so the live tail lines up with the flushed history.
-  const streamingContinuesFlushed = alreadyFlushedChars + pendingFlushChars > 0;
+  const streamingContinuesFlushed = alreadyFlushedChars > 0;
 
   // ── Fullscreen alt-screen transcript ───────────────────
   // Flatten history + live items + in-flight streaming into the flat ANSI line
@@ -2853,6 +2883,58 @@ export function App(props: AppProps) {
     active: !!props.fullscreen && !overlay && !taskBarFocused,
     resetToken: scrollResetToken,
   });
+
+  // Mid-run bottom-anchor gap reclaim. While the agent runs, the patched ink
+  // anchor converts every live-frame SHRINK into pad debt — blank rows emitted
+  // above the frame so the footer never jumps up during tool/status churn.
+  // Growth normally consumes those pads, but when a shrink is NOT followed by
+  // growth the pads linger on screen as a blank gap between the flushed
+  // scrollback transcript and the live frame — the whitespace users see.
+  //
+  // This is ONE mechanism with many triggers, and this single effect covers
+  // them ALL by construction: every debt-creating event mutates one of the
+  // dependencies below, so the debounce re-arms on each and fires once the
+  // frame finally settles. Sources include:
+  //   • the submit boundary — the prior turn flushes + the live frame clears
+  //     (setLiveItems([])) and the open slash menu closes (controls shrink),
+  //     all before the new turn streams a single token (measuredLiveAreaRows +
+  //     liveItems change);
+  //   • a finishing tool batch — panel rows collapse (liveToolFeed / liveItems);
+  //   • status-slot swaps and oversized-item flushes mid-stream;
+  //   • a long quiet thinking stretch after any of the above (no growth comes).
+  // Previously this debt was only reclaimed at idle (run end), so the gap
+  // "fixed itself" only once the turn landed in history.
+  //
+  // Once the live frame has been visually stable for a beat, pulse the anchor
+  // off→on: the off transition reclaims the pad debt via the backfill repaint
+  // (footer stays bottom-pinned, the gap fills with the transcript tail) and
+  // the immediate on transition restores pad protection for the next burst of
+  // churn. Both calls are synchronous so no unpadded frame renders between, and
+  // it is a cheap no-op when there is no debt (the off transition early-returns
+  // when pad debt is zero). Skipped in fullscreen, which owns the whole screen
+  // and never pads. The delay trails React's commit + ink's render throttle
+  // (~33ms) and the insertBeforeFrame fallback (100ms) so the compensated
+  // flush has fully rendered before we measure-and-reclaim, while staying short
+  // enough that a stranded gap never lingers long enough to read as a bug.
+  useEffect(() => {
+    if (props.fullscreen) return;
+    if (!setFrameAnchorActive) return;
+    if (!agentLoop.isRunning) return;
+    const timer = setTimeout(() => {
+      setFrameAnchorActive(false);
+      setFrameAnchorActive(true);
+    }, 250);
+    return () => clearTimeout(timer);
+  }, [
+    props.fullscreen,
+    setFrameAnchorActive,
+    agentLoop.isRunning,
+    agentLoop.activityPhase,
+    liveItems,
+    visibleStreamingText,
+    liveToolFeed,
+    measuredLiveAreaRows,
+  ]);
 
   const visibleQueuedCount = liveItems.filter((item) => item.kind === "queued").length;
   const hiddenQueuedCount = Math.max(0, agentLoop.queuedCount - visibleQueuedCount);

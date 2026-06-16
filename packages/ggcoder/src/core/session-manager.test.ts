@@ -68,6 +68,27 @@ describe("SessionManager persistence failure handling", () => {
   });
 });
 
+describe("SessionManager.getMostRecent", () => {
+  it("returns the session most recently spoken in, not the newest-created", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager = new SessionManager(sessionsDir);
+    const cwd = "/proj/continue";
+
+    // Session A is created first, then session B (newer header timestamp).
+    const sessionA = await manager.create(cwd, "anthropic", "test-model");
+    await new Promise((r) => setTimeout(r, 5));
+    const sessionB = await manager.create(cwd, "anthropic", "test-model");
+
+    // We chat in B first, then send the LAST message to A.
+    await manager.appendEntry(sessionB.path, entry("b-msg"));
+    await new Promise((r) => setTimeout(r, 5));
+    await manager.appendEntry(sessionA.path, entry("a-msg"));
+
+    const mostRecent = await manager.getMostRecent(cwd);
+    expect(mostRecent).toBe(sessionA.path);
+  });
+});
+
 describe("SessionManager.pruneOldSessions", () => {
   async function makeAgedSession(
     manager: SessionManager,

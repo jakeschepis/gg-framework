@@ -1,0 +1,2457 @@
+:root {
+  /* Surfaces — cool charcoal ramp, elevation by ΔL only (no shadows). */
+  --bg: #0f1115;
+  --surface-1: #161922;
+  --surface-2: #1d212b;
+  --border: #272b36;
+  --border-strong: #353a47;
+
+  /* Text — neutral-cool, APCA-gated. */
+  --text: #f4f6f8;
+  --text-secondary: #c3c9d4;
+  --text-muted: #9aa3b2;
+  --text-dim: #5b6472;
+
+  /* Accents — true sibling set; dot/icon/border/verb colors (NOT body text). */
+  --primary: #4d9dff;
+  --success: #36c489;
+  --warning: #e3a23f;
+  --error: #f2716e;
+  --secondary: #9b8cf7;
+  --info: #2dd4bf;
+
+  /* User identity — periwinkle text on a slate chip (mirrors the ggcoder TUI:
+     commandColor #818cf8 on the #374151 message fill). Shared by the user
+     bubble and the chat input. */
+  --user-text: #818cf8;
+  --user-bg: #313a49;
+
+  /* Shape system (Linear capsule-vs-card + Warp three radii). */
+  --radius-button: 6px;
+  --radius-card: 10px;
+  --radius-pill: 9999px;
+
+  /* Motion — color-only hover (Warp/Resend). NO movement on buttons. */
+  --t-fast: 0.15s ease;
+
+  /* Button system — gradient-filled primary, glass ghost. No glows. */
+  --grad-primary: linear-gradient(135deg, #4d9dff 0%, #9b8cf7 100%);
+
+  /* Fonts — same-family Geist Sans + Geist Mono. */
+  --sans: "Geist Variable", ui-sans-serif, system-ui, sans-serif;
+  --mono: "Geist Mono Variable", ui-monospace, "SF Mono", Menlo, monospace;
+}
+
+/* ── Button system (shared) ───────────────────────────────────────────────
+   .btn is the base; pair with .btn-primary (gradient fill), .btn-ghost (glass
+   outline), or .btn-success. Pill-shaped. Hover changes color/border/tint only
+   — NO movement and NO glow change. */
+.btn {
+  position: relative;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-pill);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  letter-spacing: -0.005em;
+  padding: 8px 18px;
+  cursor: pointer;
+  white-space: nowrap;
+  /* Color only — NO movement, no scale, no hover glow. */
+  transition:
+    background-color var(--t-fast),
+    border-color var(--t-fast),
+    color var(--t-fast);
+}
+.btn:disabled {
+  opacity: 0.5;
+  cursor: default;
+  pointer-events: none;
+}
+
+/* Primary — gradient fill, white text. Brightens slightly on hover, no glow. */
+.btn-primary {
+  background: var(--grad-primary);
+  color: #fff;
+}
+.btn-primary:hover:not(:disabled) {
+  background: linear-gradient(135deg, #5ba6ff 0%, #a698f9 100%);
+}
+
+/* Success — ghost variant tinted green (e.g. an active /commit). */
+.btn-success {
+  background: color-mix(in srgb, var(--success) 12%, var(--surface-1));
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, var(--border));
+}
+.btn-success:hover:not(:disabled) {
+  border-color: var(--success);
+  background: color-mix(in srgb, var(--success) 20%, var(--surface-1));
+}
+
+/* Ghost — glass outline; fills with a faint accent tint on hover. */
+.btn-ghost {
+  background: color-mix(in srgb, var(--surface-1) 70%, transparent);
+  color: var(--text-secondary);
+  border-color: var(--border);
+}
+.btn-ghost:hover:not(:disabled) {
+  color: var(--text);
+  border-color: color-mix(in srgb, var(--secondary) 55%, var(--border));
+  background: color-mix(in srgb, var(--secondary) 12%, var(--surface-1));
+}
+
+/* Size modifiers. */
+.btn-sm {
+  font-size: 12px;
+  padding: 4px 12px;
+  gap: 6px;
+}
+.btn-lg {
+  font-size: 15px;
+  padding: 13px 22px;
+}
+/* Icon-only — perfect circle, fixed square size, no rectangular padding. */
+.btn-icon {
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border-radius: var(--radius-pill);
+  flex: 0 0 auto;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+/* ── Toasts (bottom-right, slide up + fade) ── */
+.toaster {
+  position: fixed;
+  right: 18px;
+  bottom: 18px;
+  z-index: 200;
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  align-items: flex-end;
+  pointer-events: none;
+}
+.toast {
+  pointer-events: auto;
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  max-width: 360px;
+  padding: 11px 12px 11px 11px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: 0 10px 30px -8px rgba(0, 0, 0, 0.6);
+  font-size: 13px;
+  color: var(--text);
+  animation: toast-in 0.32s var(--ease-out, cubic-bezier(0.16, 1, 0.3, 1));
+}
+@keyframes toast-in {
+  from {
+    opacity: 0;
+    transform: translateY(16px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+/* Exit: slide straight down and fade out. Duration must match EXIT_MS. */
+.toast.leaving {
+  animation: toast-out 0.26s var(--ease-out, cubic-bezier(0.16, 1, 0.3, 1)) forwards;
+  pointer-events: none;
+}
+@keyframes toast-out {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+  }
+  to {
+    opacity: 0;
+    transform: translateY(20px);
+  }
+}
+.toast-icon {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 22px;
+  height: 22px;
+  border: 1px solid;
+  border-radius: var(--radius-pill);
+  font-size: 12px;
+  font-weight: 700;
+}
+.toast-msg {
+  flex: 1 1 auto;
+  line-height: 1.4;
+}
+.toast-close {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 2px;
+  transition: color var(--t-fast);
+}
+.toast-close:hover {
+  color: var(--text);
+}
+
+html,
+body,
+#root {
+  margin: 0;
+  height: 100%;
+  width: 100%;
+}
+
+body {
+  overflow: hidden;
+}
+
+.app {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.55;
+  letter-spacing: -0.011em;
+  color: var(--text);
+  -webkit-font-smoothing: antialiased;
+}
+
+.titlebar {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  /* Native chrome (Windows/Linux): no overlay title bar to clear. */
+  padding: 10px 16px;
+  border-bottom: 1px solid var(--border);
+  user-select: none;
+}
+/* macOS overlay title bar: top padding clears the traffic-light buttons so the
+   action rows sit BELOW them (matching .picker-head), not crammed onto them. */
+.platform-macos .titlebar {
+  padding: 34px 16px 10px;
+}
+
+.titlebar .title {
+  font-size: 12px;
+  color: var(--text-muted);
+  font-weight: 600;
+}
+
+/* ── Home screen (app entry) ── */
+.home {
+  position: relative;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  height: 100vh;
+  gap: 28px;
+  padding: 24px;
+  text-align: center;
+  overflow: hidden;
+}
+/* Decorative floating meme cards — behind the logo/buttons, non-interactive. */
+.meme-layer {
+  position: absolute;
+  inset: 0;
+  overflow: hidden;
+  pointer-events: none;
+  z-index: 0;
+}
+.meme-card {
+  position: absolute;
+  /* The GIF is the card — caption overlays it, no padded container. */
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 220px;
+  height: 170px;
+  overflow: hidden;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  background: var(--surface-1);
+  opacity: 0;
+  /* --rot (set inline per card) is folded into the keyframe so the card can
+     rise + scale into place instead of popping, while keeping its tilt. */
+  --rot: 0deg;
+  animation: meme-fade 6s cubic-bezier(0.22, 1, 0.36, 1) forwards;
+}
+@keyframes meme-fade {
+  0% {
+    opacity: 0;
+    transform: rotate(var(--rot)) scale(0.9) translateY(10px);
+  }
+  12%,
+  84% {
+    opacity: 0.85;
+    transform: rotate(var(--rot)) scale(1) translateY(0);
+  }
+  100% {
+    opacity: 0;
+    transform: rotate(var(--rot)) scale(0.97) translateY(-6px);
+  }
+}
+.meme-gif {
+  width: 100%;
+  height: 100%;
+  object-fit: cover;
+  display: block;
+}
+.meme-emoji {
+  font-size: 64px;
+  line-height: 1;
+}
+/* Caption sits on top of the GIF, pinned to the bottom over a dark scrim so
+   it stays legible against any frame. */
+.meme-caption {
+  position: absolute;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  padding: 16px 8px 6px;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+  color: #fff;
+  text-align: center;
+  line-height: 1.25;
+  text-shadow: 0 1px 3px rgba(0, 0, 0, 0.9);
+  background: linear-gradient(to top, rgba(0, 0, 0, 0.75), rgba(0, 0, 0, 0));
+}
+/* Home content sits above the meme layer. */
+.home > .ascii-logo,
+.home > .home-tagline,
+.home > .home-byline,
+.home > .home-actions,
+.home > .home-update,
+.home > .home-version {
+  position: relative;
+  z-index: 1;
+}
+/* Entry: each block fades + rises in sequence so the page assembles smoothly
+   on load instead of snapping in all at once. The logo keeps its infinite
+   shimmer, so it gets BOTH animations (reveal-up once + ggshimmer looping). */
+.home > .home-update,
+.home > .home-version,
+.home > .home-tagline,
+.home > .home-byline,
+.home > .home-actions {
+  animation: reveal-up 460ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.home > .ascii-logo {
+  animation:
+    reveal-up 460ms cubic-bezier(0.22, 1, 0.36, 1) both,
+    ggshimmer 4s linear infinite;
+  animation-delay: 120ms, 0s;
+}
+.home > .home-update,
+.home > .home-version {
+  animation-delay: 40ms;
+}
+.home > .home-tagline {
+  animation-delay: 240ms;
+}
+.home > .home-byline {
+  animation-delay: 340ms;
+}
+.home > .home-actions {
+  animation-delay: 440ms;
+}
+@media (prefers-reduced-motion: reduce) {
+  .home > .home-update,
+  .home > .home-version,
+  .home > .home-tagline,
+  .home > .home-byline,
+  .home > .home-actions {
+    animation: none;
+  }
+  .home > .ascii-logo {
+    animation: ggshimmer 4s linear infinite;
+  }
+}
+
+.ascii-logo {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.05;
+  white-space: pre;
+  /* Brand gradient (blue → periwinkle → blue), wider than the text so the
+     animated position shift reads as a shimmer sweep across the letters. */
+  background: linear-gradient(
+    100deg,
+    #4d9dff 0%,
+    #6f8ff7 25%,
+    #9b8cf7 50%,
+    #6f8ff7 75%,
+    #4d9dff 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: ggshimmer 4s linear infinite;
+}
+.ascii-logo-line {
+  white-space: pre;
+}
+.home-tagline {
+  margin-top: -12px;
+  font-size: 13px;
+  color: var(--text-muted);
+}
+.home-byline {
+  margin-top: -18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: var(--text-dim);
+}
+.home-byline-sep {
+  color: var(--border-strong);
+}
+.home-link {
+  color: var(--primary);
+  text-decoration: none;
+  cursor: pointer;
+  transition: color var(--t-fast);
+}
+.home-link:hover {
+  text-decoration: underline;
+}
+.home-actions {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  width: min(320px, 80vw);
+}
+/* Home actions are the brand showcase — full-width pills, a touch taller. */
+.home-btn {
+  width: 100%;
+  font-size: 15px;
+  padding: 14px 22px;
+}
+/* Projects + its settings icon sit on one row; the pill flexes, icon is fixed. */
+.home-projects-row {
+  display: flex;
+  gap: 10px;
+  width: 100%;
+}
+.home-projects-row .home-btn {
+  flex: 1 1 auto;
+}
+.home-settings {
+  flex: 0 0 auto;
+  width: 48px;
+  height: 48px;
+}
+/* Serve button while live: green tint + dot, so "on" reads at a glance. */
+.home-serve-active {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 45%, transparent);
+}
+.home-serve-active:hover {
+  border-color: var(--success);
+}
+/* Dimmed (prerequisites unmet): muted but still clickable so it can toast.
+   Keep the gradient flat on hover so it reads as inactive, not interactive. */
+.btn-primary.is-dimmed,
+.btn-primary.is-dimmed:hover {
+  background: var(--grad-primary);
+}
+.is-dimmed {
+  opacity: 0.45;
+  filter: grayscale(0.4);
+}
+.is-dimmed:hover {
+  opacity: 0.55;
+}
+
+/* ── Login screen (provider list + connection badges) ── */
+.login-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+.login-item {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  width: 100%;
+  background: transparent;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  font-family: var(--sans);
+  text-align: left;
+  padding: 12px 14px;
+  cursor: pointer;
+  transition:
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.login-item:hover {
+  background: var(--surface-1);
+  border-color: var(--border-strong);
+}
+.login-item-body {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.login-item-name {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+.login-item-desc {
+  font-size: 12px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.login-methods {
+  display: flex;
+  gap: 6px;
+  flex: 0 0 auto;
+}
+
+/* ── Provider login modal ── */
+.login-modal-desc {
+  font-size: 13px;
+  color: var(--text-muted);
+  margin-bottom: 14px;
+}
+.login-method-row {
+  display: flex;
+  gap: 8px;
+  margin-bottom: 10px;
+}
+.login-status {
+  font-size: 13px;
+  margin-top: 12px;
+  word-break: break-word;
+}
+.login-status a {
+  color: var(--primary);
+}
+
+/* ── Project picker (new-window / app-load project chooser) ── */
+.picker {
+  display: flex;
+  flex-direction: column;
+  height: 100vh;
+}
+.picker-head {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  /* When the window gets too narrow for back + title + search + actions to fit
+     on one line, wrap the overflow onto a second row instead of letting flex
+     squish the children (which made the title text reflow/wrap and the search
+     box deform). row-gap spaces the wrapped rows. */
+  flex-wrap: wrap;
+  row-gap: 8px;
+  /* Native chrome (Windows/Linux): no overlay title bar to clear. */
+  padding: 12px 20px;
+  border-bottom: 1px solid var(--border);
+}
+/* macOS overlay title bar: top padding clears the traffic-light buttons. */
+.platform-macos .picker-head {
+  padding: 34px 20px 12px;
+}
+.picker-title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text);
+  /* Truncate with an ellipsis rather than wrapping to a second line when the
+     bar tightens. min-width:0 lets a flex item shrink below its content width
+     (the classic flexbox min-content default that otherwise forces overflow). */
+  flex: 0 1 auto;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Main chat-view header (.chat-head) ──
+   Two stacked rows under one bottom border:
+   1) .chat-head-strip — the macOS traffic-light row: window title (left, where
+      the native title sat) + the show/hide toggle (right). ALWAYS present.
+   2) .chat-head-nav — the action-button row; collapsed away by the toggle.
+   When collapsed only the strip remains, so the title never moves up into the
+   traffic lights. */
+.chat-head {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  border-bottom: 1px solid var(--border);
+}
+.chat-head-strip {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  /* Height matches the macOS traffic-light zone so align-items:center lines the
+     title + toggle up with the lights' centerline (~19px from the window top). */
+  height: 38px;
+  /* Native chrome (Windows/Linux): no traffic lights, so no left gutter. */
+  padding: 0 14px;
+}
+/* macOS: left padding clears the traffic lights so the title sits right of them. */
+.platform-macos .chat-head-strip {
+  padding: 0 14px 0 82px;
+}
+/* The window title (session title once generated, else "GG Coder"). The native
+   overlay title is hidden (hiddenTitle), so this is the ONLY title. It grows to
+   take the slack and truncates with an ellipsis on small windows, so it never
+   overlaps the toggle. */
+.chat-head-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+}
+.chat-head-nav {
+  display: flex;
+  align-items: center;
+  gap: 14px;
+  /* Wrap the action cluster below the back button on narrow windows instead of
+     letting the fixed-width buttons overflow / clip off the right edge. */
+  flex-wrap: wrap;
+  row-gap: 8px;
+  padding: 2px 20px 12px;
+}
+.picker-head-actions {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  /* Buttons keep their intrinsic size — never squish the action cluster — but
+     the cluster as a whole may wrap to its own line when the bar is too tight. */
+  flex: 0 0 auto;
+  flex-wrap: wrap;
+  row-gap: 8px;
+  justify-content: flex-end;
+}
+/* Inline project filter, sits just right of the total-projects badge. Grows to
+   fill slack but shrinks down (min-width:0) and, once the row is full, wraps to
+   its own line via the head's flex-wrap rather than deforming. */
+.picker-search {
+  flex: 1 1 200px;
+  min-width: 0;
+  max-width: 260px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-button);
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 12px;
+  padding: 4px 10px;
+  outline: none;
+  transition:
+    border-color var(--t-fast),
+    background-color var(--t-fast);
+}
+.picker-search::placeholder {
+  color: var(--text-dim);
+}
+.picker-search:focus {
+  border-color: var(--primary);
+  background: var(--surface-2);
+}
+/* Match the titlebar nav buttons (.commit-button / .winlayout-button): same
+   font-size, weight, and padding so every chrome button reads uniformly. */
+.picker-new {
+  background: transparent;
+  border: 1px solid;
+  border-radius: var(--radius-button);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 9px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.picker-new:hover {
+  background: var(--surface-1);
+}
+/* ── Reusable modal ── */
+.modal-backdrop {
+  position: fixed;
+  inset: 0;
+  background: rgba(0, 0, 0, 0.55);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  z-index: 100;
+}
+.modal {
+  width: min(440px, 90vw);
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  padding: 24px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  /* Modals can be mounted inside centered containers (e.g. `.home` is
+     text-align: center). Pin left alignment so every modal's text matches
+     regardless of where it's rendered. */
+  text-align: left;
+}
+/* Any scroll container inside a modal gets a thin, non-overlapping scrollbar so
+   the thumb never sits on top of the row content. */
+.modal ::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+.modal ::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.modal-title {
+  font-size: 15px;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  margin-bottom: 20px;
+}
+.modal-label {
+  display: block;
+  font-size: 12px;
+  font-weight: 600;
+  margin-top: 22px;
+  margin-bottom: 10px;
+}
+/* The first label shouldn't double up the title's bottom margin. */
+.modal-title + .modal-label {
+  margin-top: 4px;
+}
+.modal-input {
+  width: 100%;
+  border: none;
+  outline: none;
+  border-radius: var(--radius-card);
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 11px 13px;
+}
+.modal-row {
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  margin-top: 14px;
+}
+.modal-row .modal-input {
+  flex: 1 1 auto;
+  /* Allow the input to shrink below its content/attribute width so a long path
+     value or a sibling button never forces horizontal overflow. */
+  min-width: 0;
+}
+.modal-hint {
+  font-size: 12px;
+  line-height: 1.55;
+  margin-top: 8px;
+  word-break: break-all;
+}
+/* A hint sitting directly above an input needs breathing room below it,
+   otherwise the field is flush against the description text. */
+.modal-hint + .modal-input {
+  margin-top: 10px;
+}
+.modal-radio-group {
+  display: flex;
+  gap: 18px;
+  align-items: center;
+}
+.modal-radio {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 14px;
+  cursor: pointer;
+}
+.modal-radio input {
+  cursor: pointer;
+  accent-color: var(--primary);
+}
+.modal-error {
+  font-size: 12px;
+  margin-top: 8px;
+}
+.modal-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin-top: 26px;
+}
+.modal-btn {
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-button);
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  padding: 8px 16px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.modal-btn:hover:not(:disabled) {
+  background: var(--surface-1);
+}
+.modal-btn.primary:hover:not(:disabled) {
+  filter: brightness(1.08);
+}
+.modal-btn:disabled {
+  cursor: default;
+  opacity: 0.7;
+}
+
+/* ── Tasks modal (project task list → run one / run all) ── */
+.tasks-empty {
+  font-size: 13px;
+  line-height: 1.5;
+  padding: 8px 2px;
+}
+.tasks-list {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  /* Cap height so a long list scrolls inside the modal instead of growing it
+     past the viewport; the actions row stays pinned below. */
+  max-height: min(48vh, 360px);
+  overflow-y: auto;
+  /* Reserve room for the scrollbar so the thumb never overlaps the row content
+     (run button / delete ×). `stable` keeps layout steady whether or not the
+     list overflows. */
+  scrollbar-gutter: stable;
+  padding-right: 4px;
+  margin: 2px 0 14px;
+}
+.tasks-list::-webkit-scrollbar {
+  width: 8px;
+}
+.tasks-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+.tasks-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 6px;
+  border-radius: var(--radius-button);
+}
+.tasks-item:hover {
+  background: var(--surface-1);
+}
+.tasks-dot {
+  flex: 0 0 auto;
+  font-size: 11px;
+  width: 14px;
+  text-align: center;
+}
+.tasks-title {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-size: 13.5px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.tasks-status {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.tasks-run-one {
+  flex: 0 0 auto;
+}
+.tasks-delete {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  font-size: 16px;
+  line-height: 1;
+  cursor: pointer;
+  padding: 0 4px;
+  transition: color var(--t-fast);
+}
+.tasks-delete:hover {
+  color: var(--error) !important;
+}
+.tasks-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+/* In-transcript task header row (shown at the top of a task's session). */
+.task-row {
+  margin: 2px 0 6px;
+}
+.picker-list {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+/* Empty/loading state: fill the list and center its content both axes, with a
+   clear gap between the message and any action button. */
+.picker-empty {
+  flex: 1 1 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 16px;
+  padding: 24px;
+  text-align: center;
+  font-size: 14px;
+  line-height: 1.5;
+}
+.picker-item {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  width: 100%;
+  background: transparent;
+  border: 1px solid transparent;
+  border-radius: var(--radius-button);
+  font-family: var(--sans);
+  text-align: left;
+  padding: 10px 12px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.picker-item:hover {
+  background: var(--surface-1);
+}
+.picker-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.picker-name {
+  font-size: 14px;
+  font-weight: 600;
+}
+.picker-sources {
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 600;
+}
+.picker-meta {
+  font-family: var(--mono);
+  font-size: 11px;
+}
+
+/* ── Reusable pill badge ── */
+.badge {
+  display: inline-flex;
+  align-items: center;
+  border: 1px solid;
+  border-radius: var(--radius-pill);
+  padding: 1px 8px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-weight: 600;
+  line-height: 1.5;
+  white-space: nowrap;
+}
+.picker-preview {
+  flex: 1;
+  min-width: 0;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Action clusters sit in the padded row BELOW the overlay title bar (matching
+   .picker-head), aligned to the bar's bottom edge — NOT crammed onto the
+   native overlay. */
+.titlebar-actions {
+  position: absolute;
+  right: 16px;
+  bottom: 10px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+/* Mirror cluster pinned to the left edge (the "‹ Sessions" back affordance). */
+.titlebar-actions.left {
+  right: auto;
+  left: 16px;
+}
+
+.commit-button {
+  background: transparent;
+  border: 1px solid;
+  border-radius: var(--radius-button);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 9px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.commit-button:hover:not(:disabled) {
+  background: var(--surface-1);
+}
+.commit-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+
+/* Multi-window layout control + its dropdown. */
+.winlayout {
+  position: relative;
+  display: inline-flex;
+}
+/* Hide/show toggle for the nav-button row. Lives at the right of the title
+   strip; small and borderless so it reads as a titlebar control, not a button. */
+.nav-toggle {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-button);
+  color: var(--text-muted);
+  padding: 2px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast);
+}
+.nav-toggle:hover {
+  background: var(--surface-1);
+  color: var(--text);
+}
+.winlayout-button {
+  background: transparent;
+  border: 1px solid;
+  border-radius: var(--radius-button);
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 2px 9px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.winlayout-button:hover:not(:disabled) {
+  background: var(--surface-1);
+}
+.winlayout-button:disabled {
+  opacity: 0.5;
+  cursor: default;
+}
+/* Invisible full-screen click catcher for dismissing popovers that live in a
+   Tauri drag region (where document mousedown listeners don't fire). Sits just
+   under the menu it dismisses. */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 59;
+}
+
+.winlayout-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  padding: 5px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 60;
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 150px;
+}
+.winlayout-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-button);
+  font-family: var(--sans);
+  font-size: 13px;
+  text-align: left;
+  padding: 6px 9px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.winlayout-item:hover {
+  background: var(--surface-1);
+}
+
+.transcript {
+  flex: 1 1 auto;
+  /* Required so this scrollable flex child actually shrinks (default min-height
+     is `auto`, which keeps it at content height — that pushes the live tool
+     panel / activity bar down over the transcript text instead of scrolling). */
+  min-height: 0;
+  overflow-y: auto;
+  /* Extra bottom padding keeps the last line off the live-region border so the
+     newest message reads with a little breathing room above the tool panel. */
+  padding: 4px 18px 16px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+.transcript::-webkit-scrollbar {
+  width: 8px;
+}
+.transcript::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+.line {
+  min-height: 1.55em;
+}
+.line.info,
+.line.error {
+  padding: 1px 0;
+}
+
+/* ── Plan review modal (plan_exit: YOUR PLAN + Accept/Feedback/Reject) ── */
+.plan-review {
+  position: fixed;
+  inset: 0;
+  z-index: 120;
+  display: flex;
+  flex-direction: column;
+  background: var(--bg);
+}
+.plan-review-banner {
+  flex: 0 0 auto;
+  padding: 40px 24px 12px;
+  border-bottom: 1px solid var(--border);
+}
+.plan-review-body {
+  flex: 1 1 auto;
+  overflow-y: auto;
+  padding: 20px 24px;
+  font-size: 15px;
+}
+.plan-review-actions {
+  flex: 0 0 auto;
+  display: flex;
+  gap: 10px;
+  align-items: center;
+  padding: 14px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--surface-1);
+}
+.plan-reject {
+  margin-left: auto;
+  color: var(--error);
+  border-color: color-mix(in srgb, var(--error) 35%, var(--border));
+}
+.plan-reject:hover:not(:disabled) {
+  color: var(--error);
+  border-color: var(--error);
+  background: color-mix(in srgb, var(--error) 12%, var(--surface-1));
+}
+.plan-feedback {
+  width: 100%;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+}
+.plan-feedback-input {
+  width: 100%;
+  resize: vertical;
+  background: var(--bg);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  font-family: var(--sans);
+  font-size: 14px;
+  padding: 10px 12px;
+  outline: none;
+}
+.plan-feedback-input:focus {
+  border-color: var(--border-strong);
+}
+.plan-feedback-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+}
+.plan-feedback-hint {
+  font-size: 12px;
+}
+.plan-feedback-buttons {
+  display: flex;
+  gap: 8px;
+}
+
+/* ── Plan mode ASCII banner ── */
+.plan-logo {
+  margin: 10px 0;
+  padding-left: 2px;
+}
+.plan-logo-line {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1.15;
+  white-space: pre;
+  letter-spacing: 0;
+}
+.plan-logo-reason {
+  margin-top: 6px;
+  color: var(--warning);
+  font-style: italic;
+  font-size: 13px;
+}
+
+/* ── User message chip (mirrors USER_MESSAGE_BACKGROUND in the TUI) ── */
+.user-msg {
+  /* Hug the text, but never span the whole pane: cap at a readable measure
+     that scales down on narrow windows. Wraps once it would overflow the cap. */
+  width: fit-content;
+  max-width: min(620px, 78%);
+  /* Push the bubble to the right edge (user on right, assistant on left). */
+  background: var(--user-bg);
+  color: var(--user-text);
+  border-radius: var(--radius-card);
+  padding: 6px 12px;
+  margin: 8px 0 8px auto;
+  font-size: 15px;
+  white-space: pre-wrap;
+  word-break: break-word;
+}
+
+/* ── Shimmer sweep: a bright spot rides across text (mirrors TUI ShimmerLabel).
+   Drives both the workflow-command chip and footer "full power" labels (plan
+   mode, max-tier thinking) via two color vars. ── */
+.shimmer-text,
+.command-shimmer {
+  background: linear-gradient(
+    100deg,
+    var(--shimmer-base) 0%,
+    var(--shimmer-base) 38%,
+    var(--shimmer-bright) 50%,
+    var(--shimmer-base) 62%,
+    var(--shimmer-base) 100%
+  );
+  background-size: 220% 100%;
+  -webkit-background-clip: text;
+  background-clip: text;
+  -webkit-text-fill-color: transparent;
+  animation: ggshimmer 2.4s linear infinite;
+}
+@keyframes ggshimmer {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -80% 0;
+  }
+}
+
+/* ── Workflow command chip: highlighted + shimmer sweep ── */
+.user-msg.command {
+  font-family: var(--mono);
+  font-weight: 600;
+}
+.user-msg.command.labelled,
+.user-msg.command.labelled .command-shimmer {
+  font-family: var(--sans);
+}
+.command-shimmer {
+  font-family: var(--mono);
+  /* Resting color comes from inline `color`; the bright spot is white. */
+  --shimmer-base: currentColor;
+  --shimmer-bright: #ffffff;
+}
+
+/* Footer shimmer label (plan mode, max-power thinking). */
+.shimmer-text {
+  font-weight: 600;
+}
+.footer-plan {
+  margin-left: 10px;
+  font-family: var(--mono);
+}
+
+/* ── Assistant message: blue dot + text ── */
+.assistant-msg {
+  display: flex;
+  gap: 6px;
+  padding: 4px 0;
+  align-items: flex-start;
+}
+.assistant-dot {
+  flex: 0 0 auto;
+  line-height: 1.55;
+}
+.assistant-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  color: var(--text);
+  word-break: break-word;
+  /* Match the user message / input size so both sides read uniformly. */
+  font-size: 15px;
+}
+
+/* ── Markdown rendering (assistant blocks) ── */
+/* Reset the transcript's inherited `pre-wrap` so the markdown source's
+   structural newlines (blank lines between list items / paragraphs) don't
+   render as abnormal vertical gaps. The parser already produces the right
+   block structure; whitespace should collapse normally here. */
+.markdown {
+  white-space: normal;
+}
+.markdown > :first-child {
+  margin-top: 0;
+}
+.markdown > :last-child {
+  margin-bottom: 0;
+}
+.markdown p {
+  margin: 0.4em 0;
+}
+.markdown h1,
+.markdown h2,
+.markdown h3,
+.markdown h4 {
+  margin: 0.7em 0 0.35em;
+  line-height: 1.3;
+  font-weight: 600;
+  letter-spacing: -0.02em;
+  color: var(--text);
+}
+.markdown h1 {
+  font-size: 1.3em;
+}
+.markdown h2 {
+  font-size: 1.18em;
+}
+.markdown h3 {
+  font-size: 1.08em;
+}
+.markdown ul,
+.markdown ol {
+  margin: 0.35em 0;
+  padding-left: 1.4em;
+}
+.markdown li {
+  margin: 0.15em 0;
+}
+/* Loose lists wrap each item's text in a <p>; strip its margins so list rows
+   stay compact instead of inheriting paragraph spacing. */
+.markdown li > p {
+  margin: 0;
+}
+.markdown a {
+  color: var(--primary);
+  text-decoration: underline;
+  text-decoration-color: color-mix(in srgb, var(--primary) 40%, transparent);
+  text-underline-offset: 2px;
+  transition: text-decoration-color var(--t-fast);
+}
+.markdown a:hover {
+  text-decoration-color: var(--primary);
+}
+.markdown blockquote {
+  margin: 0.5em 0;
+  padding: 0.1em 0 0.1em 0.9em;
+  border-left: 3px solid color-mix(in srgb, var(--secondary) 50%, var(--border));
+  color: var(--text-muted);
+}
+.markdown blockquote p {
+  margin: 0.2em 0;
+}
+.markdown hr {
+  border: none;
+  border-top: 1px solid var(--border);
+  margin: 0.8em 0;
+}
+/* Inline code: a faint violet-tinted chip with a border so it separates from
+   the dark canvas (a plain dark fill blends in). Accent-tinted text reads as
+   "code" at a glance without shouting. */
+.markdown :not(pre) > code {
+  font-family: var(--mono);
+  font-size: 0.88em;
+  color: #c7b8ff;
+  background: color-mix(in srgb, var(--secondary) 14%, var(--surface-1));
+  border: 1px solid color-mix(in srgb, var(--secondary) 28%, var(--border));
+  border-radius: 5px;
+  padding: 0.08em 0.4em;
+  word-break: break-word;
+}
+/* Code blocks: deeper inset surface + border so the block reads as a distinct
+   panel against the message background. */
+.markdown pre {
+  margin: 0.6em 0;
+  padding: 12px 14px;
+  background: #0b0d11;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow-x: auto;
+}
+.markdown pre code {
+  background: transparent;
+  border: none;
+  padding: 0;
+  color: var(--text-secondary);
+  font-size: 0.88em;
+  line-height: 1.55;
+  white-space: pre;
+}
+.markdown table {
+  border-collapse: collapse;
+  margin: 0.5em 0;
+  display: block;
+  overflow-x: auto;
+}
+.markdown th,
+.markdown td {
+  border: 1px solid var(--border);
+  padding: 4px 9px;
+  text-align: left;
+}
+.markdown th {
+  background: var(--surface-1);
+  font-weight: 600;
+}
+.markdown del {
+  color: var(--text-muted);
+}
+.markdown strong,
+.markdown b {
+  font-weight: 700;
+  color: var(--text);
+}
+.markdown em {
+  color: var(--text-secondary);
+}
+/* First heading shouldn't add top space; tighten heading rhythm overall. */
+.markdown h1:first-child,
+.markdown h2:first-child,
+.markdown h3:first-child {
+  margin-top: 0;
+}
+.markdown th {
+  color: var(--text);
+}
+/* Zebra striping for readability against the dark canvas. */
+.markdown tbody tr:nth-child(even) td {
+  background: color-mix(in srgb, var(--surface-1) 50%, transparent);
+}
+
+/* ── Tool rows (status dot + styled verb/detail/summary) ── */
+.tool-row {
+  display: flex;
+  gap: 6px;
+  padding: 1px 0;
+  align-items: baseline;
+}
+.tool-dot {
+  flex: 0 0 auto;
+}
+.tool-line {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  /* Keep each tool row to a SINGLE line, truncated with an ellipsis, so a long
+     command/path/summary can't wrap into many lines and eat vertical space
+     (the panel only shows a few rows). min-width:0 lets the flex item shrink
+     below its content so the ellipsis actually engages. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Sub-agent in-chat feed (parallel delegations + live tool activity) ── */
+.subagents {
+  margin: 6px 0 10px;
+}
+.subagents-head {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  padding: 1px 0 4px;
+  font-family: var(--mono);
+}
+.subagents-list {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  /* Indent the agent list under the header dot. */
+  padding-left: 18px;
+  border-left: 1px solid var(--border);
+  margin-left: 5px;
+}
+.subagent {
+  display: flex;
+  flex-direction: column;
+  gap: 1px;
+  min-width: 0;
+}
+.subagent-row {
+  display: flex;
+  gap: 6px;
+  align-items: baseline;
+  font-family: var(--mono);
+  min-width: 0;
+}
+.subagent-icon {
+  flex: 0 0 auto;
+}
+.subagent-name {
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.subagent-summary {
+  flex: 1 1 auto;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.subagent-feed {
+  display: flex;
+  flex-direction: column;
+  /* Align activity lines under the agent name (past the icon + gap). */
+  padding-left: 18px;
+  min-width: 0;
+}
+.subagent-activity {
+  font-family: var(--mono);
+  font-size: 0.92em;
+  /* One line each, truncated with ellipsis so the panel reflows on resize. */
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+.spinner {
+  /* Fixed width so varying glyph widths between animation frames don't reflow
+     the rest of the status row. */
+  display: inline-block;
+  width: 1.2em;
+  text-align: center;
+}
+
+@keyframes ggblink {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.25;
+  }
+}
+.blink {
+  animation: ggblink 1s steps(1, end) infinite;
+}
+
+/* ── Pinned live region (tool panel + activity bar) ── */
+.liveregion {
+  flex: 0 0 auto;
+}
+
+.livetoolpanel {
+  padding: 8px 18px 4px;
+  display: flex;
+  flex-direction: column;
+  /* Top border to frame the panel, matching the activity bar below it. */
+  border-top: 1px solid var(--border);
+}
+
+/* ── Plan step completion row (✓ from [DONE:n] markers): blue circle, white
+   tick + label, mirroring the requested ggcoder treatment. ── */
+.plan-step-done {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 0;
+}
+.plan-step-check {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 18px;
+  height: 18px;
+  border-radius: var(--radius-pill);
+  background: var(--primary);
+  color: #fff;
+  font-size: 11px;
+  font-weight: 700;
+  line-height: 1;
+}
+.plan-step-label {
+  font-size: 14px;
+  font-weight: 600;
+  color: var(--text);
+}
+
+/* Single flex row in both states so content is uniformly vertically centered
+   within the bar (tall spinner/sparkle glyphs otherwise throw off baseline
+   alignment). A fixed line-height keeps the bar height steady. */
+.statusrow {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  /* Extra top padding pushes the text down so it reads as vertically centered
+     between the top border and the chat input below (the input's own top gap
+     otherwise makes the line look high). */
+  padding: 11px 18px 7px;
+  border-top: 1px solid var(--border);
+  font-size: 13px;
+  line-height: 1.5;
+  /* Fixed-width figures so the ticking timer / token count don't reflow the
+     rest of the row as digits change (1 vs 8, etc.). */
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}
+
+/* Idle "ready" line: icon + label aligned with a clean gap. */
+.statusrow-ready {
+  display: inline-flex;
+  align-items: center;
+  gap: 8px;
+}
+
+/* Plan-step progress badge in the activity bar (amber "Plan Steps n/total"). */
+.plan-steps-badge {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.plan-steps-running {
+  margin-left: auto;
+  padding-left: 12px;
+  flex: 0 0 auto;
+}
+
+.statusrow .working {
+  font-style: italic;
+}
+
+/* Running state: left cluster grows/shrinks freely; cancel stays pinned right
+   so a widening timer/thinking label never nudges it. */
+.statusrow.running .cancel {
+  margin-left: auto;
+  padding-left: 12px;
+  flex: 0 0 auto;
+}
+.statusrow-left {
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  /* Flex collapses inter-element whitespace, so space the spinner / "Working…"
+     / meta group explicitly. */
+  gap: 8px;
+}
+
+.inputwrap {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin: 10px 14px;
+  padding: 10px 12px;
+  background: var(--surface-1);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  position: relative;
+  transition: border-color var(--t-fast);
+}
+.inputwrap:focus-within {
+  border-color: var(--border-strong);
+}
+.inputwrap.dragover {
+  border-color: var(--primary);
+  background: color-mix(in srgb, var(--primary) 8%, var(--surface-1));
+}
+.inputrow {
+  display: flex;
+  /* Pin controls to the first line so they don't drift as the textarea grows. */
+  align-items: flex-start;
+  gap: 8px;
+}
+
+/* Attach button (paperclip). */
+.attach-btn {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 28px;
+  height: 28px;
+  background: transparent;
+  border: none;
+  border-radius: var(--radius-pill);
+  color: var(--text-muted);
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast);
+}
+.attach-btn:hover {
+  color: var(--text);
+  background: var(--surface-2);
+}
+
+/* Staged attachment chips above the input. */
+.attach-bar {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.attach-chip {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  max-width: 220px;
+  padding: 4px 6px 4px 4px;
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-button);
+  font-size: 12px;
+}
+.attach-thumb {
+  width: 28px;
+  height: 28px;
+  object-fit: cover;
+  border-radius: 4px;
+  flex: 0 0 auto;
+}
+.attach-icon {
+  display: inline-flex;
+  width: 28px;
+  height: 28px;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+}
+.attach-name {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-secondary);
+}
+.attach-remove {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  background: transparent;
+  border: none;
+  color: var(--text-dim);
+  cursor: pointer;
+  padding: 2px;
+  border-radius: var(--radius-pill);
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast);
+}
+.attach-remove:hover {
+  color: var(--text);
+  background: var(--surface-1);
+}
+
+/* User bubble inline image attachments. */
+.user-img-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-bottom: 6px;
+}
+.user-img {
+  max-width: 180px;
+  max-height: 180px;
+  border-radius: var(--radius-button);
+  border: 1px solid var(--border);
+  object-fit: cover;
+}
+
+/* Tool-produced images (screenshot / read) in the transcript. */
+.img-grid {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 6px 0;
+}
+.img-card {
+  margin: 0;
+  max-width: 320px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  overflow: hidden;
+  background: var(--surface-1);
+}
+.img-thumb {
+  display: block;
+  max-width: 100%;
+  max-height: 280px;
+  object-fit: contain;
+}
+.img-cap {
+  padding: 5px 9px;
+  font-family: var(--mono);
+  font-size: 11px;
+  color: var(--text-muted);
+  border-top: 1px solid var(--border);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* ── Slash command palette (opens upward from the input) ── */
+.slash-menu {
+  position: absolute;
+  bottom: calc(100% + 4px);
+  left: 0;
+  right: 0;
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  padding: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 50;
+  max-height: 44vh;
+  overflow-y: auto;
+}
+.slash-menu-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 8px 6px;
+}
+.slash-item {
+  display: flex;
+  align-items: baseline;
+  gap: 10px;
+  width: 100%;
+  border: none;
+  border-radius: var(--radius-button);
+  font-family: var(--sans);
+  text-align: left;
+  padding: 5px 8px;
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast);
+}
+.slash-name {
+  font-family: var(--mono);
+  font-size: 13px;
+  font-weight: 600;
+  flex: 0 0 auto;
+}
+.slash-desc {
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+.inputwrap .prompt {
+  font-family: var(--mono);
+  font-weight: 700;
+  color: var(--user-text);
+}
+
+.input {
+  flex: 1;
+  min-width: 0;
+  background: transparent;
+  border: none;
+  outline: none;
+  /* User's own text matches the user-message identity color (mirrors TUI). */
+  color: var(--user-text);
+  font-family: var(--mono);
+  font-size: 15px;
+  /* Auto-growing multi-line input: JS sets height to fit content; cap growth
+     here and scroll past the cap. No manual resize handle, wrap long lines. */
+  resize: none;
+  overflow-y: auto;
+  max-height: 40vh;
+  line-height: 1.5;
+  padding: 0;
+  margin: 0;
+}
+.input::-webkit-scrollbar {
+  width: 8px;
+}
+.input::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 4px;
+}
+
+.input::placeholder {
+  color: var(--text-dim);
+}
+
+.cancel {
+  background: transparent;
+  border: none;
+  font-family: var(--sans);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+  transition: color var(--t-fast);
+}
+.cancel:hover {
+  text-decoration: underline;
+}
+
+/* App-update banner — its own row below the footer so it reads as a distinct,
+   noticeable announcement. Same green gradient as the home-screen update pill
+   (#36c489 → #2dd4bf) with dark text; a light sweep draws the eye. The whole
+   row is the click target that downloads, installs, and restarts. */
+.update-banner {
+  position: relative;
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  gap: 9px;
+  width: 100%;
+  padding: 8px 18px;
+  border: none;
+  background: linear-gradient(135deg, #36c489 0%, #2dd4bf 100%);
+  color: #04130d;
+  font-family: var(--sans);
+  font-size: 13px;
+  font-weight: 600;
+  cursor: pointer;
+  overflow: hidden;
+  transition: filter var(--t-fast);
+}
+/* Light sweep across the banner to draw the eye to a pending update. */
+.update-banner::after {
+  content: "";
+  position: absolute;
+  inset: 0;
+  background: linear-gradient(
+    100deg,
+    transparent 30%,
+    rgba(255, 255, 255, 0.28) 50%,
+    transparent 70%
+  );
+  transform: translateX(-100%);
+  animation: update-shimmer 2.6s ease-in-out infinite;
+  pointer-events: none;
+}
+.update-banner-busy::after {
+  animation: none;
+}
+@keyframes update-shimmer {
+  0% {
+    transform: translateX(-100%);
+  }
+  60%,
+  100% {
+    transform: translateX(100%);
+  }
+}
+.update-banner:hover:not(.update-banner-busy) {
+  filter: brightness(1.08);
+}
+.update-banner-busy {
+  cursor: default;
+  filter: saturate(0.7) brightness(0.92);
+}
+.update-banner-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #04130d;
+  box-shadow: 0 0 0 0 rgba(4, 19, 13, 0.55);
+  animation: update-pulse 1.8s ease-out infinite;
+}
+@keyframes update-pulse {
+  0% {
+    box-shadow: 0 0 0 0 rgba(4, 19, 13, 0.5);
+  }
+  70% {
+    box-shadow: 0 0 0 7px transparent;
+  }
+  100% {
+    box-shadow: 0 0 0 0 transparent;
+  }
+}
+/* Home-screen update pill — small green-gradient chip floating above the ASCII
+   logo, shown only when an update is pending. Deliberately smaller than the
+   primary action buttons so it reads as a notification, not a main CTA. */
+.home-update {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  align-self: center;
+  background: linear-gradient(135deg, #36c489 0%, #2dd4bf 100%);
+  color: #04130d;
+  border: none;
+  border-radius: 999px;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  padding: 5px 12px;
+  cursor: pointer;
+  box-shadow: 0 4px 14px color-mix(in srgb, var(--success) 35%, transparent);
+  transition:
+    filter var(--t-fast),
+    transform var(--t-fast);
+}
+.home-update:hover:not(:disabled) {
+  filter: brightness(1.08);
+  transform: translateY(-1px);
+}
+.home-update:disabled {
+  opacity: 0.7;
+  cursor: default;
+}
+/* Shown in the update pill's place when already up to date — just the current
+   version, muted, so the spot never collapses/jumps. */
+.home-version {
+  align-self: center;
+  font-family: var(--mono);
+  font-size: 12px;
+  font-weight: 500;
+  color: var(--text-dim);
+  letter-spacing: 0.02em;
+}
+
+.footer {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 8px 18px;
+  font-size: 13px;
+  /* Reserve the bar's height before its contents hydrate so the input/
+     transcript above never shift when the footer fills in (8+8 padding +
+     ~20px line box). */
+  min-height: 37px;
+}
+
+/* Footer clusters reveal as one faded unit once the session has hydrated,
+   instead of cwd/git/thinking/model popping in piecemeal and reflowing. The
+   skeleton occupies the same box first, so this is a true crossfade in place. */
+.footer-reveal {
+  animation: reveal-up 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* Shared smooth entrance: a small rise + fade. Fast, eased, no layout cost
+   (transform/opacity only). Reused by footer, transcript, and list reveals. */
+@keyframes reveal-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+.transcript-reveal {
+  animation: reveal-up 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ── Skeletons: shape-preserving placeholders that crossfade to real content ──
+   A soft sheen sweeps across a neutral surface block. Pure background-position
+   animation, GPU-cheap, paused for reduced-motion users. */
+.skeleton {
+  display: inline-block;
+  position: relative;
+  overflow: hidden;
+  border-radius: var(--radius-pill);
+  background: linear-gradient(
+    100deg,
+    var(--surface-1) 0%,
+    var(--surface-1) 38%,
+    var(--surface-2) 50%,
+    var(--surface-1) 62%,
+    var(--surface-1) 100%
+  );
+  background-size: 220% 100%;
+  animation: skeleton-sweep 1.4s linear infinite;
+  /* Each skeleton group fades in so the placeholders themselves don't pop. */
+  vertical-align: middle;
+}
+@keyframes skeleton-sweep {
+  0% {
+    background-position: 180% 0;
+  }
+  100% {
+    background-position: -80% 0;
+  }
+}
+
+/* Transcript history placeholder: message-shaped rows. */
+.transcript-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 14px;
+  padding: 4px 0;
+}
+.skeleton-msg {
+  display: flex;
+  gap: 8px;
+  align-items: flex-start;
+  animation: reveal-up 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.skeleton-dot {
+  flex: 0 0 auto;
+  margin-top: 3px;
+}
+.skeleton-lines {
+  display: flex;
+  flex-direction: column;
+  gap: 7px;
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.skeleton-lines .skeleton {
+  border-radius: 5px;
+}
+
+/* Project / session list placeholder rows. */
+.list-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.skeleton-item {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  padding: 14px 16px;
+  border-radius: var(--radius-card);
+  animation: reveal-up 220ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+.skeleton-item .skeleton {
+  border-radius: 5px;
+}
+
+/* Picker list reveal: the loaded rows fade up once when discovery finishes
+   (the wrapper mounts once, so filtering doesn't re-trigger it). */
+.picker-reveal {
+  display: contents;
+}
+.picker-reveal > .picker-item {
+  animation: reveal-up 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .footer-reveal,
+  .transcript-reveal,
+  .skeleton-msg,
+  .skeleton-item,
+  .picker-reveal > .picker-item {
+    animation-name: none;
+  }
+  .skeleton {
+    animation: none;
+    background: var(--surface-1);
+  }
+}
+
+/* Left cluster shrinks first; the git branch truncates rather than deforming
+   the bar when the window narrows. */
+.footer-left {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  overflow: hidden;
+  white-space: nowrap;
+}
+/* Dividers sit flush (no flex gap) so ` │ ` reads as one separator unit. */
+.footer-sep {
+  flex: 0 0 auto;
+}
+/* cwd is the first thing to truncate when the bar gets tight. */
+.footer-cwd {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+
+/* Right cluster holds the controls (context, thinking, model, provider) at
+   their natural size so they stay legible and clickable. */
+.footer-right {
+  flex: 0 0 auto;
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  min-width: 0;
+}
+
+/* Thinking level: borderless colored text (mirrors TUI footer), color graded
+   by tier. No badge, no icon — just the label changing hue. */
+.thinking-toggle {
+  background: transparent;
+  border: none;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 0;
+  cursor: pointer;
+  line-height: 1.55;
+  transition: color var(--t-fast);
+}
+.thinking-toggle:hover {
+  text-decoration: underline;
+}
+
+/* ── Footer: context meter ── */
+.ctx-meter {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-family: var(--mono);
+}
+.ctx-meter-track {
+  display: inline-block;
+  width: 56px;
+  height: 5px;
+  background: var(--surface-2);
+  border-radius: var(--radius-pill);
+  overflow: hidden;
+}
+.ctx-meter-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-pill);
+  transition: width var(--t-fast);
+}
+.ctx-meter-pct {
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;
+}
+
+/* ── Footer: background tasks indicator + popover ── */
+.bgtasks {
+  position: relative;
+  display: inline-flex;
+  margin-left: 10px;
+}
+.bgtasks-button {
+  background: transparent;
+  border: 1px solid;
+  border-radius: var(--radius-pill);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 0 8px;
+  cursor: pointer;
+  line-height: 1.5;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.bgtasks-button:hover {
+  background: var(--surface-1);
+}
+.bgtasks-menu {
+  /* Fixed (not absolute) so the footer's `overflow: hidden` doesn't clip the
+     upward popover. left/bottom are set inline from the button's rect. */
+  position: fixed;
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  padding: 6px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 100;
+  min-width: 280px;
+  max-width: min(440px, 90vw);
+}
+.bgtasks-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 6px 6px;
+}
+.bgtasks-empty {
+  padding: 6px;
+  font-size: 12px;
+}
+.bgtasks-item {
+  display: flex;
+  align-items: baseline;
+  gap: 8px;
+  padding: 4px 6px;
+  border-radius: var(--radius-button);
+  font-size: 12.5px;
+}
+.bgtasks-dot {
+  flex: 0 0 auto;
+  font-size: 9px;
+}
+.bgtasks-cmd {
+  flex: 1 1 auto;
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.bgtasks-status {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11px;
+}
+.bgtasks-kill {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  font-family: var(--mono);
+  font-size: 12px;
+  cursor: pointer;
+  padding: 0;
+}
+.bgtasks-kill:hover {
+  text-decoration: underline;
+}
+
+/* ── Model picker (footer, opens upward) ── */
+.model-anchor {
+  position: relative;
+  display: inline-flex;
+}
+
+.model-button {
+  background: transparent;
+  border: none;
+  font-family: var(--mono);
+  font-size: 13px;
+  cursor: pointer;
+  padding: 0;
+  transition: color var(--t-fast);
+}
+.model-button:hover:not(:disabled) {
+  text-decoration: underline;
+}
+.model-button:disabled {
+  cursor: default;
+}
+
+.model-menu {
+  position: absolute;
+  bottom: calc(100% + 8px);
+  right: 0;
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  padding: 8px;
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  z-index: 50;
+  max-width: min(640px, 90vw);
+  max-height: 50vh;
+  overflow-y: auto;
+}
+
+.model-menu-title {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  padding: 2px 6px 6px;
+}
+
+.model-menu-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
+  gap: 2px 8px;
+}
+
+.model-menu-item {
+  border: none;
+  border-radius: var(--radius-button);
+  font-family: var(--mono);
+  font-size: 12.5px;
+  text-align: left;
+  padding: 4px 8px;
+  cursor: pointer;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast);
+}
+.model-menu-item:hover {
+  background: var(--surface-1) !important;
+}
+
+.meter {
+  display: inline-block;
+  width: 90px;
+  height: 10px;
+  background: var(--border);
+  border-radius: 2px;
+  overflow: hidden;
+  position: relative;
+}
+
+.meter-bar {
+  position: absolute;
+  left: 0;
+  top: 0;
+  bottom: 0;
+  width: 6px;
+}

@@ -134,7 +134,10 @@ export class ScreenRecorder {
     if (final === "H" || final === "f") {
       const row = Number.isFinite(values[0]) && values[0]! > 0 ? values[0]! - 1 : 0;
       const col = Number.isFinite(values[1]) && values[1]! > 0 ? values[1]! - 1 : 0;
-      this.cursorRow = row;
+      // Cursor addressing is VIEWPORT-relative: row 1 is the top of the
+      // visible screen, not the top of the cumulative buffer (scrollback).
+      const viewportStart = Math.max(0, this.lines.length - this.rows);
+      this.cursorRow = viewportStart + row;
       this.cursorCol = Math.max(0, Math.min(this.columns - 1, col));
       this.ensureLine(this.cursorRow);
       return;
@@ -144,6 +147,12 @@ export class ScreenRecorder {
         this.lines = [[]];
         this.cursorRow = 0;
         this.cursorCol = 0;
+      } else if (first === 0) {
+        // ED 0 — erase from cursor to end of screen, in place (no scrollback
+        // push): clear the rest of the current line and drop lines below.
+        this.ensureLine(this.cursorRow);
+        this.lines[this.cursorRow] = this.lines[this.cursorRow]!.slice(0, this.cursorCol);
+        this.lines.length = this.cursorRow + 1;
       }
       return;
     }

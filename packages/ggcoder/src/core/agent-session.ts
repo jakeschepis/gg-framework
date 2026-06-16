@@ -1,5 +1,13 @@
 import { agentLoop, isAbortError, type AgentEvent, type AgentTool } from "@kenkaiiii/gg-agent";
-import { ProviderError, type Message, type Provider, type ThinkingLevel } from "@kenkaiiii/gg-ai";
+import {
+  ProviderError,
+  type Message,
+  type Provider,
+  type ThinkingLevel,
+  type TextContent,
+  type ImageContent,
+  type VideoContent,
+} from "@kenkaiiii/gg-ai";
 import { EventBus } from "./event-bus.js";
 import {
   SlashCommandRegistry,
@@ -20,11 +28,30 @@ import { getContextWindow, getModel, MODELS } from "./model-registry.js";
 import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
 import { buildSystemPrompt } from "../system-prompt.js";
-import { createTools, createWebSearchTool, type ProcessManager } from "../tools/index.js";
+import {
+  createTools,
+  createWebSearchTool,
+  type LspManager,
+  type ProcessManager,
+} from "../tools/index.js";
+import type { BackgroundProcess } from "./process-manager.js";
 import { MCPClientManager, getMCPServers, getAllMcpServers } from "./mcp/index.js";
 import { log } from "./logger.js";
 import { setEstimatorModel } from "./compaction/token-estimator.js";
 import { discoverAgents } from "./agents.js";
+import { generateSessionTitle } from "../utils/session-title.js";
+import {
+  type IdealReviewStats,
+  evaluateIdealReview,
+  buildIdealReviewMessage,
+} from "./ideal-review.js";
+import {
+  evaluateLoopBreak,
+  buildLoopBreakMessage,
+  toolCallSignature,
+  detectTextRepetition,
+} from "./loop-breaker.js";
+import { buildRegroundingMessage } from "./regrounding.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -59,6 +86,14 @@ export interface AgentSessionOptions {
    * resumable identity.
    */
   transient?: boolean;
+  /**
+   * Plan-mode callbacks. When provided, the `enter_plan`/`exit_plan` tools are
+   * registered and the session manages plan-mode restrictions + system-prompt
+   * rebuilds. Hosts (e.g. the gg-app sidecar) use these to surface plan-mode
+   * UI. Omitted by callers that don't want plan mode (CLI wires its own).
+   */
+  onEnterPlan?: (reason?: string) => void | Promise<void>;
+  onExitPlan?: (planPath: string) => Promise<string>;
 }
 
 // ── State ──────────────────────────────────────────────────
@@ -70,6 +105,7 @@ export interface AgentSessionState {
   sessionId: string;
   sessionPath: string;
   messageCount: number;
+  planMode: boolean;
 }
 
 // ── Agent Session ──────────────────────────────────────────
@@ -87,7 +123,36 @@ export class AgentSession {
   private tools: AgentTool[] = [];
   private skills: Skill[] = [];
   private cacheKeyLogged = false;
+  // ── Self-correction hook state (mirrors the TUI's useAgentLoop refs) ──
+  // Reset at the start of every run; observed from the event stream; read by
+  // the loop-break (mid-loop) and ideal-review (pre-stop) callbacks.
+  private hookStats: IdealReviewStats = {
+    changedLines: 0,
+    toolCalls: 0,
+    toolFailures: 0,
+    turns: 0,
+    writeCalls: 0,
+    editCalls: 0,
+    bashCalls: 0,
+  };
+  private hookText = "";
+  private hookConsecutiveFailures = 0;
+  private hookMaxSignatureRepeats = 0;
+  private hookMaxSameFileEdits = 0;
+  private hookSignatureCounts = new Map<string, number>();
+  private hookFileEditCounts = new Map<string, number>();
+  private hookToolCalls = new Map<string, { name: string; args: Record<string, unknown> }>();
+  private idealReviewInjected = false;
+  private loopBreakInjected = false;
+  private regroundingInjected = false;
+  private compactionOccurred = false;
+  private originalRequest = "";
+  // Messages queued by the user while a run is in flight. Drained at the
+  // mid-loop steering boundary (user steering wins over the hooks), mirroring
+  // the TUI's getSteeringMessages.
+  private userQueue: string[] = [];
   private processManager?: ProcessManager;
+  private lspManager?: LspManager;
   private mcpManager?: MCPClientManager;
   private provider: Provider;
   private model: string;
@@ -96,6 +161,8 @@ export class AgentSession {
   private maxTokens: number;
   private thinkingLevel?: ThinkingLevel;
   private customSystemPrompt?: string;
+  /** Shared with the tool layer so plan-mode restrictions read live state. */
+  private planModeRef = { current: false };
 
   private sessionId = "";
   private sessionPath = "";
@@ -149,17 +216,28 @@ export class AgentSession {
       globalAgentsDir: paths.agentsDir,
       projectDir: this.cwd,
     });
-    const { tools, processManager } = createTools(this.cwd, {
+    const { tools, processManager, lspManager } = createTools(this.cwd, {
       agents,
       skills: this.skills,
       provider: this.provider,
       model: this.model,
+      lspDiagnostics: this.settingsManager.get("lspDiagnostics"),
       // Lazy — sessionId isn't assigned yet when createTools() runs, so we
       // must defer reading the cache key until the sub-agent actually fires.
       getCacheKey: () => this.getPromptCacheKey(),
+      // Plan mode: only wired when the host supplies callbacks. The ref is
+      // shared so bash/edit/write enforce read-only restrictions live.
+      ...(this.opts.onEnterPlan || this.opts.onExitPlan
+        ? {
+            planModeRef: this.planModeRef,
+            onEnterPlan: this.opts.onEnterPlan,
+            onExitPlan: this.opts.onExitPlan,
+          }
+        : {}),
     });
     this.tools = tools;
     this.processManager = processManager;
+    this.lspManager = lspManager;
 
     // Connect MCP servers (non-blocking — failures are logged and skipped)
     this.mcpManager = new MCPClientManager();
@@ -316,6 +394,176 @@ export class AgentSession {
     await this.runLoop();
   }
 
+  /**
+   * Prompt with multimodal attachments (images / videos) alongside optional
+   * text. Images and videos become native content blocks the model can see;
+   * non-media files are surfaced as a text note with their saved path so the
+   * agent can open them with its tools. Slash-command parsing is skipped —
+   * attachments are always a direct conversational turn.
+   */
+  async promptWithAttachments(
+    text: string,
+    attachments: Array<{
+      kind: "image" | "video" | "file";
+      mediaType: string;
+      data: string;
+      name: string;
+      path?: string;
+    }>,
+  ): Promise<void> {
+    const parts: Array<TextContent | ImageContent | VideoContent> = [];
+    const fileNotes: string[] = [];
+    for (const a of attachments) {
+      if (a.kind === "image") {
+        parts.push({ type: "image", mediaType: a.mediaType, data: a.data });
+      } else if (a.kind === "video") {
+        parts.push({ type: "video", mediaType: a.mediaType, data: a.data });
+      } else if (a.path) {
+        fileNotes.push(`- ${a.name} (saved at ${a.path})`);
+      }
+    }
+    const textParts: string[] = [];
+    if (text.trim()) textParts.push(text.trim());
+    if (fileNotes.length > 0) {
+      textParts.push(`Attached files (inspect with your tools):\n${fileNotes.join("\n")}`);
+    }
+    if (textParts.length > 0) parts.unshift({ type: "text", text: textParts.join("\n\n") });
+    if (parts.length === 0) return;
+
+    const userMessage: Message = { role: "user", content: parts };
+    this.messages.push(userMessage);
+    await this.persistMessage(userMessage);
+    this.lastPersistedIndex = this.messages.length;
+    await this.runLoop();
+  }
+
+  /**
+   * Reset per-run self-correction hook state. Mirrors the TUI's run_start
+   * resets so each run evaluates the hooks from a clean slate. `originalRequest`
+   * is the verbatim user ask, pinned for post-compaction re-grounding.
+   */
+  private resetHookState(originalRequest: string): void {
+    this.hookStats = {
+      changedLines: 0,
+      toolCalls: 0,
+      toolFailures: 0,
+      turns: 0,
+      writeCalls: 0,
+      editCalls: 0,
+      bashCalls: 0,
+    };
+    this.hookText = "";
+    this.hookConsecutiveFailures = 0;
+    this.hookMaxSignatureRepeats = 0;
+    this.hookMaxSameFileEdits = 0;
+    this.hookSignatureCounts.clear();
+    this.hookFileEditCounts.clear();
+    this.hookToolCalls.clear();
+    this.idealReviewInjected = false;
+    this.loopBreakInjected = false;
+    this.regroundingInjected = false;
+    this.compactionOccurred = false;
+    this.originalRequest = originalRequest;
+  }
+
+  /**
+   * Fold one agent event into the hook stat accumulators. Pure bookkeeping —
+   * the same signals the TUI's useAgentLoop collects, so the loop-break and
+   * ideal-review decisions match across the CLI and the app.
+   */
+  private trackHookEvent(event: AgentEvent): void {
+    switch (event.type) {
+      case "text_delta":
+        this.hookText += event.text;
+        break;
+      case "tool_call_start":
+        this.hookToolCalls.set(event.toolCallId, { name: event.name, args: event.args ?? {} });
+        break;
+      case "tool_call_end": {
+        const call = this.hookToolCalls.get(event.toolCallId);
+        const name = call?.name ?? "";
+        const args = call?.args;
+        this.hookStats.toolCalls += 1;
+        if (event.isError) this.hookStats.toolFailures += 1;
+        if (name === "write") this.hookStats.writeCalls += 1;
+        if (name === "edit") this.hookStats.editCalls += 1;
+        if (name === "bash") this.hookStats.bashCalls += 1;
+        this.hookConsecutiveFailures = event.isError ? this.hookConsecutiveFailures + 1 : 0;
+        const sig = toolCallSignature(name, args);
+        const sigNext = (this.hookSignatureCounts.get(sig) ?? 0) + 1;
+        this.hookSignatureCounts.set(sig, sigNext);
+        if (sigNext > this.hookMaxSignatureRepeats) this.hookMaxSignatureRepeats = sigNext;
+        if ((name === "edit" || name === "write") && args) {
+          const filePath = (args as { file_path?: unknown }).file_path;
+          if (typeof filePath === "string") {
+            const fileNext = (this.hookFileEditCounts.get(filePath) ?? 0) + 1;
+            this.hookFileEditCounts.set(filePath, fileNext);
+            if (fileNext > this.hookMaxSameFileEdits) this.hookMaxSameFileEdits = fileNext;
+          }
+        }
+        if (name === "edit" && !event.isError) {
+          const diff = (event.details as { diff?: string } | undefined)?.diff ?? event.result;
+          const added = (diff.match(/^\+[^+]/gm) ?? []).length;
+          const removed = (diff.match(/^-[^-]/gm) ?? []).length;
+          this.hookStats.changedLines += added + removed;
+        }
+        break;
+      }
+      case "turn_end":
+        this.hookStats.turns = event.turn;
+        break;
+    }
+  }
+
+  /**
+   * Mid-loop steering hook: fires the loop-breaker when the agent looks stuck,
+   * then post-compaction re-grounding. At most one of each per run. Mirrors the
+   * TUI's getSteeringMessages ordering (minus user steering, which the app
+   * delivers as normal prompts).
+   */
+  private getHookSteeringMessages(): Message[] | null {
+    // User steering wins: drain any messages queued during this run first so the
+    // agent sees them mid-loop instead of after it stops.
+    if (this.userQueue.length > 0) {
+      const merged = this.userQueue.splice(0).join("\n\n");
+      return [{ role: "user", content: merged }];
+    }
+    if (!this.settingsManager.get("idealReviewEnabled")) return null;
+    if (!this.loopBreakInjected) {
+      const decision = evaluateLoopBreak({
+        consecutiveFailures: this.hookConsecutiveFailures,
+        maxSignatureRepeats: this.hookMaxSignatureRepeats,
+        maxSameFileEdits: this.hookMaxSameFileEdits,
+        textRepetitionDetected: detectTextRepetition(this.hookText),
+      });
+      if (decision.shouldBreak) {
+        this.loopBreakInjected = true;
+        this.eventBus.emit("hook", { kind: "loop_break" });
+        return [buildLoopBreakMessage(decision.reasons)];
+      }
+    }
+    if (!this.regroundingInjected && this.compactionOccurred) {
+      this.regroundingInjected = true;
+      this.eventBus.emit("hook", { kind: "regrounding" });
+      return [buildRegroundingMessage(this.originalRequest)];
+    }
+    return null;
+  }
+
+  /**
+   * Pre-stop follow-up hook: runs the ideal review once, when the agent would
+   * otherwise finish and the change set is substantial enough to warrant it.
+   */
+  private getHookFollowUpMessages(): Message[] | null {
+    if (!this.settingsManager.get("idealReviewEnabled")) return null;
+    if (this.idealReviewInjected) return null;
+    const decision = evaluateIdealReview(this.hookStats);
+    if (!decision.shouldReview) return null;
+    this.idealReviewInjected = true;
+    this.eventBus.emit("hook", { kind: "ideal" });
+    return [buildIdealReviewMessage(decision.reasons)];
+  }
+
   /** Auto-compact if needed, run agent loop with auth retry, and persist messages. */
   private async runLoop(): Promise<void> {
     // One-shot cache-key marker per session so turn_end cacheRead numbers
@@ -330,6 +578,12 @@ export class AgentSession {
         transient: String(!!this.opts.transient),
       });
     }
+
+    // Reset self-correction hook state for this run; pin the latest user message
+    // as the verbatim original request for post-compaction re-grounding.
+    const lastUser = [...this.messages].reverse().find((m) => m.role === "user");
+    const originalRequest = typeof lastUser?.content === "string" ? lastUser.content : "";
+    this.resetHookState(originalRequest);
 
     // Resolve OAuth credentials and run agent loop.
     // On 401, force-refresh the token and retry once — the provider may have
@@ -347,6 +601,8 @@ export class AgentSession {
       const threshold = this.settingsManager.get("compactThreshold");
       if (shouldCompact(this.messages, contextWindow, threshold)) {
         await this.compact(creds);
+        // Re-grounding hook keys off this — the context was just summarized.
+        this.compactionOccurred = true;
       }
     }
 
@@ -385,9 +641,14 @@ export class AgentSession {
         maxToolResultChars: Math.floor(
           getContextWindow(this.model, { provider: this.provider, accountId }) * 3.5 * 0.3,
         ),
+        // Self-correction hooks (same as the TUI): loop-break + re-grounding are
+        // polled mid-loop; the ideal review is polled when the agent would stop.
+        getSteeringMessages: () => this.getHookSteeringMessages(),
+        getFollowUpMessages: () => this.getHookFollowUpMessages(),
       });
 
       for await (const event of generator as AsyncIterable<AgentEvent>) {
+        this.trackHookEvent(event);
         this.eventBus.forwardAgentEvent(event);
       }
     };
@@ -611,11 +872,114 @@ export class AgentSession {
       sessionId: this.sessionId,
       sessionPath: this.sessionPath,
       messageCount: this.messages.length,
+      planMode: this.planModeRef.current,
     };
+  }
+
+  getPlanMode(): boolean {
+    return this.planModeRef.current;
+  }
+
+  /** Queue a user message to be injected mid-run as steering. Returns the new
+   *  queue length. No-op semantics are the caller's concern. */
+  queueMessage(text: string): number {
+    this.userQueue.push(text);
+    return this.userQueue.length;
+  }
+
+  /** Number of messages currently queued. */
+  getQueuedCount(): number {
+    return this.userQueue.length;
+  }
+
+  /** Clear the queue, returning the combined text (to restore to the composer). */
+  drainQueue(): string {
+    return this.userQueue.splice(0).join("\n\n");
+  }
+
+  /** Snapshot of background processes (bash run_in_background), newest-state. */
+  listBackgroundProcesses(): BackgroundProcess[] {
+    return this.processManager?.list() ?? [];
+  }
+
+  /** Stop a background process by id. Returns a human-readable status string. */
+  async killBackgroundProcess(id: string): Promise<string> {
+    if (!this.processManager) return `No background process with id "${id}"`;
+    return this.processManager.stop(id);
+  }
+
+  /**
+   * Toggle plan mode: flips the shared ref (so tools enforce read-only
+   * restrictions) and rebuilds the system prompt in place so the model is told
+   * about the mode change on its next turn. No-op when a custom system prompt
+   * is in force (the host owns the prompt then).
+   */
+  async setPlanMode(active: boolean): Promise<void> {
+    this.planModeRef.current = active;
+    if (this.customSystemPrompt) return;
+    const rebuilt = await buildSystemPrompt(
+      this.cwd,
+      this.skills,
+      active,
+      undefined,
+      this.tools.map((tool) => tool.name),
+      undefined,
+      this.provider,
+    );
+    if (this.messages[0]?.role === "system") {
+      this.messages[0] = { role: "system", content: rebuilt };
+    } else {
+      this.messages.unshift({ role: "system", content: rebuilt });
+    }
   }
 
   getMessages(): Message[] {
     return this.messages;
+  }
+
+  /**
+   * Generate a short LLM session title from the conversation so far (first user
+   * message + first assistant reply). Best-effort; returns null on failure or
+   * when there's no user message yet. Uses the cheapest model for the provider.
+   */
+  async generateTitle(): Promise<string | null> {
+    const extractText = (content: Message["content"]): string =>
+      typeof content === "string"
+        ? content
+        : content
+            .map((c) =>
+              c.type === "text" && "text" in c && typeof c.text === "string" ? c.text : "",
+            )
+            .join(" ");
+    const userMsg = this.messages.find((m) => m.role === "user");
+    const assistantMsg = this.messages.find((m) => m.role === "assistant");
+    const userText = userMsg ? extractText(userMsg.content) : "";
+    if (!userText.trim()) return null;
+    try {
+      const creds = await this.authStorage.resolveCredentials(this.provider);
+      const title = await generateSessionTitle({
+        provider: this.provider,
+        userMessage: userText,
+        assistantPreview: assistantMsg ? extractText(assistantMsg.content).slice(0, 200) : "",
+        apiKey: creds.accessToken,
+        baseUrl: this.baseUrl ?? creds.baseUrl,
+        accountId: creds.accountId,
+      });
+      return title || null;
+    } catch {
+      return null;
+    }
+  }
+
+  /** Current reasoning/thinking level, or undefined when thinking is off. */
+  getThinkingLevel(): ThinkingLevel | undefined {
+    return this.thinkingLevel;
+  }
+
+  /** Set the reasoning/thinking level (undefined turns thinking off). Takes
+   * effect on the next prompt, since the in-flight loop reads it at start. */
+  setThinkingLevel(level: ThinkingLevel | undefined): void {
+    this.thinkingLevel = level;
   }
 
   /** Replace the abort signal (e.g. after cancellation). */
@@ -636,6 +1000,7 @@ export class AgentSession {
 
   async dispose(): Promise<void> {
     this.processManager?.shutdownAll();
+    this.lspManager?.shutdownAll();
     await this.mcpManager?.dispose();
     await this.extensionLoader.deactivateAll();
     this.eventBus.removeAllListeners();

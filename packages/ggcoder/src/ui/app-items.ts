@@ -358,3 +358,20 @@ export type CompletedItem =
   | StoppedItem
   | TombstoneItem
   | StepDoneItem;
+
+/**
+ * True when a transcript item carries one or more inline-image previews.
+ *
+ * Used to detect images in a transcript region before the bottom-anchor shrink
+ * backfill tries to reconstruct it as text. A graphics escape's base64 payload
+ * is not recognized as zero-width by `wrapAnsi` (it hard-wraps into literal
+ * base64 text) and its visual row count never matches its newline count, so a
+ * text-only repaint of an image region desyncs Ink's erase math and displaces
+ * the on-screen image. Callers bail out of the text repaint when this is true.
+ */
+export function itemHasImagePreviews(item: {
+  kind: string;
+  imagePreviews?: readonly unknown[];
+}): boolean {
+  return !!(item.imagePreviews && item.imagePreviews.length > 0);
+}

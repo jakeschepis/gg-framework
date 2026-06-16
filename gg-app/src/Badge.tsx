@@ -1,0 +1,39 @@
+import { theme } from "./theme";
+
+/**
+ * Small pill badge with a consistent shape/size across the app. Defaults to a
+ * neutral surface pill (Resend scarcity: color is reserved as a data signal).
+ * Pass an explicit `color` to tint the background/border/text — used for source
+ * badges where the hue *is* the indicator.
+ */
+export function Badge({
+  children,
+  color,
+}: {
+  children: React.ReactNode;
+  color?: string;
+}): React.ReactElement {
+  const style = color
+    ? { color, backgroundColor: `${color}22`, borderColor: `${color}55` }
+    : {
+        color: theme.textSecondary,
+        backgroundColor: theme.surface1,
+        borderColor: theme.border,
+      };
+  return (
+    <span className="badge" style={style}>
+      {children}
+    </span>
+  );
+}
+
+/** Project source → display label + accent color. One home so badges stay consistent. */
+const SOURCE_STYLES: Record<string, { label: string; color: string }> = {
+  ggcoder: { label: "gg-coder", color: theme.primary }, // blue
+  "claude-code": { label: "Claude Code", color: "#d97757" }, // Anthropic clay
+  codex: { label: "Codex", color: "#aeb6c2" }, // neutral silver
+};
+
+export function sourceStyle(source: string): { label: string; color: string } {
+  return SOURCE_STYLES[source] ?? { label: source, color: theme.textMuted };
+}

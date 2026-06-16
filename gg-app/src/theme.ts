@@ -1,0 +1,50 @@
+// Verified OKLCH/APCA design tokens (Warp × Linear × Resend synthesis).
+// Mirrors the :root custom properties in App.css so inline-style consumers and
+// the stylesheet share one source of truth. Existing key names are kept as
+// aliases (new hex values) to minimize component churn.
+export const theme = {
+  name: "dark",
+
+  // Surfaces — cool charcoal ramp, elevation by ΔL only (no shadows).
+  background: "#0f1115",
+  surface1: "#161922",
+  surface2: "#1d212b",
+  border: "#272b36",
+  borderStrong: "#353a47",
+
+  // Text — neutral-cool, APCA-gated.
+  text: "#f4f6f8",
+  textSecondary: "#c3c9d4",
+  textMuted: "#9aa3b2",
+  textDim: "#5b6472",
+
+  // Accents — true sibling set (OKLCH L 69–76); dot/icon/border/verb colors.
+  primary: "#4d9dff",
+  secondary: "#9b8cf7",
+  success: "#36c489",
+  warning: "#e3a23f",
+  error: "#f2716e",
+  info: "#2dd4bf",
+
+  // Aliases mapped onto the accent family for existing consumers.
+  accent: "#9b8cf7",
+  toolName: "#4d9dff",
+  toolSuccess: "#36c489",
+  toolError: "#f2716e",
+  code: "#e3a23f",
+  language: "#2dd4bf",
+  footerText: "#9aa3b2",
+  commandColor: "#9b8cf7",
+  link: "#4d9dff",
+
+  inputBackground: "#161922",
+
+  // User text + chip — mirrors the ggcoder TUI (commandColor #818cf8 on the
+  // #374151 message fill). Shared by the user bubble and the chat input so the
+  // "this is you" color reads identically in both places.
+  userText: "#818cf8",
+  userBackground: "#313a49",
+} as const;
+
+// User-message chip background — mirrors USER_MESSAGE_BACKGROUND in the TUI.
+export const USER_MESSAGE_BACKGROUND = "#313a49";

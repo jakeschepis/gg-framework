@@ -215,6 +215,19 @@ export function countOversizedFlushItems(
   return 0;
 }
 
+export function splitOversizedPinnedItems<T extends { kind: string; text?: string }>(
+  items: readonly T[],
+  estimateRows: (text: string) => number,
+  liveAreaRows: number,
+): { flushed: T[]; remaining: T[] } {
+  const count = countOversizedFlushItems(items, estimateRows, liveAreaRows);
+  if (count <= 0) return { flushed: [], remaining: [...items] };
+  return {
+    flushed: [...items.slice(0, count)],
+    remaining: [...items.slice(count)],
+  };
+}
+
 /**
  * Called when `onTurnEnd` fires with a tool_use stop reason (LLM responded
  * with only tool calls, no text). Flushes all items IF none are still pending

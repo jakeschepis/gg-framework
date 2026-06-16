@@ -54,6 +54,11 @@ import { renderApp } from "./ui/render.js";
 import { runJsonMode } from "./modes/json-mode.js";
 import { runRpcMode } from "./modes/rpc-mode.js";
 import { runServeMode } from "./modes/serve-mode.js";
+import {
+  loadTelegramConfig,
+  saveTelegramConfig,
+  isValidBotTokenFormat,
+} from "./core/telegram-config.js";
 import { runAgentHomeMode } from "./modes/agent-home-mode.js";
 import { renderSessionSelector } from "./ui/sessions.js";
 import type { CompletedItem } from "./ui/app-items.js";
@@ -344,7 +349,7 @@ function main(): void {
     if (p === "openai") return "gpt-5.5";
     if (p === "gemini") return "gemini-3.1-flash-lite-preview";
     if (p === "glm") return "glm-5.1";
-    if (p === "moonshot") return "kimi-k2.6";
+    if (p === "moonshot") return "kimi-k2.7-code";
     if (p === "minimax") return "MiniMax-M3";
     if (p === "deepseek") return "deepseek-v4-pro";
     if (p === "openrouter") return "qwen/qwen3.6-plus";
@@ -366,6 +371,7 @@ function main(): void {
     cwd,
     thinkingLevel,
     idealReviewEnabled: saved.idealReviewEnabled,
+    lspDiagnostics: saved.lspDiagnostics,
     continueRecent,
     resumeSessionPath: values.resume,
     theme: savedTheme,
@@ -389,6 +395,7 @@ async function runInkTUI(opts: {
   theme?: "auto" | ThemeName;
   initialOverlay?: "pixel";
   idealReviewEnabled?: boolean;
+  lspDiagnostics?: boolean;
 }): Promise<void> {
   requireInteractiveTTY();
 
@@ -521,33 +528,41 @@ async function runInkTUI(opts: {
   const onPreFileMutation = (filePath: string): Promise<void> =>
     checkpointRef.current?.recordPreMutation(filePath) ?? Promise.resolve();
 
-  const { tools, processManager, rebuildReadTool } = createTools(cwd, {
+  const { tools, processManager, rebuildReadTool, lspManager } = createTools(cwd, {
     agents,
     skills,
     provider,
     model,
     planModeRef,
     onPreFileMutation,
+    lspDiagnostics: opts.lspDiagnostics,
     onEnterPlan: (reason) => planToolCallbacks.onEnterPlan?.(reason),
     onExitPlan: (planPath) =>
       planToolCallbacks.onExitPlan?.(planPath) ?? Promise.resolve("Plan review is unavailable."),
   });
 
+  // The active LSP pool follows the active tool set — rebuilds (pixel chdir)
+  // shut the old pool down and swap in the new one.
+  let activeLspManager = lspManager;
+
   // Rebuilds the cwd-bound tools for a different project root. Used by the
   // pixel-fix flow so the agent operates in the error's project, not in
   // wherever ggcoder was launched from.
   const rebuildToolsForCwd = (newCwd: string) => {
-    const { tools: rebuilt } = createTools(newCwd, {
+    activeLspManager?.shutdownAll();
+    const { tools: rebuilt, lspManager: rebuiltLspManager } = createTools(newCwd, {
       agents,
       skills,
       provider,
       model,
       planModeRef,
       onPreFileMutation,
+      lspDiagnostics: opts.lspDiagnostics,
       onEnterPlan: (reason) => planToolCallbacks.onEnterPlan?.(reason),
       onExitPlan: (planPath) =>
         planToolCallbacks.onExitPlan?.(planPath) ?? Promise.resolve("Plan review is unavailable."),
     });
+    activeLspManager = rebuiltLspManager;
     return rebuilt;
   };
 
@@ -578,6 +593,7 @@ async function runInkTUI(opts: {
   // Kill all background processes on exit (synchronous — catches all exit paths)
   process.on("exit", () => {
     processManager.shutdownAll();
+    activeLspManager?.shutdownAll();
     mcpManager.dispose().catch(() => {});
   });
 
@@ -775,7 +791,7 @@ async function runSessions(): Promise<void> {
     if (p === "openai") return "gpt-5.5";
     if (p === "gemini") return "gemini-3.1-flash-lite-preview";
     if (p === "glm") return "glm-5.1";
-    if (p === "moonshot") return "kimi-k2.6";
+    if (p === "moonshot") return "kimi-k2.7-code";
     if (p === "minimax") return "MiniMax-M3";
     if (p === "deepseek") return "deepseek-v4-pro";
     return "claude-opus-4-8";
@@ -794,36 +810,13 @@ async function runSessions(): Promise<void> {
     cwd,
     thinkingLevel,
     idealReviewEnabled: saved2.idealReviewEnabled,
+    lspDiagnostics: saved2.lspDiagnostics,
     resumeSessionPath: selectedPath,
     theme: saved2.theme,
   });
 }
 
 // ── Telegram Setup ───────────────────────────────────────
-
-interface TelegramConfig {
-  botToken: string;
-  userId: number;
-}
-
-async function loadTelegramConfig(): Promise<TelegramConfig | null> {
-  try {
-    const raw = await fs.promises.readFile(getAppPaths().telegramFile, "utf-8");
-    const data = JSON.parse(raw) as TelegramConfig;
-    if (data.botToken && data.userId) return data;
-    return null;
-  } catch {
-    return null;
-  }
-}
-
-async function saveTelegramConfig(config: TelegramConfig): Promise<void> {
-  const paths = await ensureAppDirs();
-  await fs.promises.writeFile(paths.telegramFile, JSON.stringify(config, null, 2), {
-    encoding: "utf-8",
-    mode: 0o600,
-  });
-}
 
 async function runTelegramSetup(): Promise<void> {
   clearVisibleScreen();
@@ -882,7 +875,7 @@ async function runTelegramSetup(): Promise<void> {
     }
 
     // Validate token format (roughly: digits:alphanumeric)
-    if (!/^\d+:[A-Za-z0-9_-]+$/.test(botToken)) {
+    if (!isValidBotTokenFormat(botToken)) {
       console.log(chalk.hex("#ef4444")("\n  Invalid token format. Expected: 123456789:ABCdef..."));
       return;
     }

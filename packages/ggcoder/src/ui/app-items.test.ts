@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { lastVisibleTranscriptItem } from "./app-items.js";
+import { lastVisibleTranscriptItem, itemHasImagePreviews } from "./app-items.js";
 
 describe("lastVisibleTranscriptItem", () => {
   it("returns the last item when nothing is panel-replaced", () => {
@@ -38,5 +38,24 @@ describe("lastVisibleTranscriptItem", () => {
 
   it("returns undefined for an empty list", () => {
     expect(lastVisibleTranscriptItem([])).toBeUndefined();
+  });
+});
+
+describe("itemHasImagePreviews", () => {
+  it("is true for items carrying image previews", () => {
+    expect(itemHasImagePreviews({ kind: "user", imagePreviews: [{ base64: "AAAA" }] })).toBe(true);
+  });
+
+  it("is false for items with no previews or an empty list", () => {
+    expect(itemHasImagePreviews({ kind: "assistant" })).toBe(false);
+    expect(itemHasImagePreviews({ kind: "tool_done", imagePreviews: [] })).toBe(false);
+  });
+
+  it("detects an image anywhere in a transcript via some()", () => {
+    const history = [
+      { kind: "assistant", imagePreviews: undefined },
+      { kind: "user", imagePreviews: [{ base64: "x" }] },
+    ];
+    expect(history.some(itemHasImagePreviews)).toBe(true);
   });
 });

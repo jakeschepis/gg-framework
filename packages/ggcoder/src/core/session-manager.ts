@@ -105,6 +105,8 @@ export interface SessionInfo {
   id: string;
   path: string;
   timestamp: string;
+  /** Timestamp of the most recent message (falls back to creation timestamp). */
+  lastActivity: string;
   cwd: string;
   messageCount: number;
 }
@@ -275,6 +277,7 @@ export class SessionManager {
 
         let first: SessionLine | null = null;
         let messageCount = 0;
+        let lastActivity: string | null = null;
 
         for await (const line of rl) {
           if (!line) continue;
@@ -285,6 +288,7 @@ export class SessionManager {
               first = parsed;
             } else if (parsed.type === "message") {
               messageCount++;
+              if (parsed.timestamp) lastActivity = parsed.timestamp;
             }
           } catch {
             // Skip malformed lines
@@ -297,6 +301,7 @@ export class SessionManager {
           id: first.id,
           path: filePath,
           timestamp: first.timestamp,
+          lastActivity: lastActivity ?? first.timestamp,
           cwd: first.cwd,
           messageCount,
         });
@@ -305,7 +310,8 @@ export class SessionManager {
       }
     }
 
-    sessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+    // Sort by last activity descending (the session most recently spoken in first)
+    sessions.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity));
     return sessions;
   }
 

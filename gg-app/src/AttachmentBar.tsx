@@ -1,0 +1,40 @@
+import { FileText, Film, X } from "lucide-react";
+import { theme } from "./theme";
+import type { PendingAttachment } from "./attachments";
+
+/**
+ * Staged attachment chips shown above the chat input. Images show a thumbnail;
+ * videos/files show an icon + name. Each has a remove button.
+ */
+export function AttachmentBar({
+  attachments,
+  onRemove,
+}: {
+  attachments: PendingAttachment[];
+  onRemove: (id: number) => void;
+}): React.ReactElement | null {
+  if (attachments.length === 0) return null;
+  return (
+    <div className="attach-bar">
+      {attachments.map((a) => (
+        <div key={a.id} className="attach-chip" title={a.name}>
+          {a.previewUrl ? (
+            <img className="attach-thumb" src={a.previewUrl} alt={a.name} />
+          ) : (
+            <span className="attach-icon" style={{ color: theme.textMuted }}>
+              {a.kind === "video" ? <Film size={16} /> : <FileText size={16} />}
+            </span>
+          )}
+          <span className="attach-name">{a.name}</span>
+          <button
+            className="attach-remove"
+            aria-label={`Remove ${a.name}`}
+            onClick={() => onRemove(a.id)}
+          >
+            <X size={13} />
+          </button>
+        </div>
+      ))}
+    </div>
+  );
+}

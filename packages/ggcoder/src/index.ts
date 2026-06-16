@@ -58,6 +58,15 @@ export { renderApp } from "./ui/render.js";
 // Config
 export { APP_NAME, VERSION, getAppPaths, ensureAppDirs } from "./config.js";
 
+// Project discovery (shared with gg-boss + gg-app sidecar)
+export {
+  discoverProjects,
+  listRecentSessions,
+  type DiscoveredProject,
+  type ProjectSource,
+  type RecentSession,
+} from "./core/project-discovery.js";
+
 // Types
 export type {
   CliConfig,

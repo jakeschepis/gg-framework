@@ -1,14 +1,15 @@
 // Regression for the per-chunk footer "bounce" during streaming.
 //
 // The assistant response is flushed to native scrollback paragraph-by-paragraph
-// while it streams (see assistant-stream-split). The scrollback print happens in
-// an effect AFTER paint, while `flushedChars` only advances in that same effect.
-// If the live frame is sliced solely by the already-committed `flushedChars`,
-// the just-flushed paragraph renders BOTH in scrollback and still live for one
-// frame — a transient height bump that shoves the footer up, then back down on
-// every paragraph boundary. App fixes this by slicing the live text with the
-// PROSPECTIVE flush computed during render. This test models that flow and
-// asserts the footer offset from the bottom stays constant across flushes.
+// while it streams (see assistant-stream-split). The flush effect calls
+// queueFlush, which renders the paragraph to ANSI and enqueues the bytes
+// through the patched Ink `insertBeforeFrame` (a passive buffer — no terminal
+// write), then advances `flushedChars` via the same React batch. The commit
+// that shrinks the live text therefore carries the compensating scrollback
+// bytes in ONE frame write: erase tall frame + paragraph bytes + shorter
+// frame. No frame ever shows the paragraph in both scrollback and the live
+// region, so the footer offset from the bottom stays constant. This test
+// models that flow and asserts exactly that.
 import React, { useEffect, useRef, useState } from "react";
 import { render, Text, useStdout } from "ink";
 import { describe, expect, it } from "vitest";
@@ -53,18 +54,30 @@ function Controls(): React.ReactElement {
   );
 }
 
-// Mirrors App.tsx: prospective flush is computed during render so the live
-// frame drops the to-be-flushed prefix immediately; the scrollback print is
-// deferred to the effect.
-function Driver({ rawText }: { rawText: string }): React.ReactElement {
+// Mirrors App.tsx: the live text is sliced by the COMMITTED `flushedChars`
+// only. The flush effect enqueues the paragraph bytes (passive) and advances
+// `flushedChars`; the resulting commit's single frame write both shrinks the
+// live frame and carries the scrollback bytes.
+function Driver({
+  rawText,
+  enqueueStdout,
+}: {
+  rawText: string;
+  enqueueStdout: (data: string) => void;
+}): React.ReactElement {
   const { write: writeStdout } = useStdout();
   const [history, setHistory] = useState<CompletedItem[]>([]);
   const [liveItems, setLiveItems] = useState<CompletedItem[]>([]);
   const flushRef = useRef({ flushedChars: 0, text: "" });
+  // Stable printer across renders — mirrors renderApp, where one printer
+  // instance (and its printed-id dedup set) lives for the whole app lifetime.
+  const printerRef = useRef<ReturnType<typeof createTerminalHistoryPrinter> | null>(null);
+  printerRef.current ??= createTerminalHistoryPrinter();
   const { queueFlush } = useTranscriptHistory({
-    terminalHistoryPrinter: createTerminalHistoryPrinter(),
+    terminalHistoryPrinter: printerRef.current,
     terminalHistoryContext: terminalContext,
     writeStdout,
+    enqueueStdout,
     sessionPathRef: { current: undefined },
     sessionManagerRef: { current: null },
     history,
@@ -73,9 +86,6 @@ function Driver({ rawText }: { rawText: string }): React.ReactElement {
   });
 
   const alreadyFlushed = flushRef.current.flushedChars;
-  const pendingFlushChars = rawText
-    ? splitAssistantStreamingText(rawText.slice(alreadyFlushed)).flushedText.length
-    : 0;
 
   useEffect(() => {
     if (!rawText) {
@@ -102,7 +112,7 @@ function Driver({ rawText }: { rawText: string }): React.ReactElement {
     flushRef.current = { ...flushRef.current, text: rawText };
   }, [rawText, queueFlush]);
 
-  const visibleStreamingText = stripDoneMarkers(rawText.slice(alreadyFlushed + pendingFlushChars));
+  const visibleStreamingText = stripDoneMarkers(rawText.slice(alreadyFlushed));
 
   const renderItem = (
     item: CompletedItem,
@@ -137,8 +147,10 @@ function Driver({ rawText }: { rawText: string }): React.ReactElement {
             reserveStreamingSpacing={false}
             renderMarkdown
             measuredLiveAreaRows={ROWS}
-            assistantMarginTop={0}
-            streamingContinuation={alreadyFlushed + pendingFlushChars > 0}
+            // Mirrors App: a live continuation of an already-flushed stream
+            // re-inserts the blank separator line above the live remainder.
+            assistantMarginTop={alreadyFlushed > 0 ? 1 : 0}
+            streamingContinuation={alreadyFlushed > 0}
           />
           <Controls />
         </ChatLayout>
@@ -160,6 +172,19 @@ describe("streaming flush footer bounce", () => {
     const recorder = new ScreenRecorder({ columns: COLUMNS, rows: ROWS });
     const stdout = makeRecordingStdout(recorder);
 
+    // Mirrors renderApp's enqueueHistoryWrite: reads the (patched) instance at
+    // call time, falling back to a raw write when the API is unavailable.
+    const instanceRef: { current: { insertBeforeFrame?: (data: string) => void } | null } = {
+      current: null,
+    };
+    const enqueueStdout = (data: string): void => {
+      if (instanceRef.current?.insertBeforeFrame) {
+        instanceRef.current.insertBeforeFrame(data);
+      } else {
+        stdout.write(data);
+      }
+    };
+
     const footerOffsets: number[] = [];
     const capture = (): void => {
       const lines = recorder.viewportLines().map((line) => stripAnsi(line));
@@ -178,17 +203,20 @@ describe("streaming flush footer bounce", () => {
       `${paragraph(1)}\n\n${paragraph(2)}\n\n${paragraph(3)}`,
     ];
 
-    const mounted = render(<Driver rawText={steps[0]!} />, {
+    const mounted = render(<Driver rawText={steps[0]!} enqueueStdout={enqueueStdout} />, {
       stdout,
       columns: COLUMNS,
       rows: ROWS,
       patchConsole: false,
       maxFps: 1000,
     });
+    instanceRef.current = mounted as unknown as {
+      insertBeforeFrame?: (data: string) => void;
+    };
     await tick();
     capture();
     for (let i = 1; i < steps.length; i++) {
-      mounted.rerender(<Driver rawText={steps[i]!} />);
+      mounted.rerender(<Driver rawText={steps[i]!} enqueueStdout={enqueueStdout} />);
       await tick();
       await tick();
       capture();

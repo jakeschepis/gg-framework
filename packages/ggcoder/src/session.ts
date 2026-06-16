@@ -113,19 +113,25 @@ export async function listSessions(cwd: string): Promise<SessionInfo[]> {
       const header = JSON.parse(lines[0]) as SessionEntry;
       if (header.type !== "session") continue;
 
-      const messageCount = lines.filter((line) => {
+      let messageCount = 0;
+      let lastActivity = header.timestamp;
+      for (const line of lines) {
         try {
           const entry = JSON.parse(line) as SessionEntry;
-          return entry.type === "message";
+          if (entry.type === "message") {
+            messageCount++;
+            if (entry.timestamp) lastActivity = entry.timestamp;
+          }
         } catch {
-          return false;
+          // Skip corrupt lines
         }
-      }).length;
+      }
 
       sessions.push({
         id: header.id,
         path: filePath,
         timestamp: header.timestamp,
+        lastActivity,
         cwd: header.cwd,
         messageCount,
       });
@@ -134,8 +140,8 @@ export async function listSessions(cwd: string): Promise<SessionInfo[]> {
     }
   }
 
-  // Sort by timestamp descending (most recent first)
-  sessions.sort((a, b) => b.timestamp.localeCompare(a.timestamp));
+  // Sort by last activity descending (the session most recently spoken in first)
+  sessions.sort((a, b) => b.lastActivity.localeCompare(a.lastActivity));
   return sessions;
 }
 

@@ -1,11 +1,13 @@
 import React from "react";
 import { Text, render } from "ink";
+import stripAnsiLib from "strip-ansi";
 import { describe, expect, it } from "vitest";
 import { ChatLivePane } from "./components/ChatLivePane.js";
 import { ChatLayout, ChatControls } from "./components/ChatLayout.js";
 import { TerminalSizeProvider } from "./hooks/useTerminalSize.js";
 import { useTheme } from "./theme/theme.js";
 import { renderTranscriptItem } from "./transcript/TranscriptRenderer.js";
+import { ScreenRecorder, makeRecordingStdout } from "./testing/screen-recorder.js";
 import type { CompletedItem } from "./app-items.js";
 
 const ROWS = 24;
@@ -145,5 +147,50 @@ describe("live area clamp", () => {
     );
     // 1 assistant row + 4 control rows, no padding up to the budget.
     expect(height).toBeLessThanOrEqual(CONTROLS_ROWS + 2);
+  });
+
+  it("reserves no blank rows above short live content (slash-command info rows)", async () => {
+    // Regression: several lingering non-assistant rows (e.g. info rows printed
+    // by a slash command) used to inflate the biased row ESTIMATE past the
+    // budget, so the clamp fixed the live area to `budget` while the real
+    // content was far shorter — bottom-anchoring it and reserving a block of
+    // blank rows above the first visible row until the rows flushed to history.
+    // With the estimate biased low the area stays compact, so the footer is
+    // never locked too low and no blank gap appears.
+    const recorder = new ScreenRecorder({ columns: COLUMNS, rows: ROWS });
+    const stdout = makeRecordingStdout(recorder);
+    const items: CompletedItem[] = Array.from(
+      { length: 6 },
+      (_, i) => ({ kind: "info", id: `i${i}`, text: `info line ${i + 1}` }) as CompletedItem,
+    );
+    const instance = render(
+      <TerminalSizeProvider>
+        <Harness liveItems={items} streamingText="final short answer" />
+      </TerminalSizeProvider>,
+      {
+        stdout,
+        columns: COLUMNS,
+        rows: ROWS,
+        patchConsole: false,
+        maxFps: 1000,
+        anchorFrameToBottom: true,
+        clipFrameToTerminalHeight: true,
+      } as Parameters<typeof render>[1],
+    );
+    // Flush any throttled/queued frame writes before reading the screen.
+    await new Promise<void>((resolve) => setTimeout(resolve, 80));
+    const lines = recorder.viewportLines().map((line) => stripAnsiLib(line));
+    instance.unmount();
+
+    const firstInfoIdx = lines.findIndex((line) => line.includes("info line 1"));
+    const lastContentIdx = lines.reduce((acc, line, i) => (line.trim().length > 0 ? i : acc), -1);
+    expect(firstInfoIdx, "first info row visible").toBeGreaterThanOrEqual(0);
+    // No run of blank rows reserved directly above the first live row.
+    const blanksAbove = lines
+      .slice(0, firstInfoIdx)
+      .filter((line) => line.trim().length === 0).length;
+    expect(blanksAbove, "no blank gap reserved above the live content").toBe(0);
+    // And the controls/footer still sit at the very bottom, nothing stranded.
+    expect(lines[lastContentIdx]).toContain("CONTROL_");
   });
 });

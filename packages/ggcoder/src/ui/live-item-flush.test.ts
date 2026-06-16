@@ -4,6 +4,7 @@ import {
   flushOnTurnText,
   flushOnTurnEnd,
   countOversizedFlushItems,
+  splitOversizedPinnedItems,
   MAX_HISTORY_ITEMS,
   type FlushableItem,
 } from "./live-item-flush.js";
@@ -212,6 +213,18 @@ describe("countOversizedFlushItems", () => {
     const small = (id: string) => ({ kind: "assistant", text: "one line", id });
     const items = [small("a"), { kind: "step_done", id: "s" }, small("b")];
     expect(countOversizedFlushItems(items, estimate, LIVE_ROWS)).toBe(0);
+  });
+
+  it("splits an oversized prefix so only the fitting suffix stays live", () => {
+    const tallText = {
+      kind: "assistant",
+      text: Array.from({ length: 40 }, (_, i) => `line ${i}`).join("\n"),
+      id: "tall-text",
+    };
+    const tail = { ...shortText, id: "tail" };
+    const split = splitOversizedPinnedItems([tallText, tail], estimate, LIVE_ROWS);
+    expect(split.flushed.map((item) => item.id)).toEqual(["tall-text"]);
+    expect(split.remaining.map((item) => item.id)).toEqual(["tail"]);
   });
 });
 

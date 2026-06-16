@@ -1,19 +1,496 @@
 diff --git a/build/ink.js b/build/ink.js
-index 30019a073d38ed05dca08f6221af187c429a536b..80d9de5601b4e22d205eb27857508aedc60f0b9d 100644
+index 30019a0..497f3be 100644
 --- a/build/ink.js
 +++ b/build/ink.js
-@@ -319,12 +319,12 @@ export default class Ink {
+@@ -1,4 +1,5 @@
+ import process from 'node:process';
++import fs from 'node:fs';
+ import React from 'react';
+ import { throttle } from 'es-toolkit/compat';
+ import ansiEscapes from 'ansi-escapes';
+@@ -102,6 +103,27 @@ export default class Ink {
+     // This variable is used only in debug mode to store full static output
+     // so that it's rerendered every time, not just new static parts, like in non-debug mode
+     fullStaticOutput;
++    // [gg patch] Raw bytes queued via insertBeforeFrame(), folded atomically into the
++    // next frame write. Invariant: every write that shrinks the live frame must carry
++    // compensating scrollback bytes, otherwise the frame bottom (footer) jumps up.
++    pendingFrameInsert;
++    // [gg patch] Blank pad rows currently sitting directly above the frame
++    // (written by anchorFrameToBottom on net shrink). Consumed by the next
++    // net-growth write, which overwrites them instead of scrolling.
++    framePadDebt = 0;
++    // [gg patch] Runtime gate for pad CREATION (consumption always runs).
++    // The app toggles this via setFrameAnchorActive(): on while the agent
++    // runs (footer must not jump), off at idle so symmetric UI shrink
++    // (slash menu close, etc.) lets the footer return up naturally.
++    frameAnchorActive = true;
++    // [gg patch] Content rows currently visible ABOVE the live frame on the
++    // screen (excludes scrollback). Lets idle shrink know whether the frame
++    // bottom is pinned at the screen bottom (shrink would strand dead rows).
++    linesAboveFrame = 0;
++    // [gg patch] App-provided callback: given a row count, return that many
++    // hard-wrapped transcript-tail rows (newline-joined) to backfill vacated
++    // rows on a bottom-pinned idle shrink. Undefined → footer rises (default).
++    frameShrinkBackfill = undefined;
+     exitPromise;
+     exitResult;
+     beforeExitHandler;
+@@ -171,6 +193,8 @@ export default class Ink {
+         // This variable is used only in debug mode to store full static output
+         // so that it's rerendered every time, not just new static parts, like in non-debug mode
+         this.fullStaticOutput = '';
++        // [gg patch] See field declaration.
++        this.pendingFrameInsert = '';
+         // Use ConcurrentRoot for concurrent mode, LegacyRoot for legacy mode
+         const rootTag = options.concurrent ? ConcurrentRoot : LegacyRoot;
+         // eslint-disable-next-line @typescript-eslint/no-unsafe-assignment
+@@ -248,18 +272,46 @@ export default class Ink {
+             return;
+         }
+         const startTime = performance.now();
+-        const { output, outputHeight, staticOutput } = render(this.rootNode, this.isScreenReaderEnabled);
++        let { output, outputHeight, staticOutput } = render(this.rootNode, this.isScreenReaderEnabled);
+         this.options.onRender?.({ renderTime: performance.now() - startTime });
++        // [gg patch] Scrollback-mode safety net: never let a frame reach terminal
++        // height. Once lastOutputHeight >= rows, log-update's eraseLines clamps at
++        // the screen top on the next (shorter) frame and rewrites it top-anchored —
++        // stranding the frame bottom mid-screen with blank rows below. Clipping the
++        // oldest (top) rows mirrors the app's own bottom-anchored live-area clamp
++        // and only engages when that clamp's row estimate undercounts. Opt-in via
++        // the clipFrameToTerminalHeight option so fullscreen/alt-screen apps that
++        // intentionally own the whole screen are unaffected.
++        if (this.options.clipFrameToTerminalHeight &&
++            this.options.stdout.isTTY &&
++            !this.isScreenReaderEnabled &&
++            !this.options.debug &&
++            !isInCi) {
++            const maxRows = Math.max(1, this.options.stdout.rows - 2);
++            if (outputHeight > maxRows) {
++                output = output.split('\n').slice(-maxRows).join('\n');
++                outputHeight = maxRows;
++            }
++        }
+         // If <Static> output isn't empty, it means new children have been added to it
+         const hasStaticOutput = staticOutput && staticOutput !== '\n';
++        // [gg patch] Consume queued scrollback bytes so they ride this frame write.
++        // Never accumulated into fullStaticOutput — the patched tall-frame repaint
++        // keeps scrollback, so re-emitting would duplicate history.
++        const frameInsert = this.pendingFrameInsert;
++        this.pendingFrameInsert = '';
++        const hasFrameInsert = frameInsert !== '';
+         if (this.options.debug) {
+             if (hasStaticOutput) {
+                 this.fullStaticOutput += staticOutput;
+             }
+-            this.options.stdout.write(this.fullStaticOutput + output);
++            this.options.stdout.write(frameInsert + this.fullStaticOutput + output);
+             return;
+         }
+         if (isInCi) {
++            if (hasFrameInsert) {
++                this.options.stdout.write(frameInsert);
++            }
+             if (hasStaticOutput) {
+                 this.options.stdout.write(staticOutput);
+             }
+@@ -273,16 +325,16 @@ export default class Ink {
+             if (sync) {
+                 this.options.stdout.write(bsu);
+             }
+-            if (hasStaticOutput) {
++            if (hasStaticOutput || hasFrameInsert) {
+                 // We need to erase the main output before writing new static output
+                 const erase = this.lastOutputHeight > 0
+                     ? ansiEscapes.eraseLines(this.lastOutputHeight)
+                     : '';
+-                this.options.stdout.write(erase + staticOutput);
++                this.options.stdout.write(erase + frameInsert + (hasStaticOutput ? staticOutput : ''));
+                 // After erasing, the last output is gone, so we should reset its height
+                 this.lastOutputHeight = 0;
+             }
+-            if (output === this.lastOutput && !hasStaticOutput) {
++            if (output === this.lastOutput && !hasStaticOutput && !hasFrameInsert) {
+                 if (sync) {
+                     this.options.stdout.write(esu);
+                 }
+@@ -294,7 +346,7 @@ export default class Ink {
+                 hard: true,
+             });
+             // If we haven't erased yet, do it now.
+-            if (hasStaticOutput) {
++            if (hasStaticOutput || hasFrameInsert) {
+                 this.options.stdout.write(wrappedOutput);
+             }
+             else {
+@@ -319,12 +371,123 @@ export default class Ink {
          // Only apply when writing to a real TTY — piped output always gets trailing newlines.
          const isFullscreen = this.options.stdout.isTTY && outputHeight >= this.options.stdout.rows;
          const outputToRender = isFullscreen ? output : output + '\n';
 -        if (this.lastOutputHeight >= this.options.stdout.rows) {
-+        if (isFullscreen && this.lastOutputHeight >= this.options.stdout.rows) {
++        // [gg patch] Bottom anchoring (opt-in): the frame bottom (footer) must
++        // never move UP. Any rewrite that nets fewer rows than the previous
++        // frame occupied (shrink not fully compensated by queued scrollback
++        // bytes) is padded with blank scrollback lines so the bottom row stays
++        // put. The pad is tracked as DEBT and kept ADJACENT to the frame: on
++        // every height-changing write the cursor first moves up over ALL
++        // existing pad rows, then writes insert/static bytes, then re-emits the
++        // remaining pad (prevDebt - delta), then the frame. Inserts therefore
++        // overwrite pads instead of stacking below them — without this,
++        // mid-stream paragraph flushes landed BELOW earlier pads, permanently
++        // embedding blank gaps between paragraphs in scrollback.
++        let framePad = '';
++        let padConsumeRows = 0;
++        let backfillText = '';
++        let backfillRows = 0;
++        let doBackfillRepaint = false;
++        if (this.options.anchorFrameToBottom &&
++            this.options.stdout.isTTY &&
++            !isFullscreen &&
++            this.lastOutputHeight > 0) {
++            const insertLineCount = hasFrameInsert ? (frameInsert.match(/\n/g) ?? []).length : 0;
++            const staticLineCount = hasStaticOutput ? (staticOutput.match(/\n/g) ?? []).length : 0;
++            const delta = insertLineCount + staticLineCount + outputHeight - this.lastOutputHeight;
++            // Pads above one screen height are unreachable by cursor-up; treat
++            // them as orphaned scrollback (pathological — should not happen).
++            const prevDebt = Math.min(this.framePadDebt, Math.max(0, this.options.stdout.rows - 2));
++            // Idle frame-height change while the frame bottom is pinned at the
++            // screen bottom (slash menu opening/closing on a full screen).
++            // BOTH directions are handled with a FULL IN-PLACE REPAINT:
++            // cursor-home + erase-down + transcript tail (app-provided, screen
++            // height minus the frame) + the frame at the bottom. ED erases in
++            // place and pushes NOTHING into native scrollback — critically,
++            // menu OPEN must not scroll the terminal, because each scroll
++            // pushes a screenful into scrollback and every open/close cycle
++            // would deposit one more duplicate copy of those rows there.
++            // Pinned if EITHER the old or the new frame touches the screen
++            // bottom (+1 = the frame's trailing-newline row). Testing only the
++            // old height misses the critical case: menu OPEN on a frame that
++            // fits, where the GROWN frame overflows the screen — the normal
++            // log path then scrolls, pushing the top rows (half the banner)
++            // into scrollback on every single open.
++            const bottomPinned = this.linesAboveFrame +
++                Math.max(this.lastOutputHeight, outputHeight) +
++                1 >= this.options.stdout.rows;
++            if (!this.frameAnchorActive &&
++                delta !== 0 &&
++                bottomPinned &&
++                typeof this.frameShrinkBackfill === 'function') {
++                // Rows of transcript needed to fill the screen above the new
++                // frame, reserving one row for the frame's trailing newline.
++                const needRows = Math.max(0, this.options.stdout.rows - outputHeight - 1);
++                let fill;
++                try {
++                    fill = needRows > 0 ? this.frameShrinkBackfill(needRows) : '';
++                }
++                catch {
++                    fill = undefined;
++                }
++                if (typeof fill === 'string') {
++                    backfillText = fill === '' || fill.endsWith('\n') ? fill : fill + '\n';
++                    backfillRows = (backfillText.match(/\n/g) ?? []).length;
++                    doBackfillRepaint = true;
++                    padConsumeRows = 0;
++                    this.framePadDebt = 0;
++                }
++            }
++            if (!doBackfillRepaint &&
++                ((delta !== 0 && (this.frameAnchorActive || prevDebt > 0)) ||
++                    ((hasFrameInsert || hasStaticOutput) && prevDebt > 0))) {
++                // While the anchor is ACTIVE (agent running), shrink converts
++                // into pad debt so the footer never moves up. While INACTIVE
++                // (idle — slash menu close, task bar collapse, input shrink),
++                // shrink is natural symmetric UI: the footer returns up and no
++                // debt is created. Existing debt is still consumed by growth
++                // and kept adjacent in both states.
++                const newDebt = this.frameAnchorActive
++                    ? Math.max(0, prevDebt - delta)
++                    : Math.min(prevDebt, Math.max(0, prevDebt - delta));
++                padConsumeRows = prevDebt;
++                framePad = newDebt > 0 ? '\n'.repeat(newDebt) : '';
++                this.framePadDebt = newDebt;
++            }
++            // [gg patch] Diagnostics for pad behavior — enabled via env var only.
++            if (process.env['GG_INK_DEBUG'] === '1' && (delta !== 0 || this.framePadDebt > 0)) {
++                try {
++                    fs.appendFileSync('/tmp/gg-ink-debug.log', JSON.stringify({
++                        t: Date.now() % 100000,
++                        delta,
++                        ins: insertLineCount,
++                        out: outputHeight,
++                        last: this.lastOutputHeight,
++                        pad: framePad.length,
++                        consume: padConsumeRows,
++                        debt: this.framePadDebt,
++                        insHead: hasFrameInsert ? JSON.stringify(frameInsert.slice(0, 60)) : '',
++                    }) + '\n');
++                }
++                catch { }
++            }
++        }
++        const hasFramePad = framePad !== '';
++        const hasBackfill = doBackfillRepaint;
++        const hasPadConsume = padConsumeRows > 0;
++        // [gg patch] Full in-place repaint for a bottom-pinned idle height
++        // change (menu open AND close): erase + transcript tail + frame in one
++        // synchronized write. Overwrites in place — the terminal never scrolls,
++        // so native scrollback receives no duplicate copies of screen rows.
++        if (hasBackfill) {
              const sync = shouldSynchronize(this.options.stdout);
              if (sync) {
                  this.options.stdout.write(bsu);
              }
 -            this.options.stdout.write(ansiEscapes.clearTerminal + this.fullStaticOutput + output);
-+            this.options.stdout.write(ansiEscapes.eraseScreen + ansiEscapes.cursorTo(0, 0) + this.fullStaticOutput + output);
++            // cursorTo home + eraseDown (ESC[J) erases the screen IN PLACE.
++            // eraseScreen (ESC[2J) must not be used here: iTerm2/Terminal.app
++            // implement 2J as "push screen into scrollback, then clear", which
++            // deposits a duplicate screenful into scrollback on every repaint.
++            this.options.stdout.write(frameInsert + ansiEscapes.cursorTo(0, 0) + ansiEscapes.eraseDown + backfillText + outputToRender);
              this.lastOutput = output;
              this.lastOutputToRender = outputToRender;
              this.lastOutputHeight = outputHeight;
+@@ -332,16 +495,54 @@ export default class Ink {
+             if (sync) {
+                 this.options.stdout.write(esu);
+             }
++            this.linesAboveFrame = backfillRows;
+             return;
+         }
+-        // To ensure static output is cleanly rendered before main output, clear main output first
+-        if (hasStaticOutput) {
++        // [gg patch] Track how many content rows sit above the frame ON SCREEN
++        // (not scrollback). Drives the bottom-pinned test above. Updated after
++        // the write below; computed here from this write's contributions.
++        const rowsAddedAboveFrame = (hasFrameInsert ? (frameInsert.match(/\n/g) ?? []).length : 0) +
++            (hasStaticOutput ? (staticOutput.match(/\n/g) ?? []).length : 0) +
++            (hasFramePad ? framePad.length : 0) -
++            padConsumeRows;
++        if (isFullscreen && this.lastOutputHeight >= this.options.stdout.rows) {
++            const sync = shouldSynchronize(this.options.stdout);
++            if (sync) {
++                this.options.stdout.write(bsu);
++            }
++            // [gg patch] Queued scrollback bytes go out before the repaint so they
++            // scroll into scrollback instead of being erased. The repaint wipes
++            // any pad rows — the debt is gone with them.
++            this.framePadDebt = 0;
++            // In-place erase (home + ED) — see backfill repaint above for why
++            // ESC[2J is unusable (iTerm2/Terminal.app push 2J into scrollback).
++            this.options.stdout.write(frameInsert + ansiEscapes.cursorTo(0, 0) + ansiEscapes.eraseDown + this.fullStaticOutput + output);
++            this.lastOutput = output;
++            this.lastOutputToRender = outputToRender;
++            this.lastOutputHeight = outputHeight;
++            this.log.sync(outputToRender);
++            if (sync) {
++                this.options.stdout.write(esu);
++            }
++            return;
++        }
++        // To ensure static output is cleanly rendered before main output, clear main output first.
++        // [gg patch] A queued frame insert, a bottom-anchor pad, or a pad-debt
++        // consume forces this atomic path even when the frame is unchanged:
++        // erase old frame + cursor-up over existing pads + scrollback bytes +
++        // remaining pad + new frame in one synchronized write. Inserts always
++        // overwrite the pad rows; the surviving pad is re-emitted directly
++        // above the frame, keeping it adjacent and reclaimable.
++        if (hasStaticOutput || hasFrameInsert || hasFramePad || hasPadConsume) {
+             const sync = shouldSynchronize(this.options.stdout);
+             if (sync) {
+                 this.options.stdout.write(bsu);
+             }
+             this.log.clear();
+-            this.options.stdout.write(staticOutput);
++            if (hasPadConsume) {
++                this.options.stdout.write(ansiEscapes.cursorUp(padConsumeRows));
++            }
++            this.options.stdout.write(frameInsert + (hasStaticOutput ? staticOutput : '') + framePad);
+             this.log(outputToRender);
+             if (sync) {
+                 this.options.stdout.write(esu);
+@@ -351,6 +552,13 @@ export default class Ink {
+             // ThrottledLog manages its own bsu/esu at actual write time
+             this.throttledLog(outputToRender);
+         }
++        // [gg patch] Update the on-screen rows-above-frame tracker. Growth past
++        // the screen bottom scrolls content into scrollback — cap accordingly.
++        this.linesAboveFrame = Math.max(0, this.linesAboveFrame + rowsAddedAboveFrame);
++        const maxAbove = Math.max(0, this.options.stdout.rows - outputHeight);
++        if (this.linesAboveFrame + outputHeight > this.options.stdout.rows) {
++            this.linesAboveFrame = maxAbove;
++        }
+         this.lastOutput = output;
+         this.lastOutputToRender = outputToRender;
+         this.lastOutputHeight = outputHeight;
+@@ -368,6 +576,99 @@ export default class Ink {
+             reconciler.flushSyncWork();
+         }
+     }
++    // [gg patch] Toggle pad creation at runtime. See frameAnchorActive.
++    // Deactivation reclaims leftover pad debt: a frame shrink right before the
++    // run ended (tool panel collapse, finalization without a compensating
++    // insert) left blank pad rows above the frame, and at idle nothing else
++    // consumes them — they sit on screen as a permanent blank gap right above
++    // the final response. While the frame is bottom-pinned the gap is
++    // repainted in place with the app-provided transcript tail (footer stays
++    // put); otherwise the frame rises over the pads (the vacated rows below
++    // the risen frame are unwritten screen, not content).
++    setFrameAnchorActive(active) {
++        const reclaimDebt = this.frameAnchorActive && !active ? this.framePadDebt : 0;
++        this.frameAnchorActive = active;
++        if (reclaimDebt <= 0 || this.isUnmounted) {
++            return;
++        }
++        this.framePadDebt = 0;
++        if (this.options.debug || isInCi || !this.options.stdout.isTTY) {
++            return;
++        }
++        const debt = Math.min(reclaimDebt, Math.max(0, this.options.stdout.rows - 2));
++        const outputHeight = this.lastOutputHeight;
++        const sync = shouldSynchronize(this.options.stdout);
++        const bottomPinned = this.linesAboveFrame + outputHeight + 1 >= this.options.stdout.rows;
++        if (bottomPinned && typeof this.frameShrinkBackfill === 'function') {
++            const needRows = Math.max(0, this.options.stdout.rows - outputHeight - 1);
++            let fill;
++            try {
++                fill = needRows > 0 ? this.frameShrinkBackfill(needRows) : '';
++            }
++            catch {
++                fill = undefined;
++            }
++            if (typeof fill === 'string') {
++                const backfillText = fill === '' || fill.endsWith('\n') ? fill : fill + '\n';
++                if (sync) {
++                    this.options.stdout.write(bsu);
++                }
++                // In-place erase (home + ED) — ESC[2J is unusable here, see the
++                // bottom-pinned idle repaint above (iTerm2/Terminal.app push 2J
++                // into scrollback).
++                this.options.stdout.write(ansiEscapes.cursorTo(0, 0) + ansiEscapes.eraseDown + backfillText + this.lastOutputToRender);
++                this.log.sync(this.lastOutputToRender);
++                if (sync) {
++                    this.options.stdout.write(esu);
++                }
++                this.linesAboveFrame = (backfillText.match(/\n/g) ?? []).length;
++                return;
++            }
++        }
++        // No backfill provider or not pinned: consume the pads by rewriting
++        // the frame `debt` rows higher — same cursor-up consume the atomic
++        // write path uses, just without new insert bytes.
++        if (sync) {
++            this.options.stdout.write(bsu);
++        }
++        this.log.clear();
++        this.options.stdout.write(ansiEscapes.cursorUp(debt));
++        this.log(this.lastOutputToRender);
++        if (sync) {
++            this.options.stdout.write(esu);
++        }
++        this.linesAboveFrame = Math.max(0, this.linesAboveFrame - debt);
++    }
++    // [gg patch] Install the transcript-tail provider. See frameShrinkBackfill.
++    setFrameShrinkBackfill(fn) {
++        this.frameShrinkBackfill = fn;
++    }
++    // [gg patch] Queue raw bytes to be written into scrollback atomically with the
++    // next frame paint (mirrors Ink's <Static> output handling). Used by the app's
++    // transcript flush so the frame shrink and the scrollback insert land in one write.
++    insertBeforeFrame(data) {
++        if (this.isUnmounted) {
++            return;
++        }
++        if (this.options.debug || isInCi || !this.options.stdout.isTTY) {
++            this.options.stdout.write(data);
++            return;
++        }
++        this.pendingFrameInsert += data;
++        // Fallback: if no React commit follows, force a render so the bytes can't
++        // get stuck in the buffer. MUST lose the race against the upcoming React
++        // commit: with setImmediate it fired before React's scheduler applied the
++        // commit, so the insert was written alongside the STALE (still-tall) tree
++        // and the follow-up commit's shrink went uncompensated — leaking one
++        // anchor pad per flush. 100ms comfortably trails both the commit and
++        // Ink's render throttle (max 33ms trailing edge); the forced render
++        // no-ops when a real render already consumed the buffer.
++        setTimeout(() => {
++            if (this.pendingFrameInsert && !this.isUnmounted) {
++                this.onRender();
++            }
++        }, 100);
++    }
+     writeToStdout(data) {
+         if (this.isUnmounted) {
+             return;
+@@ -390,6 +691,15 @@ export default class Ink {
+         if (sync) {
+             this.options.stdout.write(esu);
+         }
++        // [gg patch] Row-adding bytes now sit between any anchor-pad rows and
++        // the frame, so the pads are no longer adjacent and can't be reclaimed
++        // by cursor-up — forget the debt (pads stay as scrollback). Zero-row
++        // writes (OSC title updates, mode escapes) leave the pads adjacent, so
++        // the debt stays consumable.
++        if (data.includes('\n')) {
++            this.framePadDebt = 0;
++            this.linesAboveFrame = Math.min(this.linesAboveFrame + (data.match(/\n/g) ?? []).length, Math.max(0, this.options.stdout.rows - this.lastOutputHeight));
++        }
+     }
+     writeToStderr(data) {
+         if (this.isUnmounted) {
+@@ -414,6 +724,11 @@ export default class Ink {
+         if (sync) {
+             this.options.stdout.write(esu);
+         }
++        // [gg patch] Same as writeToStdout: row-adding bytes orphan the pads.
++        if (data.includes('\n')) {
++            this.framePadDebt = 0;
++            this.linesAboveFrame = Math.min(this.linesAboveFrame + (data.match(/\n/g) ?? []).length, Math.max(0, this.options.stdout.rows - this.lastOutputHeight));
++        }
+     }
+     // eslint-disable-next-line @typescript-eslint/ban-types
+     unmount(error) {
+@@ -452,6 +767,14 @@ export default class Ink {
+                 this.onRender();
+             }
+         }
++        // [gg patch] Flush any queued scrollback insert that didn't ride a frame write.
++        if (this.pendingFrameInsert) {
++            const pendingInsert = this.pendingFrameInsert;
++            this.pendingFrameInsert = '';
++            if (canWriteToStdout) {
++                this.options.stdout.write(pendingInsert);
++            }
++        }
+         // Mark as unmounted after the final render but before stdout writes
+         // that could re-enter exit() via synchronous write callbacks.
+         this.isUnmounted = true;
+@@ -548,6 +871,10 @@ export default class Ink {
+             // Sync lastOutput so that unmount's final onRender
+             // sees it as unchanged and log-update skips it
+             this.log.sync(this.lastOutputToRender || this.lastOutput + '\n');
++            // [gg patch] The pad rows (if any) are no longer adjacent to a
++            // live frame after a clear — stale debt must not be consumed by a
++            // later cursor-up over rows that aren't pads.
++            this.framePadDebt = 0;
+         }
+     }
+     patchConsole() {
+diff --git a/build/render.js b/build/render.js
+index 6526022..1236230 100644
+--- a/build/render.js
++++ b/build/render.js
+@@ -28,6 +28,14 @@ const render = (node, options) => {
+         waitUntilExit: instance.waitUntilExit,
+         cleanup: () => instances.delete(inkOptions.stdout),
+         clear: instance.clear,
++        // [gg patch] Queue raw bytes to be written into scrollback atomically with
++        // the next frame paint. See Ink#insertBeforeFrame in build/ink.js.
++        insertBeforeFrame: instance.insertBeforeFrame,
++        // [gg patch] Toggle bottom-anchor pad creation (on while agent runs).
++        setFrameAnchorActive: instance.setFrameAnchorActive,
++        // [gg patch] Install the transcript-tail backfill provider for
++        // bottom-pinned idle shrink (slash menu close).
++        setFrameShrinkBackfill: instance.setFrameShrinkBackfill,
+     };
+ };
+ export default render;

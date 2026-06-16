@@ -47,33 +47,37 @@ export interface ModelInfo {
 // /model selector and login selector sort models identically.
 export const MODELS: ModelInfo[] = [
   // ── Anthropic ──────────────────────────────────────────
-  {
-    id: "claude-fable-5",
-    name: "Claude Fable 5",
-    provider: "anthropic",
-    contextWindow: 1_000_000,
-    maxOutputTokens: 128_000,
-    supportsThinking: true,
-    supportsImages: true,
-    supportsVideo: false,
-    costTier: "high",
-    maxThinkingLevel: "max",
-  },
-  {
-    // Mythos-class model offered through Project Glasswing (limited
-    // availability, invitation-only). Same underlying model as Fable 5 with
-    // some safeguards lifted; kept here so approved accounts can select it.
-    id: "claude-mythos-5",
-    name: "Claude Mythos 5",
-    provider: "anthropic",
-    contextWindow: 1_000_000,
-    maxOutputTokens: 128_000,
-    supportsThinking: true,
-    supportsImages: true,
-    supportsVideo: false,
-    costTier: "high",
-    maxThinkingLevel: "max",
-  },
+  // NOTE: Claude Fable 5 (`claude-fable-5`) and Claude Mythos 5
+  // (`claude-mythos-5`) are temporarily unavailable, so they're commented out
+  // here to keep them out of the /model selector and avoid user confusion.
+  // Re-enable once they're generally available again.
+  // {
+  //   id: "claude-fable-5",
+  //   name: "Claude Fable 5",
+  //   provider: "anthropic",
+  //   contextWindow: 1_000_000,
+  //   maxOutputTokens: 128_000,
+  //   supportsThinking: true,
+  //   supportsImages: true,
+  //   supportsVideo: false,
+  //   costTier: "high",
+  //   maxThinkingLevel: "max",
+  // },
+  // {
+  //   // Mythos-class model offered through Project Glasswing (limited
+  //   // availability, invitation-only). Same underlying model as Fable 5 with
+  //   // some safeguards lifted; kept here so approved accounts can select it.
+  //   id: "claude-mythos-5",
+  //   name: "Claude Mythos 5",
+  //   provider: "anthropic",
+  //   contextWindow: 1_000_000,
+  //   maxOutputTokens: 128_000,
+  //   supportsThinking: true,
+  //   supportsImages: true,
+  //   supportsVideo: false,
+  //   costTier: "high",
+  //   maxThinkingLevel: "max",
+  // },
   {
     id: "claude-opus-4-8",
     name: "Claude Opus 4.8",
@@ -190,8 +194,8 @@ export const MODELS: ModelInfo[] = [
   },
   // ── Moonshot (Kimi) ────────────────────────────────────
   {
-    id: "kimi-k2.6",
-    name: "Kimi K2.6",
+    id: "kimi-k2.7-code",
+    name: "Kimi K2.7",
     provider: "moonshot",
     contextWindow: 262_144,
     maxOutputTokens: 262_144,
@@ -352,7 +356,7 @@ export function getDefaultModel(provider: Provider): ModelInfo {
   if (provider === "openai") return MODELS.find((m) => m.id === "gpt-5.5")!;
   if (provider === "gemini") return MODELS.find((m) => m.id === "gemini-3.1-flash-lite-preview")!;
   if (provider === "glm") return MODELS.find((m) => m.id === "glm-5.1")!;
-  if (provider === "moonshot") return MODELS.find((m) => m.id === "kimi-k2.6")!;
+  if (provider === "moonshot") return MODELS.find((m) => m.id === "kimi-k2.7-code")!;
   if (provider === "minimax") return MODELS.find((m) => m.id === "MiniMax-M3")!;
   if (provider === "deepseek") return MODELS.find((m) => m.id === "deepseek-v4-pro")!;
   if (provider === "openrouter") return MODELS.find((m) => m.id === "qwen/qwen3.6-plus")!;

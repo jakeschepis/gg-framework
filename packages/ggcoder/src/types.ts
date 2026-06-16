@@ -39,6 +39,8 @@ export interface SessionInfo {
   id: string;
   path: string;
   timestamp: string;
+  /** Timestamp of the most recent message (falls back to creation timestamp). */
+  lastActivity: string;
   cwd: string;
   messageCount: number;
 }

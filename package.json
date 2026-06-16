@@ -5,10 +5,10 @@
   "scripts": {
     "build": "pnpm -r build",
     "check": "pnpm -r check",
-    "lint": "eslint 'packages/*/src/**/*.{ts,tsx}' && pnpm --filter matey lint",
-    "lint:fix": "eslint 'packages/*/src/**/*.{ts,tsx}' --fix && pnpm --filter matey lint:fix",
-    "format": "prettier --write 'packages/*/src/**/*.{ts,tsx}' 'Matey/**/*.{ts,tsx,css,html,json,md,yml}'",
-    "format:check": "prettier --check 'packages/*/src/**/*.{ts,tsx}' 'Matey/**/*.{ts,tsx,css,html,json,md,yml}'",
+    "lint": "eslint 'packages/*/src/**/*.{ts,tsx}' && pnpm --filter matey lint && pnpm --filter gg-app lint",
+    "lint:fix": "eslint 'packages/*/src/**/*.{ts,tsx}' --fix && pnpm --filter matey lint:fix && pnpm --filter gg-app lint:fix",
+    "format": "prettier --write 'packages/*/src/**/*.{ts,tsx}' 'Matey/**/*.{ts,tsx,css,html,json,md,yml}' && pnpm --filter gg-app format",
+    "format:check": "prettier --check 'packages/*/src/**/*.{ts,tsx}' 'Matey/**/*.{ts,tsx,css,html,json,md,yml}' && pnpm --filter gg-app format:check",
     "test": "pnpm -r test",
     "prepare": "pnpm build"
   },
@@ -34,7 +34,6 @@
       "ip-address": "^10.1.1"
     },
     "patchedDependencies": {
-      "ink@6.8.0": "patches/ink@6.8.0.patch",
       "ink@7.0.2": "patches/ink@7.0.2.patch"
     }
   },

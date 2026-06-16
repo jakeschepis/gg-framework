@@ -14,6 +14,7 @@ import { estimateConversationTokens } from "../core/compaction/token-estimator.j
 import { PROMPT_COMMANDS } from "../core/prompt-commands.js";
 import { loadCustomCommands } from "../core/custom-commands.js";
 import { renderLogoBlock } from "../cli/shared.js";
+import { verifyBotToken } from "../core/telegram-config.js";
 
 export interface ServeModeOptions {
   provider: Provider;
@@ -25,6 +26,18 @@ export interface ServeModeOptions {
     botToken: string;
     userId: number;
   };
+  /**
+   * Embedded mode (desktop app): skip the terminal banner/console output and
+   * don't register process signal handlers — the host process owns those. The
+   * bot polls in the background and the caller stops it via the returned
+   * controller. Defaults to false (the CLI's blocking, banner-printing flow).
+   */
+  embedded?: boolean;
+}
+
+/** Handle for an embedded serve session: stop polling + dispose all sessions. */
+export interface ServeController {
+  stop: () => Promise<void>;
 }
 
 // ── Serve Config ───────────────────────────────────────────
@@ -107,7 +120,16 @@ interface ChatState {
  * - Groups → linked projects via /link <path>
  * - Each chat gets its own AgentSession, tools, context
  */
-export async function runServeMode(options: ServeModeOptions): Promise<void> {
+/**
+ * Build a serve session: wire the Telegram bot to per-chat AgentSessions and
+ * start long-polling in the background. Returns a controller to stop it.
+ *
+ * Shared by the CLI (`ggcoder serve`, via {@link runServeMode}) and the desktop
+ * app sidecar. In `embedded` mode it stays silent and leaves process-signal
+ * handling to the host.
+ */
+export async function startServeMode(options: ServeModeOptions): Promise<ServeController> {
+  const embedded = options.embedded ?? false;
   const bot = new TelegramBot({
     botToken: options.telegram.botToken,
     allowedUserId: options.telegram.userId,
@@ -732,7 +754,25 @@ export async function runServeMode(options: ServeModeOptions): Promise<void> {
 
   // ── Initialize and start ─────────────────────────────
 
-  try {
+  /** Stop polling and dispose every per-chat session (idempotent enough). */
+  async function stop(): Promise<void> {
+    bot.stop();
+    for (const state of chatStates.values()) {
+      stopTyping(state);
+      await state.session.dispose().catch(() => {});
+    }
+  }
+
+  // Verify the bot token up front so an invalid token surfaces to the caller
+  // (the embedded app shows it as a start error) instead of failing silently
+  // inside the background polling loop.
+  const me = await verifyBotToken(options.telegram.botToken);
+  if (!me.ok) {
+    await stop();
+    throw new Error("Invalid bot token — Telegram rejected it.");
+  }
+
+  if (!embedded) {
     // Clear terminal
     process.stdout.write("\x1b[2J\x1b[3J\x1b[H");
 
@@ -778,30 +818,46 @@ export async function runServeMode(options: ServeModeOptions): Promise<void> {
         chalk.hex("#6b7280")("switch model"),
     );
     console.log();
+  }
 
-    // Handle graceful shutdown
-    const shutdown = async () => {
-      console.log("\nShutting down...");
-      bot.stop();
-      for (const state of chatStates.values()) {
-        stopTyping(state);
-        await state.session.dispose();
-      }
-      closeLogger();
-      process.exit(0);
-    };
-    process.on("SIGINT", shutdown);
-    process.on("SIGTERM", shutdown);
+  // Launch long-polling in the background. Errors (network blips) are logged;
+  // the loop self-recovers. The caller controls lifetime via the returned stop.
+  void bot.start().catch((err) => {
+    log(
+      "ERROR",
+      "serve",
+      `Bot polling stopped: ${err instanceof Error ? err.message : String(err)}`,
+    );
+  });
 
-    await bot.start();
+  return { stop };
+}
+
+/**
+ * CLI serve flow (`ggcoder serve`): prints the banner, starts the bot, wires
+ * SIGINT/SIGTERM to a graceful shutdown, then blocks until the process exits.
+ */
+export async function runServeMode(options: ServeModeOptions): Promise<void> {
+  let controller: ServeController;
+  try {
+    controller = await startServeMode({ ...options, embedded: false });
   } catch (err) {
     console.error(`Failed to start: ${formatUserError(err)}`);
-    for (const state of chatStates.values()) {
-      await state.session.dispose();
-    }
     closeLogger();
     process.exit(1);
   }
+
+  const shutdown = async (): Promise<void> => {
+    console.log("\nShutting down...");
+    await controller.stop();
+    closeLogger();
+    process.exit(0);
+  };
+  process.on("SIGINT", () => void shutdown());
+  process.on("SIGTERM", () => void shutdown());
+
+  // Block forever — the bot polls in the background; shutdown exits the process.
+  await new Promise<never>(() => {});
 }
 
 // ── Helpers ───────────────────────────────────────────────
