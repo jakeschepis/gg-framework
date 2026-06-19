@@ -1,6 +1,7 @@
 // Tiny module-level toast bus so any component can raise a notification without
 // threading a context through the tree. The <Toaster/> mounted once at the app
 // root subscribes and renders them.
+import { playSound } from "./sounds";
 
 export type ToastTone = "info" | "success" | "warning" | "error";
 
@@ -39,6 +40,7 @@ export function toast(message: string, tone: ToastTone = "info", duration = 4000
   if (existing) return existing.id;
   const id = ++seq;
   toasts = [...toasts, { id, message, tone, duration }];
+  if (tone === "warning" || tone === "error") playSound("warning");
   emit();
   if (duration > 0) {
     setTimeout(() => dismissToast(id), duration);

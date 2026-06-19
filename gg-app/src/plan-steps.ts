@@ -6,7 +6,11 @@
 
 export type DisplaySegment = { kind: "text"; text: string } | { kind: "done"; stepNum: number };
 
-const MARKER = /`?\[DONE:(\d+)\]`?/gi;
+const MARKER_PATTERN = "`?\\[DONE:(\\d+)\\]`?";
+
+function doneMarkerRegex(): RegExp {
+  return new RegExp(MARKER_PATTERN, "gi");
+}
 
 function hasRenderableText(text: string): boolean {
   return /[\p{L}\p{N}]/u.test(text);
@@ -20,7 +24,7 @@ function hasRenderableText(text: string): boolean {
 export function segmentDoneMarkers(text: string): DisplaySegment[] {
   const segments: DisplaySegment[] = [];
   let lastIdx = 0;
-  for (const match of text.matchAll(MARKER)) {
+  for (const match of text.matchAll(doneMarkerRegex())) {
     const idx = match.index ?? 0;
     const before = text.slice(lastIdx, idx);
     if (hasRenderableText(before)) segments.push({ kind: "text", text: before });
@@ -34,8 +38,7 @@ export function segmentDoneMarkers(text: string): DisplaySegment[] {
 
 /** True when the text contains at least one `[DONE:n]` marker. */
 export function hasDoneMarker(text: string): boolean {
-  MARKER.lastIndex = 0;
-  return MARKER.test(text);
+  return doneMarkerRegex().test(text);
 }
 
 /** All step numbers marked complete via `[DONE:n]` in the given text. */

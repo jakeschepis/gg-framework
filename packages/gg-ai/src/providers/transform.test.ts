@@ -444,6 +444,23 @@ describe("toAnthropicThinking", () => {
       });
     }
   });
+
+  it("keeps budget-based max_tokens within the model ceiling (no doubling)", () => {
+    // Haiku 4.5 is a legacy budget model. max_tokens is the total response
+    // envelope and must stay ≤ the ceiling (64K here); budget_tokens must be
+    // strictly less than max_tokens. Previously this returned maxTokens +
+    // budget (128K), which exceeds the provider's output-token cap.
+    const CEILING = 64_000;
+    for (const level of ["low", "medium", "high", "xhigh", "max"] as const) {
+      const result = toAnthropicThinking(level, CEILING, "claude-haiku-4-5");
+      expect(result.maxTokens).toBeLessThanOrEqual(CEILING);
+      const budget = (result.thinking as { budget_tokens?: number }).budget_tokens!;
+      expect(budget).toBeGreaterThan(0);
+      expect(budget).toBeLessThan(result.maxTokens);
+      // Visible output floor always reserved.
+      expect(result.maxTokens - budget).toBeGreaterThanOrEqual(1024);
+    }
+  });
 });
 
 describe("toOpenAIReasoningEffort", () => {

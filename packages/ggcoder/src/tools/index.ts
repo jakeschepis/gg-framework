@@ -58,6 +58,9 @@ export interface CreateToolsOptions {
    * only assigned after `createTools()` runs during session init.
    */
   getCacheKey?: () => string | undefined;
+  /** Current parent provider/model, evaluated lazily when spawning a sub-agent. */
+  getProvider?: () => string;
+  getModel?: () => string;
   /**
    * Append LSP diagnostics to edit/write results (default true). Servers are
    * resolved from the project/PATH only and spawn lazily on the first edit of
@@ -151,8 +154,8 @@ export function createTools(cwd: string, opts?: CreateToolsOptions): CreateTools
       createSubAgentTool(
         cwd,
         opts.agents,
-        opts.provider,
-        opts.model,
+        () => opts.getProvider?.() ?? opts.provider!,
+        () => opts.getModel?.() ?? opts.model!,
         opts.getCacheKey,
         planModeRef,
       ),

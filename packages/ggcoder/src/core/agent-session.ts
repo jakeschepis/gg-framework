@@ -121,6 +121,10 @@ export class AgentSession {
 
   private messages: Message[] = [];
   private tools: AgentTool[] = [];
+  /** Rebuilds the read tool for a new model (video byte cap is baked in at
+   *  creation). Called from switchModel so video-capable models get the
+   *  read-tool's native-video path after a mid-session model change. */
+  private rebuildReadTool: ((model: string) => AgentTool) | undefined;
   private skills: Skill[] = [];
   private cacheKeyLogged = false;
   // ── Self-correction hook state (mirrors the TUI's useAgentLoop refs) ──
@@ -163,6 +167,10 @@ export class AgentSession {
   private customSystemPrompt?: string;
   /** Shared with the tool layer so plan-mode restrictions read live state. */
   private planModeRef = { current: false };
+  /** Path of the approved plan currently being implemented, or undefined. When
+   *  set, the system prompt carries the `[DONE:n]` progress contract so the
+   *  model emits step-completion markers the UI's plan-progress widget reads. */
+  private approvedPlanPath?: string;
 
   private sessionId = "";
   private sessionPath = "";
@@ -178,9 +186,27 @@ export class AgentSession {
     this.model = options.model;
     this.cwd = options.cwd;
     this.baseUrl = options.baseUrl;
-    this.maxTokens = options.maxTokens ?? getModel(options.model)?.maxOutputTokens ?? 16384;
+    this.maxTokens = this.resolveMaxTokens(options.model);
     this.thinkingLevel = options.thinkingLevel;
     this.customSystemPrompt = options.systemPrompt;
+  }
+
+  /**
+   * Derive the output-token cap for a model. Follows the active model's
+   * `maxOutputTokens` so a session booted on a large-output model (e.g. Kimi's
+   * 256K) doesn't carry that cap to a smaller one (e.g. Opus's 128K) after a
+   * model switch — that mismatch surfaces from the provider as
+   * `max_tokens: 262144 > 128000, which is the maximum allowed …`. An explicit
+   * `maxTokens` override is honored but clamped to the model's ceiling.
+   */
+  private resolveMaxTokens(modelId: string): number {
+    const modelInfo = getModel(modelId);
+    if (this.opts.maxTokens) {
+      return modelInfo
+        ? Math.min(this.opts.maxTokens, modelInfo.maxOutputTokens)
+        : this.opts.maxTokens;
+    }
+    return modelInfo?.maxOutputTokens ?? 16384;
   }
 
   async initialize(): Promise<void> {
@@ -216,14 +242,16 @@ export class AgentSession {
       globalAgentsDir: paths.agentsDir,
       projectDir: this.cwd,
     });
-    const { tools, processManager, lspManager } = createTools(this.cwd, {
+    const { tools, processManager, rebuildReadTool, lspManager } = createTools(this.cwd, {
       agents,
       skills: this.skills,
       provider: this.provider,
       model: this.model,
       lspDiagnostics: this.settingsManager.get("lspDiagnostics"),
-      // Lazy — sessionId isn't assigned yet when createTools() runs, so we
-      // must defer reading the cache key until the sub-agent actually fires.
+      // Lazy — sessionId/model/provider can change after createTools() runs, so
+      // sub-agent spawns read the current parent state at execution time.
+      getProvider: () => this.provider,
+      getModel: () => this.model,
       getCacheKey: () => this.getPromptCacheKey(),
       // Plan mode: only wired when the host supplies callbacks. The ref is
       // shared so bash/edit/write enforce read-only restrictions live.
@@ -236,6 +264,7 @@ export class AgentSession {
         : {}),
     });
     this.tools = tools;
+    this.rebuildReadTool = rebuildReadTool;
     this.processManager = processManager;
     this.lspManager = lspManager;
 
@@ -413,11 +442,38 @@ export class AgentSession {
   ): Promise<void> {
     const parts: Array<TextContent | ImageContent | VideoContent> = [];
     const fileNotes: string[] = [];
+    const modelSupportsVideo = getModel(this.model)?.supportsVideo ?? false;
     for (const a of attachments) {
       if (a.kind === "image") {
         parts.push({ type: "image", mediaType: a.mediaType, data: a.data });
       } else if (a.kind === "video") {
-        parts.push({ type: "video", mediaType: a.mediaType, data: a.data });
+        // Mirror the CLI's buildUserContentWithAttachments: never send inline
+        // VideoContent in the user message. Video-capable models (Kimi/Gemini/
+        // MiniMax) watch video via the read tool, which auto-compresses to the
+        // model's byte cap and delivers it in the provider's required shape.
+        // Non-video models get a plain note so they know to use ffmpeg. The file
+        // was already saved to disk by prepareAttachments in the sidecar.
+        if (modelSupportsVideo && a.path) {
+          parts.push({
+            type: "text",
+            text:
+              `The user attached a video at ${a.path}. You CAN watch it: call the read tool ` +
+              `on this exact path now, then answer based on what you see. Do not say you ` +
+              `cannot watch video — reading the file lets you analyze it.`,
+          });
+        } else if (a.path) {
+          parts.push({
+            type: "text",
+            text:
+              `[User attached a video file at ${a.path}. You cannot watch video directly; ` +
+              `if needed, use ffmpeg to extract frames or audio.]`,
+          });
+        } else {
+          parts.push({
+            type: "text",
+            text: `[User attached a video file but it could not be saved for analysis.]`,
+          });
+        }
       } else if (a.path) {
         fileNotes.push(`- ${a.name} (saved at ${a.path})`);
       }
@@ -693,7 +749,26 @@ export class AgentSession {
     if (provider) this.provider = provider as Provider;
     this.model = model;
     setEstimatorModel(model);
-    this.eventBus.emit("model_change", { provider: this.provider, model: this.model });
+    // maxTokens must follow the active model — it was frozen at the boot
+    // model's `maxOutputTokens` in the constructor, so without this a session
+    // booted on e.g. Kimi (256K) keeps sending that cap after switching to a
+    // smaller model (Opus 128K), which the provider rejects.
+    this.maxTokens = this.resolveMaxTokens(model);
+    this.eventBus.emit("model_change", {
+      provider: this.provider,
+      model: this.model,
+      supportsVideo: getModel(this.model)?.supportsVideo ?? false,
+    });
+
+    // Rebuild the read tool for the new model's video byte cap. The tool's
+    // video capability (description + native-video execute path) is baked in
+    // at creation from the model's maxVideoBytes, so switching to/from a
+    // video-capable model mid-session needs a fresh tool object — mirrors
+    // the TUI's rebuildReadTool call on model switch.
+    if (this.rebuildReadTool) {
+      const newReadTool = this.rebuildReadTool(model);
+      this.tools = this.tools.map((t) => (t.name === "read" ? newReadTool : t));
+    }
 
     // Update provider-specific tools when provider changes
     if (provider && provider !== prevProvider) {
@@ -793,6 +868,9 @@ export class AgentSession {
   }
 
   async newSession(): Promise<void> {
+    // A fresh session drops any in-flight plan state so its prompt is clean.
+    this.planModeRef.current = false;
+    this.approvedPlanPath = undefined;
     const basePrompt =
       this.customSystemPrompt ??
       (await buildSystemPrompt(
@@ -916,12 +994,31 @@ export class AgentSession {
    */
   async setPlanMode(active: boolean): Promise<void> {
     this.planModeRef.current = active;
+    // Entering plan mode discards any prior approved-plan contract (a new plan
+    // is about to be drafted); exiting keeps it (set explicitly via accept).
+    if (active) this.approvedPlanPath = undefined;
+    await this.rebuildSystemPromptInPlace();
+  }
+
+  /**
+   * Bake an approved plan into the system prompt so the model is told to emit
+   * `[DONE:n]` markers as it completes each step (the contract the UI's
+   * plan-progress widget reads). Pass `undefined` to clear it. No-op when a
+   * custom system prompt is in force (the host owns the prompt then).
+   */
+  async setApprovedPlan(approvedPlanPath: string | undefined): Promise<void> {
+    this.approvedPlanPath = approvedPlanPath;
+    await this.rebuildSystemPromptInPlace();
+  }
+
+  /** Rebuild messages[0] from current plan-mode + approved-plan state. */
+  private async rebuildSystemPromptInPlace(): Promise<void> {
     if (this.customSystemPrompt) return;
     const rebuilt = await buildSystemPrompt(
       this.cwd,
       this.skills,
-      active,
-      undefined,
+      this.planModeRef.current,
+      this.approvedPlanPath,
       this.tools.map((tool) => tool.name),
       undefined,
       this.provider,

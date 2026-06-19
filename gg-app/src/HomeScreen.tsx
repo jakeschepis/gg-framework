@@ -46,19 +46,24 @@ export function HomeScreen({ onProjects, onLogin }: Props): React.ReactElement {
   }, []);
 
   async function refresh(): Promise<void> {
-    await waitForReady();
-    const [settings, providers, serve] = await Promise.all([
-      getSettings(),
-      authStatus(),
-      getServeStatus(),
-    ]);
+    // Settings + auth are read NATIVELY (Rust) — do them first, WITHOUT waiting on
+    // the sidecar, so the "Your Projects" gate never stays dimmed just because
+    // the agent is slow/crashed (the original bug, now also covering providers).
+    const [settings, providers] = await Promise.all([getSettings(), authStatus()]);
     // Prefer the explicit `configured` flag; fall back to a non-empty root so an
     // older sidecar (one that predates the flag) degrades to "set" instead of
     // dimming forever.
     setFolderSet(settings?.configured ?? Boolean(settings?.projectsRoot));
     setProviderCount(providers.filter((p) => p.connected).length);
-    setServing(serve.running);
-    setTelegramConfigured(serve.configured);
+    // Serve status lives in the sidecar (the Telegram bot runs there). Best-effort
+    // — gate it on readiness but never let it block the native reads above.
+    void waitForReady()
+      .then(() => getServeStatus())
+      .then((serve) => {
+        setServing(serve.running);
+        setTelegramConfigured(serve.configured);
+      })
+      .catch(() => {});
   }
 
   useEffect(() => {

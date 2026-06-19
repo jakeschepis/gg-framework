@@ -1,5 +1,35 @@
 # @kenkaiiii/gg-core
 
+## 4.11.3
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@4.11.3
+
+## 4.11.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@4.11.2
+
+## 4.11.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@4.11.1
+
+## 4.11.0
+
+### Minor Changes
+
+- Add GLM-5.2 as a new model — Z.ai's coding-first flagship with a usable 1M-token
+  context window and 131K max output. It is now the default model for the `glm`
+  provider (registry + CLI defaults updated; app sidecar rebundled).
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@4.11.0
+
 ## 4.10.2
 
 ### Patch Changes

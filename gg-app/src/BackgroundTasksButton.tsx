@@ -85,9 +85,6 @@ export function BackgroundTasksButton({ tasks }: { tasks: BackgroundTask[] }): R
               visibility: pos ? "visible" : "hidden",
             }}
           >
-            <div className="bgtasks-title" style={{ color: theme.textMuted }}>
-              Background tasks
-            </div>
             {tasks.length === 0 && (
               <div className="bgtasks-empty" style={{ color: theme.textDim }}>
                 no background tasks

@@ -1,4 +1,5 @@
 import { theme } from "./theme";
+import { formatTokenCount } from "./ActivityBar";
 
 // BLACK_CIRCLE — ⏺, matching the rest of the app's status figures.
 const DOT = "\u23FA";
@@ -15,6 +16,8 @@ export interface SubAgentLine {
   /** Rolling feed of tool activities the agent has run (already humanized). */
   activities: string[];
   toolUseCount: number;
+  /** Cumulative token usage for this agent (live during the run). */
+  tokenUsage?: { input: number; output: number };
   durationMs?: number;
 }
 
@@ -33,6 +36,14 @@ function formatDuration(ms: number): string {
 
 function displayName(agent: SubAgentLine, index: number): string {
   return agent.agentName && agent.agentName !== "default" ? agent.agentName : `Agent ${index + 1}`;
+}
+
+/** Compact "↑in ↓out" token readout, or null until any tokens are counted. */
+function formatTokens(usage: SubAgentLine["tokenUsage"]): string | null {
+  if (!usage) return null;
+  const total = usage.input + usage.output;
+  if (total === 0) return null;
+  return `\u2191 ${formatTokenCount(usage.input)} \u2193 ${formatTokenCount(usage.output)}`;
 }
 
 /**
@@ -81,6 +92,7 @@ export function SubAgentFeed({ agents, aborted = false }: Props): React.ReactEle
           // Done/errored agents collapse to a one-line summary; running agents
           // show their live tool feed (most recent last).
           const feed = isRunning ? agent.activities.slice(-MAX_FEED_ROWS) : [];
+          const tokens = formatTokens(agent.tokenUsage);
 
           return (
             <div className="subagent" key={agent.toolCallId}>
@@ -94,6 +106,11 @@ export function SubAgentFeed({ agents, aborted = false }: Props): React.ReactEle
                 <span className="subagent-name" style={{ color: theme.text }}>
                   {displayName(agent, i)}
                 </span>
+                {tokens && (
+                  <span className="subagent-tokens" style={{ color: theme.textDim }}>
+                    {tokens}
+                  </span>
+                )}
                 {!isRunning && (
                   <span className="subagent-summary" style={{ color: theme.textDim }}>
                     {aborted

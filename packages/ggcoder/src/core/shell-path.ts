@@ -126,7 +126,9 @@ let cached: string | undefined;
  * Compute the enriched PATH (login shell ∪ current ∪ existing well-known dirs).
  * Cached after first call. Order is preserved and duplicates removed.
  */
-export async function resolveEnrichedPath(currentPath: string = process.env.PATH ?? ""): Promise<string> {
+export async function resolveEnrichedPath(
+  currentPath: string = process.env.PATH ?? "",
+): Promise<string> {
   if (cached !== undefined) return cached;
 
   const parts: string[] = [];

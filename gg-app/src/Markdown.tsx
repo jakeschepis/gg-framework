@@ -3,17 +3,22 @@ import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
 import { openUrl } from "@tauri-apps/plugin-opener";
+import { openProjectPath } from "./agent";
 import "highlight.js/styles/github-dark.css";
 
 interface Props {
   children: string;
 }
 
+function isExternalHref(href: string): boolean {
+  const scheme = href.match(/^([a-z][a-z0-9+.-]*):/i)?.[1].toLowerCase();
+  return Boolean(scheme && scheme !== "file" && scheme.length > 1);
+}
+
 /**
- * Anchor that opens in the OS browser instead of navigating the webview. In a
- * Tauri webview a bare <a href> would replace the app's own page (or open a
- * dead in-app tab), so we intercept the click and hand the URL to the opener
- * plugin. Non-http(s) targets (anchors, mailto handled by the OS) pass through.
+ * Anchor that opens outside the webview. Browser links go to the OS browser;
+ * file-ish links from the agent (`src/App.tsx`, `/abs/file.ts`, `file://…`) open
+ * against the current project window's cwd.
  */
 function ExternalLink({
   href,
@@ -26,9 +31,13 @@ function ExternalLink({
     <a
       href={href}
       onClick={(e) => {
-        if (!href) return;
+        if (!href || href.startsWith("#")) return;
         e.preventDefault();
-        void openUrl(href);
+        if (isExternalHref(href)) {
+          void openUrl(href);
+        } else {
+          void openProjectPath(href);
+        }
       }}
     >
       {children}

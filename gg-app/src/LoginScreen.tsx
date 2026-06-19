@@ -1,6 +1,6 @@
 import { useCallback, useEffect, useState } from "react";
 import { theme } from "./theme";
-import { waitForReady, authStatus, type AuthProvider } from "./agent";
+import { authStatus, type AuthProvider } from "./agent";
 import { Badge } from "./Badge";
 import { BackButton } from "./BackButton";
 import { ProviderLoginModal } from "./ProviderLoginModal";
@@ -29,8 +29,9 @@ export function LoginScreen({ onClose }: Props): React.ReactElement {
 
   useEffect(() => {
     let cancelled = false;
-    void waitForReady()
-      .then(() => authStatus())
+    // Auth status is read natively (Rust) — no sidecar wait, so the list renders
+    // immediately even while the agent is still booting or has crashed.
+    void authStatus()
       .then((list) => {
         if (!cancelled) {
           setProviders(list);

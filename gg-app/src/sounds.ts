@@ -1,0 +1,58 @@
+// UI sound effects. Each event maps to a short mp3 bundled by Vite (imported as
+// a URL). Sounds are preloaded once and cloned per play so rapid repeats (and
+// overlapping sounds) never cut each other off.
+import clickUrl from "./assets/ui-click.mp3";
+import warningUrl from "./assets/ui-warning.mp3";
+import hoverUrl from "./assets/ui-hover.mp3";
+import doneUrl from "./assets/ui-done.mp3";
+
+export type UiSound = "click" | "warning" | "hover" | "done";
+
+const SOURCES: Record<UiSound, string> = {
+  click: clickUrl,
+  warning: warningUrl,
+  hover: hoverUrl,
+  done: doneUrl,
+};
+
+// Per-sound master volume — clicks are frequent so they sit quieter than the
+// rarer, more deliberate cues.
+const VOLUME: Record<UiSound, number> = {
+  click: 0.25,
+  warning: 0.5,
+  hover: 0.45,
+  done: 0.5,
+};
+
+// Preloaded base elements (one per sound) cloned on each play.
+const base: Partial<Record<UiSound, HTMLAudioElement>> = {};
+
+function getBase(sound: UiSound): HTMLAudioElement {
+  let el = base[sound];
+  if (!el) {
+    el = new Audio(SOURCES[sound]);
+    el.preload = "auto";
+    base[sound] = el;
+  }
+  return el;
+}
+
+let enabled = true;
+
+/** Toggle all UI sounds (e.g. a future settings switch). */
+export function setSoundEnabled(on: boolean): void {
+  enabled = on;
+}
+
+/** Play a UI sound. Best-effort: autoplay rejections and decode errors are
+ *  swallowed so audio never disrupts the UI. */
+export function playSound(sound: UiSound): void {
+  if (!enabled) return;
+  try {
+    const node = getBase(sound).cloneNode(true) as HTMLAudioElement;
+    node.volume = VOLUME[sound];
+    void node.play().catch(() => {});
+  } catch {
+    // Audio unavailable — ignore.
+  }
+}

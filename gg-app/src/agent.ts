@@ -58,6 +58,8 @@ export interface AgentState {
   gitBranch?: string | null;
   /** True when the project cwd is inside a git work tree. */
   isGitRepo?: boolean;
+  /** True when the active model can accept native video input. */
+  supportsVideo?: boolean;
   /** Live background tasks (footer indicator). */
   tasks?: BackgroundTask[];
 }
@@ -146,6 +148,20 @@ export async function getState(): Promise<AgentState> {
   return invoke<AgentState>("agent_state");
 }
 
+export async function openProjectPath(path: string): Promise<void> {
+  let decoded = path;
+  try {
+    decoded = decodeURIComponent(path);
+  } catch {
+    // Keep the original string if the model emitted a malformed `%` escape.
+  }
+  try {
+    await invoke("open_project_path", { path: decoded });
+  } catch (e) {
+    await logError(`open_project_path failed: ${String(e)}`);
+  }
+}
+
 /** A chat-input attachment (image / video / other file) sent with a prompt. */
 export interface Attachment {
   kind: "image" | "video" | "file";
@@ -175,6 +191,20 @@ export async function cancel(): Promise<void> {
   }
 }
 
+/**
+ * Accept the pending plan: bakes its `## Steps` into the agent's system prompt
+ * so it emits `[DONE:n]` progress markers as it implements each step (which the
+ * activity bar's "Plan Steps n/total" widget reads). Call this BEFORE sending
+ * the "implement it now" prompt. `planPath` comes from the `plan_exit` event.
+ */
+export async function acceptPlan(planPath: string | null): Promise<void> {
+  try {
+    await invoke("agent_accept_plan", { planPath });
+  } catch (e) {
+    await logError(`agent_accept_plan failed: ${String(e)}`);
+  }
+}
+
 /** A resumed transcript entry (user or assistant text) for hydration. When
  *  `hook` is set, this user message is an injected self-correction hook prompt
  *  and should render as the short hook notice, not the raw prompt body. */
@@ -187,6 +217,9 @@ export interface HistoryEntry {
   /** True when `text` is a recovered `/name [args]` command invocation, so the
    *  webview renders the short command chip instead of the expanded body. */
   command?: boolean;
+  /** True when this user message is a post-compaction summary marker, so the
+   *  webview renders the quiet compaction notice instead of the summary body. */
+  compacted?: boolean;
 }
 
 /** Fetch the resumed session's prior messages so the transcript can hydrate. */
@@ -214,35 +247,59 @@ export interface AuthProvider {
   connected: boolean;
 }
 
-/** List providers with their supported auth methods + live connection status. */
+/**
+ * List providers with their supported auth methods + live connection status.
+ *
+ * Handled NATIVELY in Rust (static list + reads ~/.gg/auth.json directly) so the
+ * login hub always renders even when the Node sidecar is slow/crashed — it used
+ * to show a blank list, the same failure mode as the project-folder bug. The
+ * login ACTIONS (OAuth, key save, logout) still go through the sidecar.
+ */
 export async function authStatus(): Promise<AuthProvider[]> {
   try {
-    const res = await invoke<{ providers: AuthProvider[] }>("agent_auth_status");
+    const res = await invoke<{ providers: AuthProvider[] }>("app_auth_status");
     return res.providers ?? [];
   } catch (e) {
-    await logError(`agent_auth_status failed: ${String(e)}`);
+    await logError(`app_auth_status failed: ${String(e)}`);
     return [];
   }
 }
 
-/** Store an API key for a provider. Throws with a user-facing message on error. */
+/**
+ * Store an API key for a provider. Handled NATIVELY in Rust (writes ~/.gg/auth.json
+ * directly) so it never depends on the per-window sidecar being up — a fresh
+ * user's sidecar may not have booted yet, and a sidecar round-trip would hang.
+ * Throws with a user-facing message on error.
+ */
 export async function authApiKey(provider: string, key: string): Promise<void> {
-  await invoke("agent_auth_apikey", { provider, key });
+  await invoke("app_auth_apikey", { provider, key });
 }
 
-/** Begin an OAuth login; progress arrives via subscribe() auth_* events. */
+/**
+ * Begin an OAuth login; progress arrives via subscribe() auth_* events. Unlike
+ * the API-key/logout paths (handled natively in Rust), the OAuth flow is proxied
+ * through the per-window Node sidecar, so wait for it to come up first — on the
+ * login hub the sidecar may still be booting, and invoking early throws the
+ * "sidecar not ready" error users hit when clicking Continue.
+ */
 export async function authOAuthStart(provider: string): Promise<void> {
+  await waitForReady();
   await invoke("agent_auth_oauth_start", { provider });
 }
 
-/** Submit a pasted OAuth code to an in-flight login. */
+/** Submit a pasted OAuth code to an in-flight login. Sidecar-proxied like start. */
 export async function authOAuthCode(code: string): Promise<void> {
+  await waitForReady();
   await invoke("agent_auth_oauth_code", { code });
 }
 
-/** Disconnect a provider (clear stored credentials). */
+/**
+ * Disconnect a provider (clear stored credentials). Handled NATIVELY in Rust
+ * (removes the provider from ~/.gg/auth.json; moonshot also clears its OAuth
+ * key) so it never depends on the sidecar.
+ */
 export async function authLogout(provider: string): Promise<void> {
-  await invoke("agent_auth_logout", { provider });
+  await invoke("app_auth_logout", { provider });
 }
 
 /** Start a fresh session (clears history) for this window's current project. */
@@ -397,6 +454,29 @@ export async function listProjects(): Promise<DiscoveredProject[]> {
   }
 }
 
+/** A project file surfaced in the chat input's `@` picker. */
+export interface FileHit {
+  /** Project-relative POSIX path, e.g. "src/App.tsx". */
+  path: string;
+  /** File name only, e.g. "App.tsx". */
+  name: string;
+}
+
+/**
+ * Search the current project's files for the `@` mention picker. An empty
+ * `query` returns the most-recently-modified files; a query returns fuzzy
+ * matches. Honors .gitignore and skips node_modules/.git. Capped sidecar-side.
+ */
+export async function searchFiles(query: string): Promise<FileHit[]> {
+  try {
+    const res = await invoke<{ files: FileHit[] }>("agent_files", { query });
+    return res.files ?? [];
+  } catch (e) {
+    await logError(`agent_files failed: ${String(e)}`);
+    return [];
+  }
+}
+
 /** List the latest sessions for a project cwd (newest first, with previews). */
 export async function listSessions(cwd: string): Promise<RecentSession[]> {
   try {
@@ -416,6 +496,27 @@ export async function selectProject(cwd: string, sessionPath?: string): Promise<
   await invoke("select_project", { cwd, sessionPath: sessionPath ?? null });
 }
 
+/** The project/session a window was restored to on app boot (workspace restore). */
+export interface RestoreTarget {
+  cwd: string;
+  sessionPath: string | null;
+}
+
+/**
+ * If THIS window was reopened from the saved workspace (after a restart/update),
+ * return its restore target so the webview can skip the project picker and
+ * hydrate straight into the resumed project/session. Returns null for a normal
+ * (freshly launched) window. Consume-once: a second call returns null.
+ */
+export async function restoreTarget(): Promise<RestoreTarget | null> {
+  try {
+    return await invoke<RestoreTarget | null>("window_restore_target");
+  } catch (e) {
+    await logError(`window_restore_target failed: ${String(e)}`);
+    return null;
+  }
+}
+
 /**
  * Open enough new project windows (each with its own agent) to reach `count`
  * total, then tile the first `count` windows into a 2- or 4-up grid filling the
@@ -430,6 +531,40 @@ export async function setupWindows(count: number): Promise<void> {
   }
 }
 
+// ── Gaze focus (webcam eye/head tracking → window focus) ───────────
+
+/** Payload of the `gaze-target` event broadcast to every window. `target` is the
+ *  window the gaze currently rests on (null off any window); `committed` is the
+ *  window that currently holds focus. Each window paints a solid ring when it's
+ *  `committed`, a soft highlight when it's the (un-committed) `target`. */
+export interface GazeTargetEvent {
+  target: string | null;
+  committed: string | null;
+}
+
+/** Map a normalized monitor point to a window. With `commit`, commit OS focus to
+ *  the hit window. `committed` is the currently-focused window so the broadcast
+ *  border persists. Always broadcasts `gaze-target`. Returns the hit label. */
+export async function gazeFocus(
+  nx: number,
+  ny: number,
+  commit: boolean,
+  committed: string | null,
+): Promise<string | null> {
+  try {
+    return await invoke<string | null>("gaze_focus", { nx, ny, commit, committed });
+  } catch (e) {
+    await logError(`gaze_focus failed: ${String(e)}`);
+    return null;
+  }
+}
+
+/** Subscribe THIS window to gaze-target broadcasts. Returns an unlisten fn. */
+export async function onGazeTarget(cb: (e: GazeTargetEvent) => void): Promise<() => void> {
+  const un = await appWindow.listen<GazeTargetEvent>("gaze-target", (e) => cb(e.payload));
+  return un;
+}
+
 /** Open a single new project window (Cmd/Ctrl+N). Never re-tiles existing ones. */
 export async function newWindow(): Promise<void> {
   try {
@@ -438,6 +573,44 @@ export async function newWindow(): Promise<void> {
     await logError(`new_window failed: ${String(e)}`);
     throw e;
   }
+}
+
+/**
+ * Cycle keyboard focus by `offset` positions (wraps around) through windows in
+ * reading order. +1 = forward (Cmd/Ctrl+`), -1 = backward (Cmd/Ctrl+Shift+`).
+ * No-op when ≤1 window is open.
+ */
+export async function focusWindowByOffset(offset: number): Promise<void> {
+  try {
+    await invoke("focus_window_by_offset", { offset });
+  } catch (e) {
+    await logError(`focus_window_by_offset failed: ${String(e)}`);
+  }
+}
+
+/** Re-tile every open window into a clean grid (no create/destroy). */
+export async function arrangeAllWindows(): Promise<void> {
+  try {
+    await invoke("arrange_all");
+  } catch (e) {
+    await logError(`arrange_all failed: ${String(e)}`);
+  }
+}
+
+/**
+ * Payload of the `window-order` broadcast: window labels in reading order
+ * (rows top→bottom, left→right within a row) and the label of the
+ * currently-focused window (or null).
+ */
+export interface WindowOrderEvent {
+  order: string[];
+  focused: string | null;
+}
+
+/** Subscribe THIS window to reading-order broadcasts. Returns an unlisten fn. */
+export async function onWindowOrder(cb: (e: WindowOrderEvent) => void): Promise<() => void> {
+  const un = await appWindow.listen<WindowOrderEvent>("window-order", (e) => cb(e.payload));
+  return un;
 }
 
 // ── Telegram serve (remote control via Telegram) ───────────

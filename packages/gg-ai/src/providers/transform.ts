@@ -577,17 +577,27 @@ export function toAnthropicThinking(
     };
   }
 
-  // Legacy budget-based thinking for older models ("xhigh"/"max" treated as "high")
+  // Legacy budget-based thinking for older models ("xhigh"/"max" treated as
+  // "high"). `maxTokens` is the model's full output-token ceiling; for budget
+  // thinking `max_tokens` is the TOTAL response envelope (thinking + visible
+  // output), so it must stay ≤ the ceiling and `budget_tokens` must be strictly
+  // less than it. The previous code returned `maxTokens + budget`, which blew
+  // past the ceiling (e.g. Haiku 4.5: 64K + 64K = 128K) and could trip the
+  // provider's `max_tokens > maximum allowed` rejection. Now the ceiling is the
+  // envelope and the budget is a fraction of it with a reserved visible floor.
+  const VISIBLE_FLOOR = 1024;
   const effectiveLevel = level === "xhigh" || level === "max" ? "high" : level;
   const budgetMap: Record<"low" | "medium" | "high", number> = {
-    low: Math.max(1024, Math.floor(maxTokens * 0.25)),
-    medium: Math.max(2048, Math.floor(maxTokens * 0.5)),
-    high: Math.max(4096, maxTokens),
+    low: Math.max(1024, Math.floor(maxTokens * 0.2)),
+    medium: Math.max(2048, Math.floor(maxTokens * 0.45)),
+    high: Math.max(4096, Math.floor(maxTokens * 0.8)),
   };
-  const budget = budgetMap[effectiveLevel];
+  // Clamp the budget so a visible-output floor survives even at "high" on small
+  // ceilings, and budget_tokens stays < max_tokens (Anthropic hard requirement).
+  const budget = Math.max(0, Math.min(budgetMap[effectiveLevel], maxTokens - VISIBLE_FLOOR));
   return {
     thinking: { type: "enabled", budget_tokens: budget },
-    maxTokens: maxTokens + budget,
+    maxTokens,
   };
 }
 

@@ -42,7 +42,7 @@ export interface BusEventMap {
 
   // Session lifecycle
   session_start: { sessionId: string };
-  model_change: { provider: string; model: string };
+  model_change: { provider: string; model: string; supportsVideo?: boolean };
   compaction_start: { messageCount: number };
   compaction_end: { originalCount: number; newCount: number };
 

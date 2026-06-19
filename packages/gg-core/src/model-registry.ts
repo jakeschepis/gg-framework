@@ -207,6 +207,20 @@ export const MODELS: ModelInfo[] = [
     maxThinkingLevel: "high",
   },
   // ── Z.AI (GLM) ─────────────────────────────────────────
+  // GLM-5.2: coding-first flagship with a usable 1M-token context window
+  // (5x jump over GLM-5.1's ~200K) and 131K max output. Released 2026-06-13.
+  {
+    id: "glm-5.2",
+    name: "GLM-5.2",
+    provider: "glm",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 131_072,
+    supportsThinking: true,
+    supportsImages: false,
+    supportsVideo: false,
+    costTier: "medium",
+    maxThinkingLevel: "high",
+  },
   {
     id: "glm-5.1",
     name: "GLM-5.1",
@@ -355,7 +369,7 @@ export function getDefaultModel(provider: Provider): ModelInfo {
   if (provider === "xiaomi") return MODELS.find((m) => m.id === "mimo-v2.5-pro")!;
   if (provider === "openai") return MODELS.find((m) => m.id === "gpt-5.5")!;
   if (provider === "gemini") return MODELS.find((m) => m.id === "gemini-3.1-flash-lite-preview")!;
-  if (provider === "glm") return MODELS.find((m) => m.id === "glm-5.1")!;
+  if (provider === "glm") return MODELS.find((m) => m.id === "glm-5.2")!;
   if (provider === "moonshot") return MODELS.find((m) => m.id === "kimi-k2.7-code")!;
   if (provider === "minimax") return MODELS.find((m) => m.id === "MiniMax-M3")!;
   if (provider === "deepseek") return MODELS.find((m) => m.id === "deepseek-v4-pro")!;

@@ -47,18 +47,24 @@ async function main() {
     stdio: ["ignore", "pipe", "pipe"],
   });
 
-  // Sentinel: reaching the provider-auth check proves the bundled runtime +
-  // single-file bundle + native deps (sharp) all loaded on this OS — which is
-  // exactly what this distribution smoke test verifies. CI has no credentials,
-  // so the sidecar fatals with "Not logged in" right after a clean boot; treat
-  // that as PASS. With credentials (e.g. locally) it instead binds a port and
-  // we exercise /state below.
+  // The sidecar is boot-tolerant: with no credentials it no longer fatals, it
+  // boots logged-out and binds a port so the login endpoints are reachable. So
+  // on credential-less CI we now reach the GG_APP_LISTENING handshake and
+  // exercise /state below — proving the bundled runtime + single-file bundle +
+  // native deps (sharp) loaded on this OS. (Older bundles fataled with "Not
+  // logged in" instead; that's still accepted as a legacy pass.)
+  //
+  // Timeout is generous (120s): session.initialize() connects the default
+  // `kencode-search` MCP server via `npx -y …` with a 30s connect timeout, and a
+  // cold npx cache on a fresh CI runner can take the full 30s before MCP fails
+  // gracefully and boot continues to server.listen(). 30s here used to race that
+  // and time out; 120s clears it with margin.
   const LOADED_BUT_UNAUTHED = Symbol("loaded-but-unauthed");
 
   const port = await new Promise((resolve, reject) => {
     const timer = setTimeout(
       () => reject(new Error("timed out waiting for GG_APP_LISTENING")),
-      30000,
+      120000,
     );
     let out = "";
     let err = "";

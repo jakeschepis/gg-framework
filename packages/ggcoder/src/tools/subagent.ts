@@ -1,5 +1,7 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
+import { existsSync } from "node:fs";
+import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import type { AgentDefinition } from "../core/agents.js";
@@ -12,6 +14,17 @@ const SUB_AGENT_MAX_OUTPUT_CHARS = 100_000; // ~25k tokens, matches other tool l
 const SUB_AGENT_MAX_OUTPUT_LINES = 500;
 const SUB_AGENT_MAX_STDERR_CHARS = 10_000; // Cap stderr to prevent unbounded growth
 const SUB_AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute hard timeout
+
+/**
+ * Absolute path to the ggcoder CLI entry (dist/cli.js) that runs a sub-agent in
+ * JSON mode. Resolved relative to this module so it's correct no matter how the
+ * host process was launched (CLI bin, desktop app sidecar, tests). Falls back to
+ * the launching script only if the sibling file is missing.
+ */
+function resolveCliEntry(): string {
+  const cliPath = fileURLToPath(new URL("../cli.js", import.meta.url));
+  return existsSync(cliPath) ? cliPath : process.argv[1];
+}
 
 const SubAgentParams = z.object({
   task: z.string().describe("The task to delegate to the sub-agent"),
@@ -36,8 +49,8 @@ export interface SubAgentDetails {
 export function createSubAgentTool(
   cwd: string,
   agents: AgentDefinition[],
-  parentProvider: string,
-  parentModel: string,
+  getParentProvider: () => string,
+  getParentModel: () => string,
   getParentCacheKey?: () => string | undefined,
   planModeRef?: { current: boolean },
 ): AgentTool<typeof SubAgentParams> {
@@ -76,7 +89,8 @@ export function createSubAgentTool(
         }
       }
 
-      const useProvider = parentProvider;
+      const useProvider = getParentProvider();
+      const useModel = getParentModel();
 
       // Build CLI args — limit turns to prevent runaway context growth
       const cliArgs: string[] = [
@@ -84,7 +98,7 @@ export function createSubAgentTool(
         "--provider",
         useProvider,
         "--model",
-        parentModel,
+        useModel,
         "--max-turns",
         String(SUB_AGENT_MAX_TURNS),
       ];
@@ -104,9 +118,14 @@ export function createSubAgentTool(
       }
       cliArgs.push(args.task);
 
-      // Spawn child process using same binary
-      const binPath = process.argv[1];
-      const child = spawn(process.execPath, [binPath, ...cliArgs], {
+      // Spawn the ggcoder CLI as a child process. We must run the CLI entry
+      // (dist/cli.js, the JSON-mode agent runner), NOT process.argv[1]: in the
+      // desktop app the host process is app-sidecar.js, which ignores CLI args
+      // and just boots another HTTP server — the sub-agent would then emit no
+      // NDJSON and hang until the hard timeout. cli.js sits one level up from
+      // this module (dist/tools/subagent.js → dist/cli.js); fall back to
+      // argv[1] only if that resolution somehow misses.
+      const child = spawn(process.execPath, [resolveCliEntry(), ...cliArgs], {
         cwd,
         stdio: ["ignore", "pipe", "pipe"],
         env: { ...process.env },
@@ -129,7 +148,7 @@ export function createSubAgentTool(
       log("INFO", "subagent", "Sub-agent spawn", {
         cacheKey: subCacheKey,
         provider: useProvider,
-        model: parentModel,
+        model: useModel,
         agent: agentDef?.name ?? "(default)",
       });
 

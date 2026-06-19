@@ -16,21 +16,33 @@ import {
   runAllTasks,
   deleteTask,
   newWindow,
+  focusWindowByOffset,
+  arrangeAllWindows,
+  onWindowOrder,
+  restoreTarget,
+  acceptPlan as acceptPlanIPC,
   subscribe,
   isSecondaryWindow,
+  windowLabel,
   setWindowTitle,
+  openProjectPath,
   type SidecarEvent,
   type AgentState,
   type ModelOption,
   type SlashCommand,
   type BackgroundTask,
   type ProjectTask,
+  type FileHit,
+  searchFiles,
 } from "./agent";
 import { ActivityBar, formatTokenCount } from "./ActivityBar";
 import { LiveToolPanel, type LiveToolEntry, LIVE_TOOL_PANEL_ROWS } from "./LiveToolPanel";
 import { SubAgentFeed, type SubAgentLine } from "./SubAgentFeed";
+import { CompactionNotice } from "./CompactionNotice";
 import { ModelMenu } from "./ModelMenu";
 import { SlashMenu } from "./SlashMenu";
+import { FileMentionMenu } from "./FileMentionMenu";
+import { ReferencedFiles, appendReferencedFiles, parseReferencedFiles } from "./ReferencedFiles";
 import { ContextMeter } from "./ContextMeter";
 import { BackgroundTasksButton } from "./BackgroundTasksButton";
 import { TasksModal } from "./TasksModal";
@@ -40,6 +52,8 @@ import { InitGitModal } from "./InitGitModal";
 import { PlanModeLogo } from "./PlanModeLogo";
 import { PlanReviewModal } from "./PlanReviewModal";
 import { WindowLayoutButton } from "./WindowLayoutButton";
+// Experimental gaze focus — disabled for now (see main.tsx).
+// import { GazeButton } from "./GazeButton";
 import { RadioButton } from "./RadioButton";
 import { ProjectPicker } from "./ProjectPicker";
 import { BackButton } from "./BackButton";
@@ -50,13 +64,14 @@ import { Markdown } from "./Markdown";
 import { FooterSkeleton, TranscriptSkeleton } from "./Skeleton";
 import { useAppUpdate } from "./update";
 import { recoverPromptLabel } from "./prompt-labels";
+import { playSound } from "./sounds";
 import {
   segmentDoneMarkers,
   hasDoneMarker,
   countPlanSteps,
   findCompletedSteps,
 } from "./plan-steps";
-import { Paperclip } from "lucide-react";
+import { Paperclip, AtSign } from "lucide-react";
 import { AttachmentBar } from "./AttachmentBar";
 import { fileToPending, toWire, type PendingAttachment } from "./attachments";
 import "./App.css";
@@ -75,6 +90,7 @@ type Item =
       command?: boolean;
       label?: string;
       images?: string[];
+      files?: string[];
     }
   | { kind: "assistant"; id: number; text: string }
   | { kind: "info"; id: number; text: string }
@@ -89,7 +105,16 @@ type Item =
   // A task kicked off from the Tasks modal (shown at the top of its session).
   | { kind: "task"; id: number; title: string }
   // Sub-agents delegated in a turn — a live, in-chat feed of each one's tools.
-  | { kind: "subagent_group"; id: number; agents: SubAgentLine[]; aborted?: boolean };
+  | { kind: "subagent_group"; id: number; agents: SubAgentLine[]; aborted?: boolean }
+  // Context compaction — shimmering "compacting…" while running, then a quiet
+  // "compacted · N → M messages" summary when done.
+  | {
+      kind: "compaction";
+      id: number;
+      status: "running" | "done";
+      originalCount?: number;
+      newCount?: number;
+    };
 
 export interface TranscriptImage {
   /** data: URL (base64) ready to drop into <img src>. */
@@ -204,11 +229,16 @@ function pickDoneVerb(toolsUsed: ReadonlySet<string>): string {
   return phrases[Math.floor(Math.random() * phrases.length)] ?? "Worked in";
 }
 
+function hasDraggedFiles(dataTransfer: DataTransfer | null): boolean {
+  return Array.from(dataTransfer?.types ?? []).includes("Files");
+}
+
 function App(): React.ReactElement {
   const [items, setItems] = useState<Item[]>([]);
   const [input, setInput] = useState("");
-  // Staged attachments (paste / attach button / drag-drop) shown above the input.
+  // Staged attachments (paste / attach button / whole-window drag-drop) shown above the input.
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
+  const [isFileDragOver, setIsFileDragOver] = useState(false);
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Number of messages queued mid-run (injected as steering by the sidecar).
   const [queuedCount, setQueuedCount] = useState(0);
@@ -222,9 +252,17 @@ function App(): React.ReactElement {
   const [sessionTitle, setSessionTitle] = useState<string | null>(null);
   // Pending plan awaiting review (the markdown). Non-null opens the review modal.
   const [planReview, setPlanReview] = useState<string | null>(null);
+  // Path of the plan awaiting review, captured from `plan_exit`. Needed on accept
+  // to bake the plan's `## Steps` into the agent's system prompt so it emits
+  // `[DONE:n]` progress markers (drives the activity bar's Plan Steps widget).
+  const planReviewPathRef = useRef<string | null>(null);
   // Approved-plan progress for the activity bar: total steps + completed set.
   const [planTotal, setPlanTotal] = useState(0);
   const [planDone, setPlanDone] = useState<Set<number>>(new Set());
+  // Refs mirror the plan progress state for the memoized SSE event handler,
+  // which intentionally does not re-capture React state on every render.
+  const planTotalRef = useRef(0);
+  const planDoneRef = useRef<Set<number>>(new Set());
   const [isThinking, setIsThinking] = useState(false);
   const [thinkingStartTs, setThinkingStartTs] = useState<number | null>(null);
   const [thinkingAccumMs, setThinkingAccumMs] = useState(0);
@@ -232,6 +270,15 @@ function App(): React.ReactElement {
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
+  // `@`-mention file picker state. `mention` is the active token being typed
+  // (its query + where it starts in the input); `fileMatches` is the live
+  // search result; `fileIndex` is the keyboard-highlighted row.
+  const [mention, setMention] = useState<{ query: string; start: number } | null>(null);
+  const [fileMatches, setFileMatches] = useState<FileHit[]>([]);
+  const [fileIndex, setFileIndex] = useState(0);
+  // Files referenced via `@`, tracked as chips (NOT left in the input text).
+  // Their paths are appended to the prompt on submit.
+  const [mentionedPaths, setMentionedPaths] = useState<string[]>([]);
   // Footer extras mirrored from the sidecar: live background tasks and the
   // running context-window usage (input-side tokens of the latest turn).
   const [tasks, setTasks] = useState<BackgroundTask[]>([]);
@@ -243,6 +290,10 @@ function App(): React.ReactElement {
   // Every window picks a project before connecting — on app load and on each new
   // window. The picker re-points this window's agent at the chosen cwd/session.
   const [needsProject, setNeedsProject] = useState(true);
+  // False until the boot-time workspace-restore check resolves. Gates the entry
+  // render so a window reopened from the saved workspace (after a restart /
+  // update) never flashes the picker before jumping into its restored project.
+  const [restoreChecked, setRestoreChecked] = useState(false);
   // Entry-screen routing while no project is open: the home landing, the
   // project chooser, or the provider login hub. Secondary windows (opened via
   // the Windows button) skip the home screen and land on "Choose a project".
@@ -302,6 +353,9 @@ function App(): React.ReactElement {
   // first subagent spawns). Lets later parallel agents join the same in-chat
   // feed instead of each opening a fresh block.
   const subagentGroupIdRef = useRef<number | null>(null);
+  // Transcript id of the in-flight compaction notice, so compaction_end can
+  // flip the same row from shimmer → summary instead of pushing a new line.
+  const compactionIdRef = useRef<number | null>(null);
   const runStartRef = useRef<number>(0);
   const toolsUsedRef = useRef<Set<string>>(new Set());
   const tokensRef = useRef<number>(0);
@@ -314,6 +368,12 @@ function App(): React.ReactElement {
   const thinkingStartRef = useRef<number | null>(null);
   const thinkingAccumRef = useRef<number>(0);
 
+  // Whether the transcript is "pinned" to the bottom. Auto-scroll only runs
+  // while pinned. The user scrolling up un-pins it — so they can read freely
+  // even while the agent keeps streaming — and scrolling back to the bottom
+  // re-pins. Default true so a fresh transcript follows the newest output.
+  const stickToBottomRef = useRef(true);
+
   // Pin to the bottom. Images (screenshots / attachments) load asynchronously
   // and grow the content after this fires, so it's also called from each image's
   // onLoad to keep the newest content visible.
@@ -322,31 +382,49 @@ function App(): React.ReactElement {
     if (el) el.scrollTo({ top: el.scrollHeight });
   }, []);
 
-  // Re-pin to the bottom before every paint. The live tool panel + activity bar
-  // (.liveregion) grow/shrink below the transcript as tools run and finish;
-  // since the transcript is a flexible sibling, that growth steals height from
-  // it and would leave the newest content (often the just-sent user prompt)
-  // scrolled under the fold. Keying this layout effect on the live-region's
-  // height inputs (tool feed, run state, done status) AND `items` re-pins
-  // synchronously after layout but before paint, so the prompt is never hidden.
-  // useLayoutEffect (not a ResizeObserver) avoids the post-paint flash and the
-  // RO's unreliable timing relative to the flex re-layout.
+  // Same as scrollToBottom, but a no-op while the user has scrolled up to read.
+  const maybeScrollToBottom = useCallback(() => {
+    if (stickToBottomRef.current) scrollToBottom();
+  }, [scrollToBottom]);
+
+  // Track the user's scroll intent. Any real scroll that lands more than a
+  // small threshold above the bottom un-pins; returning to (near) the bottom
+  // re-pins. Our own programmatic scrollToBottom lands at the bottom, so it
+  // simply keeps the pin set — no need to distinguish it from a user scroll.
+  const onTranscriptScroll = useCallback(() => {
+    const el = scrollRef.current;
+    if (!el) return;
+    const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
+    stickToBottomRef.current = distanceFromBottom <= 48;
+  }, []);
+
+  // Re-pin to the bottom before every paint — but only while pinned. The live
+  // tool panel + activity bar (.liveregion) grow/shrink below the transcript as
+  // tools run and finish; since the transcript is a flexible sibling, that
+  // growth steals height from it and would leave the newest content (often the
+  // just-sent user prompt) scrolled under the fold. Keying this layout effect on
+  // the live-region's height inputs (tool feed, run state, done status) AND
+  // `items` re-pins synchronously after layout but before paint, so the prompt
+  // is never hidden. useLayoutEffect (not a ResizeObserver) avoids the post-paint
+  // flash and the RO's unreliable timing relative to the flex re-layout. The
+  // stick-to-bottom gate keeps it from yanking the view away while the user is
+  // scrolled up reading mid-stream.
   useLayoutEffect(() => {
-    scrollToBottom();
-  }, [items, liveToolFeed, running, doneStatus, scrollToBottom]);
+    maybeScrollToBottom();
+  }, [items, liveToolFeed, running, doneStatus, maybeScrollToBottom]);
 
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
 
   // Stop the browser from navigating to / opening a file dropped anywhere
-  // outside the input (which would replace the whole UI with the raw file).
-  // The input's own onDrop handles real attachments; this just suppresses the
-  // default everywhere else.
+  // (which would replace the whole UI with the raw file). The active chat view
+  // handles those drops as attachments; entry/picker screens just suppress the
+  // default behavior.
   useEffect(() => {
     const prevent = (e: DragEvent): void => {
       // Only files — don't interfere with text selection drags.
-      if (e.dataTransfer?.types?.includes("Files")) e.preventDefault();
+      if (hasDraggedFiles(e.dataTransfer)) e.preventDefault();
     };
     window.addEventListener("dragover", prevent);
     window.addEventListener("drop", prevent);
@@ -370,20 +448,57 @@ function App(): React.ReactElement {
     const el = inputRef.current;
     if (!el) return;
     el.style.height = "auto";
-    el.style.height = `${el.scrollHeight}px`;
+    const max = parseFloat(getComputedStyle(el).maxHeight) || Infinity;
+    // Toggle scrolling only when content truly overflows the cap. Otherwise keep
+    // overflow hidden: under CSS zoom > 1, scrollHeight rounds down to an integer
+    // of unzoomed px, leaving the content a hair taller than the set height —
+    // `auto` would then flash a phantom grey scrollbar inside a single-line input.
+    el.style.overflowY = el.scrollHeight > max ? "auto" : "hidden";
+    el.style.height = `${Math.min(el.scrollHeight, max)}px`;
   }, [input]);
 
-  // Cmd+N (macOS) / Ctrl+N (Linux/Windows) opens a new project window.
+  // Keyboard shortcuts for multi-window navigation.
+  //   Cmd/Ctrl+N         → new project window
+  //   Cmd/Ctrl+`          → cycle forward through windows (reading order)
+  //   Cmd/Ctrl+Shift+`    → cycle backward
+  //   Cmd/Ctrl+Shift+A    → auto-arrange all windows into a clean grid
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => {
-      if (e.key.toLowerCase() === "n" && (e.metaKey || e.ctrlKey) && !e.altKey && !e.shiftKey) {
+      const meta = e.metaKey || e.ctrlKey;
+      if (!meta) return;
+      // New window: Cmd/Ctrl + N (no Shift/Alt).
+      if (e.key.toLowerCase() === "n" && !e.altKey && !e.shiftKey) {
         e.preventDefault();
         void newWindow();
+        return;
+      }
+      // Cycle windows: Cmd/Ctrl + Backquote (Shift = backward).
+      // Use e.code (physical key) — Shift turns ` into ~, but code stays stable.
+      if (e.code === "Backquote" && !e.altKey) {
+        e.preventDefault();
+        void focusWindowByOffset(e.shiftKey ? -1 : 1);
+        return;
+      }
+      // Auto-arrange all windows: Cmd/Ctrl + Shift + A.
+      if (e.shiftKey && (e.key === "a" || e.key === "A") && !e.altKey) {
+        e.preventDefault();
+        void arrangeAllWindows();
       }
     };
     window.addEventListener("keydown", onKey);
     return () => window.removeEventListener("keydown", onKey);
   }, []);
+
+  // Track whether THIS window holds OS focus (for the prominent input border).
+  // The webview's own focus/blur events are instant — no IPC round-trip.
+  const [windowFocused, setWindowFocused] = useState(true);
+
+  // Position in the multi-window reading order (e.g. window 2 of 4), plus
+  // whether this window is the focused one. Driven by the Rust `window-order`
+  // broadcast so the label updates automatically when windows move/close.
+  const [windowIndex, setWindowIndex] = useState<number | null>(null);
+  const [windowTotal, setWindowTotal] = useState(1);
+  const [isThisFocused, setIsThisFocused] = useState(true);
 
   // Focus the chat input whenever this window gains focus (or clicked anywhere),
   // so switching between project windows lands the cursor in the input without
@@ -403,20 +518,59 @@ function App(): React.ReactElement {
       if (
         active instanceof HTMLElement &&
         active !== inputRef.current &&
-        (active.tagName === "INPUT" ||
-          active.tagName === "TEXTAREA" ||
-          active.isContentEditable)
+        (active.tagName === "INPUT" || active.tagName === "TEXTAREA" || active.isContentEditable)
       ) {
         return;
       }
       inputRef.current?.focus();
     };
-    window.addEventListener("focus", focusInput);
+    const onFocus = (): void => {
+      setWindowFocused(true);
+      focusInput();
+    };
+    const onBlur = (): void => setWindowFocused(false);
+    window.addEventListener("focus", onFocus);
+    window.addEventListener("blur", onBlur);
     window.addEventListener("mouseup", focusInput);
     return () => {
-      window.removeEventListener("focus", focusInput);
+      window.removeEventListener("focus", onFocus);
+      window.removeEventListener("blur", onBlur);
       window.removeEventListener("mouseup", focusInput);
     };
+  }, []);
+
+  // Subscribe to the reading-order broadcast from Rust so each window knows its
+  // position (e.g. "1/4") and whether it's focused. Updates automatically when
+  // windows are arranged, moved (debounced), created, closed, or focused.
+  useEffect(() => {
+    let un: (() => void) | undefined;
+    void onWindowOrder((e) => {
+      const idx = e.order.indexOf(windowLabel);
+      setWindowIndex(idx >= 0 ? idx + 1 : null);
+      setWindowTotal(e.order.length);
+      setIsThisFocused(e.focused === windowLabel);
+    }).then((fn) => {
+      un = fn;
+    });
+    return () => un?.();
+  }, []);
+
+  // Global UI click sound — plays only when an actual interactive element is
+  // clicked (buttons, links, role=button, options, labels), never bare
+  // background/text. Capture phase so it fires even when a handler stops
+  // propagation; left button only.
+  useEffect(() => {
+    const INTERACTIVE = "button, a, [role='button'], [role='option'], label, summary, select";
+    const onClick = (e: MouseEvent): void => {
+      if (e.button !== 0) return;
+      const target = e.target as Element | null;
+      const el = target?.closest?.(INTERACTIVE);
+      if (!el) return;
+      if (el.hasAttribute("disabled") || el.getAttribute("aria-disabled") === "true") return;
+      playSound("click");
+    };
+    document.addEventListener("click", onClick, true);
+    return () => document.removeEventListener("click", onClick, true);
   }, []);
 
   // Side effects (nextId, ref mutation) happen outside the updater — updaters
@@ -467,6 +621,7 @@ function App(): React.ReactElement {
           setRunning(true);
           streamingIdRef.current = null;
           subagentGroupIdRef.current = null;
+          compactionIdRef.current = null;
           runStartRef.current = Date.now();
           toolsUsedRef.current = new Set();
           tokensRef.current = 0;
@@ -500,11 +655,14 @@ function App(): React.ReactElement {
           assistantTextRef.current += chunk;
           const done = findCompletedSteps(assistantTextRef.current);
           if (done.length > 0) {
-            setPlanDone((prev) => {
-              const next = new Set(prev);
-              for (const n of done) next.add(n);
-              return next.size === prev.size ? prev : next;
-            });
+            const next = new Set(planDoneRef.current);
+            for (const n of done) {
+              if (n >= 1 && n <= planTotalRef.current) next.add(n);
+            }
+            if (next.size !== planDoneRef.current.size) {
+              planDoneRef.current = next;
+              setPlanDone(next);
+            }
           }
           break;
         }
@@ -532,6 +690,7 @@ function App(): React.ReactElement {
               status: "running",
               activities: [],
               toolUseCount: 0,
+              tokenUsage: { input: 0, output: 0 },
             };
             const groupId = subagentGroupIdRef.current;
             if (groupId !== null) {
@@ -556,7 +715,11 @@ function App(): React.ReactElement {
           // currently running). Append distinct activities into its feed.
           const id = String(d.toolCallId ?? "");
           const update = d.update as
-            | { toolUseCount?: number; currentActivity?: string }
+            | {
+                toolUseCount?: number;
+                currentActivity?: string;
+                tokenUsage?: { input: number; output: number };
+              }
             | undefined;
           const groupId = subagentGroupIdRef.current;
           if (!update || groupId === null) break;
@@ -574,6 +737,7 @@ function App(): React.ReactElement {
                   return {
                     ...a,
                     toolUseCount: update.toolUseCount ?? a.toolUseCount,
+                    tokenUsage: update.tokenUsage ?? a.tokenUsage,
                     activities: activities.slice(-12),
                   };
                 }),
@@ -590,7 +754,11 @@ function App(): React.ReactElement {
           // Finalize a sub-agent's in-chat row: flip status + record duration.
           const groupId = subagentGroupIdRef.current;
           if (groupId !== null) {
-            const durationMs = (details as { durationMs?: number } | undefined)?.durationMs;
+            const endDetails = details as
+              | { durationMs?: number; tokenUsage?: { input: number; output: number } }
+              | undefined;
+            const durationMs = endDetails?.durationMs;
+            const finalTokens = endDetails?.tokenUsage;
             setItems((prev) =>
               prev.map((it) => {
                 // Only the active group, and only when the ended tool is actually
@@ -605,6 +773,7 @@ function App(): React.ReactElement {
                           ...a,
                           status: isError ? ("error" as const) : ("done" as const),
                           durationMs: durationMs ?? a.durationMs,
+                          tokenUsage: finalTokens ?? a.tokenUsage,
                         }
                       : a,
                   ),
@@ -674,9 +843,27 @@ function App(): React.ReactElement {
           }
           break;
         }
-        case "compaction_start":
-          pushItem({ kind: "info", id: nextId(), text: "compacting context\u2026" });
+        case "compaction_start": {
+          const id = nextId();
+          compactionIdRef.current = id;
+          streamingIdRef.current = null;
+          pushItem({ kind: "compaction", id, status: "running" });
           break;
+        }
+        case "compaction_end": {
+          const originalCount = typeof d.originalCount === "number" ? d.originalCount : undefined;
+          const newCount = typeof d.newCount === "number" ? d.newCount : undefined;
+          const id = compactionIdRef.current;
+          compactionIdRef.current = null;
+          setItems((prev) =>
+            prev.map((it) =>
+              it.kind === "compaction" && it.id === id
+                ? { ...it, status: "done" as const, originalCount, newCount }
+                : it,
+            ),
+          );
+          break;
+        }
         case "error":
           pushItem({
             kind: "error",
@@ -722,6 +909,18 @@ function App(): React.ReactElement {
             }
             setDoneStatus(parts.join(" \u2022 "));
             setStatus("ready");
+            const completedPlan =
+              planTotalRef.current > 0 &&
+              Array.from({ length: planTotalRef.current }, (_, i) => i + 1).every((step) =>
+                planDoneRef.current.has(step),
+              );
+            if (completedPlan) {
+              planTotalRef.current = 0;
+              planDoneRef.current = new Set();
+              setPlanTotal(0);
+              setPlanDone(new Set());
+            }
+            playSound("done");
             // A run may have created/removed `.gg/commands/*.md` (e.g.
             // /setup-commit writing commit.md). Refresh so the top-right
             // commit button flips /setup-commit → /commit without a restart.
@@ -751,7 +950,9 @@ function App(): React.ReactElement {
           break;
         case "plan_exit":
           setState((s) => (s ? { ...s, planMode: false } : s));
-          // Open the review modal (Accept / Feedback / Reject) with the plan.
+          // Open the review modal (Accept / Feedback / Reject) with the plan, and
+          // stash its path so accept can bake it into the system prompt.
+          planReviewPathRef.current = typeof d.planPath === "string" ? d.planPath : null;
           setPlanReview(String(d.content ?? ""));
           break;
         case "tasks":
@@ -782,6 +983,7 @@ function App(): React.ReactElement {
         }
         case "session_reset":
           // Sidecar started a fresh session — clear the transcript + counters.
+          stickToBottomRef.current = true;
           setItems([]);
           setLiveToolFeed([]);
           setTokens(0);
@@ -789,6 +991,8 @@ function App(): React.ReactElement {
           setContextTokens(0);
           setSessionTitle(null);
           setPlanReview(null);
+          planTotalRef.current = 0;
+          planDoneRef.current = new Set();
           setPlanTotal(0);
           setPlanDone(new Set());
           setAttachments([]);
@@ -843,22 +1047,31 @@ function App(): React.ReactElement {
       // only sees live SSE events, so past messages must be fetched explicitly.
       const history = await listHistory();
       if (history.length > 0) {
+        // A freshly hydrated session lands at the bottom (newest message).
+        stickToBottomRef.current = true;
         setItems(
           history.map((h): Item => {
             if (h.hook) return { kind: "hook", id: nextId(), hook: h.hook };
+            // A resumed compacted session shows the quiet compaction notice in
+            // place of the raw summary body (counts aren't persisted).
+            if (h.compacted) return { kind: "compaction", id: nextId(), status: "done" };
             if (h.role !== "user") return { kind: h.role, id: nextId(), text: h.text };
             // App-button prompts (e.g. "Initialize Git") were shown live as a
             // friendly shimmer label, not the expanded body. The label is
             // webview-only, so recover it from the restored prompt text. Slash
             // commands are already collapsed to `/name` by the sidecar (h.command).
             const label = !h.command ? recoverPromptLabel(h.text) : null;
+            // Recover @-referenced files appended to the prompt so resumed
+            // sessions show the same file chips (and clean text) as when sent.
+            const parsed = !h.command && label === null ? parseReferencedFiles(h.text) : null;
             return {
               kind: "user",
               id: nextId(),
-              text: h.text,
+              text: parsed ? parsed.text : h.text,
               command: h.command || label !== null,
               ...(label !== null ? { label } : {}),
               images: h.images && h.images.length > 0 ? h.images : undefined,
+              ...(parsed && parsed.files.length > 0 ? { files: parsed.files } : {}),
             };
           }),
         );
@@ -876,6 +1089,25 @@ function App(): React.ReactElement {
     const unsub = subscribe(handleEvent);
     return () => unsub();
   }, [handleEvent]);
+
+  // Boot-time workspace restore: if Rust reopened THIS window from the saved
+  // workspace (after a restart / update), its sidecar is already spawned at the
+  // restored project + session. Skip the picker and hydrate straight in, exactly
+  // like a completed project choice. Consume-once on the Rust side, so this runs
+  // a single time on mount. Always flips `restoreChecked` so the entry render is
+  // unblocked whether or not this was a restored window.
+  useEffect(() => {
+    // No cancelled-guard: the Rust target is consume-once, so whichever call
+    // receives it MUST act on it (a dev StrictMode double-mount would otherwise
+    // consume it on the first run and drop it, stranding the window on the
+    // picker). React 19 makes a setState after unmount a safe no-op.
+    void restoreTarget()
+      .then((target) => {
+        if (target) onProjectChosen();
+      })
+      .finally(() => setRestoreChecked(true));
+    // Mount-only: onProjectChosen reads stable setters; restoreTarget is consumed once.
+  }, []);
 
   useEffect(() => {
     // Only the main window auto-connects to its default project. Secondary
@@ -955,6 +1187,11 @@ function App(): React.ReactElement {
   const slashOpen = slashMatches.length > 0;
   // Clamp so a shrinking match list never points past the end.
   const clampedSlashIndex = slashMatches.length > 0 ? slashIndex % slashMatches.length : 0;
+
+  // `@`-mention picker: open whenever a mention token is active and the search
+  // returned at least one file. Clamp the highlighted row to the result count.
+  const mentionOpen = mention !== null && fileMatches.length > 0;
+  const clampedFileIndex = fileMatches.length > 0 ? fileIndex % fileMatches.length : 0;
   // Footer background-tasks indicator only shows while something is actually
   // running (exited tasks shouldn't keep the bar item around).
   const runningTaskCount = tasks.filter((t) => t.exitCode === null).length;
@@ -988,12 +1225,81 @@ function App(): React.ReactElement {
     setSlashIndex(0);
   }
 
+  // Detect an active `@`-mention token at the caret: a `@` that starts at a word
+  // boundary with no whitespace between it and the caret. Returns the query text
+  // after `@` and the `@`'s index, or null when not in a mention.
+  function detectMention(text: string, caret: number): { query: string; start: number } | null {
+    const before = text.slice(0, caret);
+    const at = before.lastIndexOf("@");
+    if (at < 0) return null;
+    // Must start at the line start or after whitespace.
+    const prev = at > 0 ? before[at - 1] : " ";
+    if (prev !== undefined && !/\s/.test(prev)) return null;
+    const query = before.slice(at + 1);
+    // A space ends the token — no mention once the path is followed by a space.
+    if (/\s/.test(query)) return null;
+    return { query, start: at };
+  }
+
+  // Sync the mention picker to the current input + caret on every change.
+  function updateMention(text: string, caret: number): void {
+    setMention(detectMention(text, caret));
+  }
+
+  // Debounced file search whenever the active mention query changes.
+  useEffect(() => {
+    if (mention === null) {
+      setFileMatches([]);
+      return;
+    }
+    let cancelled = false;
+    const t = setTimeout(() => {
+      void searchFiles(mention.query).then((files) => {
+        if (!cancelled) {
+          setFileMatches(files);
+          setFileIndex(0);
+        }
+      });
+    }, 80);
+    return () => {
+      cancelled = true;
+      clearTimeout(t);
+    };
+  }, [mention]);
+
+  // Pick a file: drop the typed `@query` from the input, add the file as a chip
+  // (deduped), and restore the caret where the token was. The path lives in chip
+  // state, never in the textarea text.
+  function pickMentionFile(file: FileHit): void {
+    if (mention === null) return;
+    const el = inputRef.current;
+    const caret = el?.selectionStart ?? input.length;
+    const head = input.slice(0, mention.start);
+    const tail = input.slice(caret);
+    const next = head + tail;
+    setInput(next);
+    setMentionedPaths((prev) => (prev.includes(file.path) ? prev : [...prev, file.path]));
+    setMention(null);
+    setFileMatches([]);
+    requestAnimationFrame(() => {
+      el?.focus();
+      el?.setSelectionRange(head.length, head.length);
+    });
+  }
+
+  // Drop a referenced-file chip.
+  function removeMentionChip(p: string): void {
+    setMentionedPaths((prev) => prev.filter((x) => x !== p));
+  }
+
   // Submit arbitrary text as if typed + entered. Shared by the input and the
   // top-right commit button. `label` shows a friendly shimmer phrase in the
   // transcript while the full `text` is still sent to the agent.
   function submitText(text: string, label?: string): void {
     const trimmed = text.trim();
     if (!trimmed || !readyRef.current || running) return;
+    // A user send always re-pins to the bottom — they want to see their message.
+    stickToBottomRef.current = true;
     pushItem({
       kind: "user",
       id: nextId(),
@@ -1012,15 +1318,29 @@ function App(): React.ReactElement {
   function submit(): void {
     const trimmed = input.trim();
     if (!readyRef.current) return;
-    if (!trimmed && attachments.length === 0) return;
+    if (!trimmed && attachments.length === 0 && mentionedPaths.length === 0) return;
+    // A user send always re-pins to the bottom — they want to see their message.
+    stickToBottomRef.current = true;
+    // Referenced files are appended to the prompt as a small block so the agent
+    // knows which paths to read; they aren't shown in the user's bubble text.
+    const prompt =
+      mentionedPaths.length > 0 ? appendReferencedFiles(trimmed, mentionedPaths) : trimmed;
     // While a run is in flight, a plain text message is QUEUED as steering (the
     // sidecar injects it mid-loop). Attachments can't be queued — block those.
     if (running) {
       if (attachments.length > 0) return;
-      pushItem({ kind: "user", id: nextId(), text: trimmed, command: isWorkflowCommand(trimmed) });
+      pushItem({
+        kind: "user",
+        id: nextId(),
+        text: trimmed,
+        command: isWorkflowCommand(trimmed),
+        files: mentionedPaths.length > 0 ? mentionedPaths : undefined,
+      });
       setInput("");
       setSlashIndex(0);
-      void sendPrompt(trimmed);
+      setMention(null);
+      setMentionedPaths([]);
+      void sendPrompt(prompt);
       return;
     }
     const wire = attachments.map(toWire);
@@ -1031,20 +1351,66 @@ function App(): React.ReactElement {
       text: trimmed,
       command: isWorkflowCommand(trimmed),
       images: imgPreviews.length > 0 ? imgPreviews : undefined,
+      files: mentionedPaths.length > 0 ? mentionedPaths : undefined,
     });
+    // Warn the user when a video attachment is sent to a model without native
+    // video analysis — the agent can still use ffmpeg to extract frames/audio,
+    // but can't watch the clip directly.
+    if (wire.some((a) => a.kind === "video") && !(state?.supportsVideo ?? false)) {
+      pushItem({
+        kind: "info",
+        id: nextId(),
+        text: "This model can't watch video directly. The agent can still extract frames or audio with ffmpeg if needed — switch to a video-capable model (Gemini, Kimi, MiniMax) for native video analysis.",
+      });
+    }
     setInput("");
     setAttachments([]);
     setSlashIndex(0);
+    setMention(null);
+    setMentionedPaths([]);
     streamingIdRef.current = null;
-    void sendPrompt(trimmed, wire);
+    void sendPrompt(prompt, wire);
   }
 
-  // ── Attachment intake (paste / attach button / drag-drop) ──
+  // ── Attachment intake (paste / attach button / whole-window drag-drop) ──
   async function addFiles(files: FileList | File[]): Promise<void> {
     const list = Array.from(files);
     const pendings = await Promise.all(list.map((f) => fileToPending(f).catch(() => null)));
     const ok = pendings.filter((p): p is PendingAttachment => p !== null);
     if (ok.length > 0) setAttachments((prev) => [...prev, ...ok]);
+  }
+
+  function canHandleWindowFileDrop(): boolean {
+    return !document.querySelector(".modal-backdrop");
+  }
+
+  function handleWindowDragEnter(e: React.DragEvent<HTMLDivElement>): void {
+    if (!hasDraggedFiles(e.dataTransfer) || !canHandleWindowFileDrop()) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    setIsFileDragOver(true);
+  }
+
+  function handleWindowDragOver(e: React.DragEvent<HTMLDivElement>): void {
+    if (!hasDraggedFiles(e.dataTransfer) || !canHandleWindowFileDrop()) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "copy";
+    setIsFileDragOver(true);
+  }
+
+  function handleWindowDragLeave(e: React.DragEvent<HTMLDivElement>): void {
+    if (!hasDraggedFiles(e.dataTransfer)) return;
+    const nextTarget = e.relatedTarget;
+    if (nextTarget instanceof Node && e.currentTarget.contains(nextTarget)) return;
+    setIsFileDragOver(false);
+  }
+
+  function handleWindowDrop(e: React.DragEvent<HTMLDivElement>): void {
+    if (!hasDraggedFiles(e.dataTransfer)) return;
+    e.preventDefault();
+    setIsFileDragOver(false);
+    if (!canHandleWindowFileDrop()) return;
+    if (e.dataTransfer.files.length > 0) void addFiles(e.dataTransfer.files);
   }
 
   function removeAttachment(id: number): void {
@@ -1062,10 +1428,18 @@ function App(): React.ReactElement {
     void sendPrompt(prompt);
   }
 
-  function acceptPlan(): void {
+  async function acceptPlan(): Promise<void> {
     // Start activity-bar progress tracking from the approved plan's step count.
-    setPlanTotal(planReview ? countPlanSteps(planReview) : 0);
+    const nextPlanTotal = planReview ? countPlanSteps(planReview) : 0;
+    planTotalRef.current = nextPlanTotal;
+    planDoneRef.current = new Set();
+    setPlanTotal(nextPlanTotal);
     setPlanDone(new Set());
+    // Bake the approved plan into the agent's system prompt FIRST, so it's told
+    // to emit `[DONE:n]` markers as it implements — without this the activity
+    // bar's Plan Steps widget would never advance past 0. Must complete before
+    // the implement prompt runs (the prompt picks up the rebuilt system message).
+    await acceptPlanIPC(planReviewPathRef.current);
     runPlanPrompt(
       "The plan has been approved. Implement it now, following each step in order.",
       "\u2713 Plan accepted. Implementing.",
@@ -1107,6 +1481,7 @@ function App(): React.ReactElement {
   // the hydrate effect even when needsProject is already false (switching
   // sessions from the reopened picker), which flipping the boolean alone won't.
   function onProjectChosen(): void {
+    stickToBottomRef.current = true;
     setItems([]);
     setLiveToolFeed([]);
     setState(null);
@@ -1114,6 +1489,8 @@ function App(): React.ReactElement {
     setContextTokens(0);
     setSessionTitle(null);
     setPlanReview(null);
+    planTotalRef.current = 0;
+    planDoneRef.current = new Set();
     setPlanTotal(0);
     setPlanDone(new Set());
     setAttachments([]);
@@ -1121,6 +1498,13 @@ function App(): React.ReactElement {
     setHydrated(false);
     setNeedsProject(false);
     setHydrateNonce((n) => n + 1);
+  }
+
+  // Hold the entry render until the restore check resolves, so a window reopened
+  // from the saved workspace jumps straight into its project instead of briefly
+  // flashing the home/picker screen.
+  if (needsProject && !restoreChecked) {
+    return <div className="app" style={{ background: theme.background }} />;
   }
 
   if (needsProject) {
@@ -1177,7 +1561,14 @@ function App(): React.ReactElement {
   }
 
   return (
-    <div className="app" style={{ background: theme.background }}>
+    <div
+      className={`app${isFileDragOver ? " app-file-dragover" : ""}${windowFocused ? " window-focused" : ""}`}
+      style={{ background: theme.background }}
+      onDragEnter={handleWindowDragEnter}
+      onDragOver={handleWindowDragOver}
+      onDragLeave={handleWindowDragLeave}
+      onDrop={handleWindowDrop}
+    >
       <div className="chat-head">
         {/* Top strip — the macOS traffic-light row. Holds the window title (where
             the native title used to sit) and the show/hide toggle. Always
@@ -1191,6 +1582,15 @@ function App(): React.ReactElement {
           <span className="chat-head-title" data-tauri-drag-region>
             {sessionTitle ?? "GG Coder"}
           </span>
+          {windowTotal > 1 && windowIndex !== null && (
+            <span
+              className={`window-index${isThisFocused ? "" : " dim"}`}
+              data-tauri-drag-region
+              title={`Window ${windowIndex} of ${windowTotal} · ⌘\` to cycle`}
+            >
+              {windowIndex}/{windowTotal}
+            </span>
+          )}
           <button
             className="nav-toggle"
             title={navHidden ? "Show nav buttons" : "Hide nav buttons"}
@@ -1265,13 +1665,14 @@ function App(): React.ReactElement {
                 )
               )}
               <RadioButton />
+              {/* <GazeButton /> */}
               <WindowLayoutButton onArrange={() => setNavHiddenPersisted(true)} />
             </span>
           </div>
         )}
       </div>
 
-      <div className="transcript" ref={scrollRef}>
+      <div className="transcript" ref={scrollRef} onScroll={onTranscriptScroll}>
         {!hydrated && items.length === 0 ? (
           <TranscriptSkeleton />
         ) : (
@@ -1284,7 +1685,7 @@ function App(): React.ReactElement {
               </div>
             )}
             {items.map((it) => (
-              <TranscriptRow key={it.id} item={it} onImageLoad={scrollToBottom} />
+              <TranscriptRow key={it.id} item={it} onImageLoad={maybeScrollToBottom} />
             ))}
           </>
         )}
@@ -1305,19 +1706,7 @@ function App(): React.ReactElement {
         />
       </div>
 
-      <div
-        className="inputwrap"
-        onDragOver={(e) => {
-          e.preventDefault();
-          e.currentTarget.classList.add("dragover");
-        }}
-        onDragLeave={(e) => e.currentTarget.classList.remove("dragover")}
-        onDrop={(e) => {
-          e.preventDefault();
-          e.currentTarget.classList.remove("dragover");
-          if (e.dataTransfer.files.length > 0) void addFiles(e.dataTransfer.files);
-        }}
-      >
+      <div className={`inputwrap${isFileDragOver ? " dragover" : ""}`}>
         {slashOpen && (
           <SlashMenu
             commands={slashMatches}
@@ -1326,7 +1715,17 @@ function App(): React.ReactElement {
             onHover={setSlashIndex}
           />
         )}
+        {mentionOpen && (
+          <FileMentionMenu
+            files={fileMatches}
+            activeIndex={clampedFileIndex}
+            isRecent={mention?.query === ""}
+            onSelect={pickMentionFile}
+            onHover={setFileIndex}
+          />
+        )}
         <AttachmentBar attachments={attachments} onRemove={removeAttachment} />
+        <ReferencedFiles paths={mentionedPaths} onRemove={removeMentionChip} />
         {queuedCount > 0 && (
           <div className="queued-bar">
             <span className="queued-dot" />
@@ -1363,7 +1762,7 @@ function App(): React.ReactElement {
             placeholder={
               running
                 ? "Agent is working \u2014 queue a follow-up…"
-                : "Type your message or / to run a command"
+                : "Type your message, / for commands, @ to add files"
             }
             onPaste={(e) => {
               const files = Array.from(e.clipboardData.files);
@@ -1375,9 +1774,31 @@ function App(): React.ReactElement {
             onChange={(e) => {
               setInput(e.target.value);
               setSlashIndex(0);
+              updateMention(e.target.value, e.target.selectionStart ?? e.target.value.length);
+            }}
+            onClick={(e) => {
+              const el = e.currentTarget;
+              updateMention(el.value, el.selectionStart ?? el.value.length);
+            }}
+            onKeyUp={(e) => {
+              if (e.key === "ArrowLeft" || e.key === "ArrowRight") {
+                const el = e.currentTarget;
+                updateMention(el.value, el.selectionStart ?? el.value.length);
+              }
             }}
             onKeyDown={(e) => {
-              if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+              if (mentionOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
+                e.preventDefault();
+                const delta = e.key === "ArrowDown" ? 1 : -1;
+                setFileIndex((i) => (i + delta + fileMatches.length) % fileMatches.length);
+              } else if (mentionOpen && (e.key === "Tab" || (e.key === "Enter" && !e.shiftKey))) {
+                e.preventDefault();
+                const file = fileMatches[clampedFileIndex];
+                if (file) pickMentionFile(file);
+              } else if (mentionOpen && e.key === "Escape") {
+                e.preventDefault();
+                setMention(null);
+              } else if (slashOpen && (e.key === "ArrowDown" || e.key === "ArrowUp")) {
                 e.preventDefault();
                 const delta = e.key === "ArrowDown" ? 1 : -1;
                 setSlashIndex((i) => (i + delta + slashMatches.length) % slashMatches.length);
@@ -1586,6 +2007,16 @@ function TranscriptRow({
             </div>
           )}
           {item.text}
+          {item.files && item.files.length > 0 && (
+            <div className="user-files-row">
+              {item.files.map((p) => (
+                <span key={p} className="user-file-chip" title={p}>
+                  <AtSign size={11} style={{ color: theme.accent }} />
+                  <span style={{ color: theme.code }}>{p}</span>
+                </span>
+              ))}
+            </div>
+          )}
         </div>
       );
     case "assistant": {
@@ -1602,7 +2033,7 @@ function TranscriptRow({
                 <span className="plan-step-check" aria-hidden="true">
                   {"\u2713"}
                 </span>
-                <span className="plan-step-label">{`Step ${seg.stepNum} complete`}</span>
+                <span className="plan-step-label">{`Step ${seg.stepNum} completed`}</span>
               </div>
             ) : (
               <div key={i} className="assistant-msg">
@@ -1650,21 +2081,38 @@ function TranscriptRow({
     case "images":
       return (
         <div className="img-grid">
-          {item.images.map((img, i) => (
-            <figure key={img.path ?? i} className="img-card">
-              <img
-                className="img-thumb"
-                src={img.src}
-                alt={img.path ?? "image"}
-                onLoad={onImageLoad}
-              />
-              {img.path && (
-                <figcaption className="img-cap" title={img.path}>
-                  {img.path.split("/").filter(Boolean).pop()}
-                </figcaption>
-              )}
-            </figure>
-          ))}
+          {item.images.map((img, i) => {
+            const openImage = (): void => {
+              if (img.path) void openProjectPath(img.path);
+            };
+            return (
+              <figure
+                key={img.path ?? i}
+                className={`img-card${img.path ? " img-card-clickable" : ""}`}
+                role={img.path ? "button" : undefined}
+                tabIndex={img.path ? 0 : undefined}
+                title={img.path ? `Open ${img.path}` : undefined}
+                onClick={openImage}
+                onKeyDown={(e) => {
+                  if (!img.path || (e.key !== "Enter" && e.key !== " ")) return;
+                  e.preventDefault();
+                  openImage();
+                }}
+              >
+                <img
+                  className="img-thumb"
+                  src={img.src}
+                  alt={img.path ?? "image"}
+                  onLoad={onImageLoad}
+                />
+                {img.path && (
+                  <figcaption className="img-cap" title={img.path}>
+                    {img.path.split("/").filter(Boolean).pop()}
+                  </figcaption>
+                )}
+              </figure>
+            );
+          })}
         </div>
       );
     case "plan":
@@ -1681,6 +2129,14 @@ function TranscriptRow({
       );
     case "subagent_group":
       return <SubAgentFeed agents={item.agents} aborted={item.aborted} />;
+    case "compaction":
+      return (
+        <CompactionNotice
+          status={item.status}
+          originalCount={item.originalCount}
+          newCount={item.newCount}
+        />
+      );
     default:
       return null;
   }
