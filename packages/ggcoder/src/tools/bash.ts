@@ -3,9 +3,11 @@ import type { AgentTool } from "@kenkaiiii/gg-agent";
 import type { ProcessManager } from "../core/process-manager.js";
 import { killProcessTree } from "../utils/process.js";
 import { truncateTail } from "./truncate.js";
+import { compressToolOutput } from "./compress.js";
 import { writeOverflow } from "./overflow.js";
 import { localOperations, type ToolOperations } from "./operations.js";
 import { getSafeToolEnv } from "./safe-env.js";
+import { resolveShell } from "../core/shell.js";
 import { isReadOnlyCommand } from "./read-only-bash.js";
 import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 
@@ -68,7 +70,12 @@ export function createBashTool(
       const effectiveTimeout = timeoutMs ?? DEFAULT_TIMEOUT;
 
       return new Promise<string>((resolve) => {
-        const child = ops.spawn("bash", ["-c", command], {
+        // Cross-platform shell: bash on macOS/Linux, Git Bash on Windows (or
+        // cmd.exe fallback). Hardcoding "bash" broke on Windows with `spawn
+        // bash ENOENT`, and accidentally hitting WSL's bash ran commands in a
+        // separate Linux filesystem (the "files not mounted" symptom).
+        const shell = resolveShell(command);
+        const child = ops.spawn(shell.file, shell.args, {
           cwd,
           detached: true,
           stdio: ["ignore", "pipe", "pipe"],
@@ -125,13 +132,30 @@ export function createBashTool(
           const result = truncateTail(rawOutput);
 
           let output = result.content;
+          const capNotice = outputCapped
+            ? `[Output capped at ${MAX_OUTPUT_BYTES / 1024 / 1024} MB to prevent memory exhaustion]\n`
+            : "";
           if (outputCapped) {
-            output = `[Output capped at ${MAX_OUTPUT_BYTES / 1024 / 1024} MB to prevent memory exhaustion]\n${output}`;
+            output = `${capNotice}${output}`;
           }
           if (result.truncated) {
+            // Over-limit: a blind tail slice would drop the head and any
+            // mid-stream error. Compress instead (keeps errors + head/tail,
+            // collapses repeats); the overflow file preserves the original.
             const overflowPath = await writeOverflow(rawOutput, "bash").catch(() => null);
             const overflowNotice = overflowPath ? ` Full output: ${overflowPath}` : "";
-            output = `[Truncated: showing last ${result.keptLines} of ${result.totalLines} lines.${overflowNotice}]\n${output}`;
+            const c = compressToolOutput(rawOutput);
+            output = `${capNotice}[${c.notice}${overflowNotice}]\n${c.content}`;
+          }
+          // Windows without Git Bash: commands ran under cmd.exe, NOT bash. Tell
+          // the model so it uses cmd syntax (no `ls`/`grep`/pipes/single-quotes)
+          // and doesn't misread failures as a wrong directory / environment.
+          if (shell.isCmdFallback) {
+            output =
+              "[Ran under Windows cmd.exe — bash is unavailable. Use cmd syntax " +
+              "(dir, findstr, type); POSIX commands and quoting will fail. " +
+              "Install Git for Windows to get bash.]\n" +
+              output;
           }
 
           const exitCode = timedOut

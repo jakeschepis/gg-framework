@@ -1,5 +1,70 @@
 # @kenkaiiii/gg-core
 
+## 4.13.2
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@4.13.2
+
+## 4.13.1
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@4.13.1
+
+## 4.13.0
+
+### Minor Changes
+
+- Update system prompt talk section for ADHD-readable responses
+
+  Rewrite `renderTalkSection()` so every reply leads with the outcome word
+  (Fixed/Done/Broken/Failed), enforces bottom-line-first scanning, one idea
+  per line, pick-don't-menu, concrete metrics, no unresolved it-depends, and
+  affirmative phrasing. Designed for fast scanning and low working memory.
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/gg-ai@4.13.0
+
+## 4.12.2
+
+### Patch Changes
+
+- Fix Windows sidecar crash: the session-folder name encoder (`encodeCwd`) now strips Windows extended-length path prefixes (`\\?\` and `\\?\UNC\`) and all reserved filename characters (`<>:"|?*`). Previously, Windows canonicalized cwds (`\\?\C:\Users\brams`) produced illegal folder names containing `?`, causing `mkdir` ENOENT and a fatal sidecar crash on startup — blocking OAuth/login for all Windows users.
+- Updated dependencies
+  - @kenkaiiii/gg-ai@4.12.2
+
+## 4.12.1
+
+### Patch Changes
+
+- Add performance benchmarks and optimize streaming, tool execution, and rendering pipeline
+  - edit-diff: lazy normalization cache for fuzzy matching (5-7× faster on large files)
+  - ls: parallel stat() via Promise.all (3.7-5.5× faster on large dirs)
+  - StreamResult: backpressure with high/low-water marks to bound memory (10× reduction)
+  - agent-loop: mixed-mode tool execution batches consecutive parallel-safe tools (2-10× faster)
+  - agent-loop: per-tool timeout isolation via AbortSignal.any (prevents indefinite hangs)
+  - agent-loop: gate diagnostic char-counting behind \_diagFn (eliminates per-turn overhead)
+  - Markdown.tsx: block-level memoization via marked.lexer (only active block re-parses)
+  - App.tsx: requestAnimationFrame-throttled appendAssistant (5-10× fewer re-renders)
+  - benchmarks: full harness with before/after comparison tables (pnpm bench)
+
+- Updated dependencies
+  - @kenkaiiii/gg-ai@4.12.1
+
+## 4.12.0
+
+### Minor Changes
+
+- Add generate_image tool: generate and edit images via OpenAI gpt-image-2 through the Codex backend. Conditionally registered when OpenAI is connected. Includes inline image preview in transcript, shimmering skeleton placeholder during generation, 1:1 history reconstruction for tool-produced images and sub-agent groups on session resume, and image path exposure for multi-turn editing.
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/gg-ai@4.12.0
+
 ## 4.11.3
 
 ### Patch Changes

@@ -1,4 +1,4 @@
-import { useState, useRef, useEffect, useLayoutEffect, useCallback } from "react";
+import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from "react";
 import { theme } from "./theme";
 import {
   waitForReady,
@@ -61,7 +61,7 @@ import { HomeScreen } from "./HomeScreen";
 import { Toaster } from "./Toaster";
 import { LoginScreen } from "./LoginScreen";
 import { Markdown } from "./Markdown";
-import { FooterSkeleton, TranscriptSkeleton } from "./Skeleton";
+import { FooterSkeleton, TranscriptSkeleton, Skeleton } from "./Skeleton";
 import { useAppUpdate } from "./update";
 import { recoverPromptLabel } from "./prompt-labels";
 import { playSound } from "./sounds";
@@ -91,6 +91,9 @@ type Item =
       label?: string;
       images?: string[];
       files?: string[];
+      // True while this message is still waiting in the mid-run steering queue.
+      // Rendered dimmed; cleared at run_end once the agent has consumed it.
+      queued?: boolean;
     }
   | { kind: "assistant"; id: number; text: string }
   | { kind: "info"; id: number; text: string }
@@ -100,6 +103,9 @@ type Item =
   | { kind: "hook"; id: number; hook: HookKind }
   // Images produced by a tool (screenshot / read of an image file).
   | { kind: "images"; id: number; images: TranscriptImage[]; caption?: string }
+  // Image generation in progress — a shimmering square placeholder that gets
+  // replaced by the final image when the tool result arrives.
+  | { kind: "generating_image"; id: number; prompt: string }
   // Plan-mode entry banner (ASCII logo + optional reason).
   | { kind: "plan"; id: number; reason: string }
   // A task kicked off from the Tasks modal (shown at the top of its session).
@@ -236,6 +242,13 @@ function hasDraggedFiles(dataTransfer: DataTransfer | null): boolean {
 function App(): React.ReactElement {
   const [items, setItems] = useState<Item[]>([]);
   const [input, setInput] = useState("");
+  // Shell-style prompt history for ↑/↓ recall in the chat input. Newest entries
+  // last. `historyIndex` is null while editing a fresh draft; stepping ↑ walks
+  // backwards into history, ↓ forwards. `historyDraftRef` stashes the in-progress
+  // text so stepping ↓ past the newest entry restores what was being typed.
+  const promptHistoryRef = useRef<string[]>([]);
+  const [historyIndex, setHistoryIndex] = useState<number | null>(null);
+  const historyDraftRef = useRef("");
   // Staged attachments (paste / attach button / whole-window drag-drop) shown above the input.
   const [attachments, setAttachments] = useState<PendingAttachment[]>([]);
   const [isFileDragOver, setIsFileDragOver] = useState(false);
@@ -411,7 +424,7 @@ function App(): React.ReactElement {
   // scrolled up reading mid-stream.
   useLayoutEffect(() => {
     maybeScrollToBottom();
-  }, [items, liveToolFeed, running, doneStatus, maybeScrollToBottom]);
+  }, [items, liveToolFeed, running, doneStatus, queuedCount, maybeScrollToBottom]);
 
   useEffect(() => {
     stateRef.current = state;
@@ -575,19 +588,69 @@ function App(): React.ReactElement {
 
   // Side effects (nextId, ref mutation) happen outside the updater — updaters
   // must stay pure since React may invoke them more than once.
-  const appendAssistant = useCallback((text: string) => {
+  //
+  // Throttled via requestAnimationFrame: text_delta events arrive at 50-100/sec.
+  // Without throttling, each triggers a full React re-render + markdown re-parse.
+  // We buffer chunks in a ref and flush once per animation frame (~16ms),
+  // reducing re-renders by 5-10× with no visible difference.
+  const pendingChunksRef = useRef<string>("");
+  const rafIdRef = useRef<number | null>(null);
+
+  const flushChunks = useCallback(() => {
+    rafIdRef.current = null;
+    const chunk = pendingChunksRef.current;
+    if (!chunk) return;
+    pendingChunksRef.current = "";
     const current = streamingIdRef.current;
-    if (current === null) {
-      const id = nextId();
-      streamingIdRef.current = id;
-      setItems((prev) => [...prev, { kind: "assistant", id, text }]);
-    } else {
-      setItems((prev) =>
-        prev.map((it) =>
-          it.kind === "assistant" && it.id === current ? { ...it, text: it.text + text } : it,
-        ),
-      );
+    if (current === null) return; // streaming ended while waiting
+    setItems((prev) =>
+      prev.map((it) =>
+        it.kind === "assistant" && it.id === current ? { ...it, text: it.text + chunk } : it,
+      ),
+    );
+  }, []);
+
+  const appendAssistant = useCallback(
+    (text: string) => {
+      const current = streamingIdRef.current;
+      if (current === null) {
+        // First token of a new assistant turn: create immediately (no delay
+        // on first paint — the user should see the bubble appear right away).
+        const id = nextId();
+        streamingIdRef.current = id;
+        setItems((prev) => [...prev, { kind: "assistant", id, text }]);
+      } else {
+        // Subsequent tokens: buffer and flush via rAF
+        pendingChunksRef.current += text;
+        if (rafIdRef.current === null) {
+          rafIdRef.current = requestAnimationFrame(flushChunks);
+        }
+      }
+    },
+    [flushChunks],
+  );
+
+  // Flush any pending buffered text and end the current streaming section.
+  // Called whenever streaming transitions to tool calls, a new prompt, etc.
+  // Without this, the last few buffered tokens (waiting for rAF) would be lost.
+  const endStreamingText = useCallback(() => {
+    if (rafIdRef.current !== null) {
+      cancelAnimationFrame(rafIdRef.current);
+      rafIdRef.current = null;
     }
+    if (pendingChunksRef.current) {
+      const chunk = pendingChunksRef.current;
+      pendingChunksRef.current = "";
+      const current = streamingIdRef.current;
+      if (current !== null) {
+        setItems((prev) =>
+          prev.map((it) =>
+            it.kind === "assistant" && it.id === current ? { ...it, text: it.text + chunk } : it,
+          ),
+        );
+      }
+    }
+    streamingIdRef.current = null;
   }, []);
 
   const pushItem = useCallback((item: Item) => {
@@ -619,7 +682,7 @@ function App(): React.ReactElement {
           break;
         case "run_start":
           setRunning(true);
-          streamingIdRef.current = null;
+          endStreamingText();
           subagentGroupIdRef.current = null;
           compactionIdRef.current = null;
           runStartRef.current = Date.now();
@@ -666,9 +729,19 @@ function App(): React.ReactElement {
           }
           break;
         }
+        case "server_tool_call": {
+          // Native server tools (e.g. Anthropic web_search) stream text both
+          // before and after them within the SAME turn. End the current
+          // assistant bubble so the post-tool text starts a fresh paragraph
+          // instead of gluing onto the pre-tool text ("…command.Let me pull…").
+          finalizeThinking();
+          endStreamingText();
+          assistantTextRef.current = "";
+          break;
+        }
         case "tool_call_start": {
           finalizeThinking();
-          streamingIdRef.current = null;
+          endStreamingText();
           const toolCallId = String(d.toolCallId ?? "");
           const name = String(d.name ?? "tool");
           const args = (d.args as Record<string, unknown>) ?? {};
@@ -704,9 +777,16 @@ function App(): React.ReactElement {
             } else {
               const id = nextId();
               subagentGroupIdRef.current = id;
-              streamingIdRef.current = null;
+              endStreamingText();
               pushItem({ kind: "subagent_group", id, agents: [newAgent] });
             }
+          }
+          // Image generation: show a shimmering square placeholder while the
+          // tool runs. It gets replaced by the real image on tool_call_end.
+          if (name === "generate_image") {
+            const prompt = typeof args.prompt === "string" ? args.prompt : "generating image…";
+            endStreamingText();
+            pushItem({ kind: "generating_image", id: nextId(), prompt });
           }
           break;
         }
@@ -790,12 +870,15 @@ function App(): React.ReactElement {
                 : entry,
             ),
           );
+          // Remove any generating_image placeholders — the tool has finished
+          // (success or failure). If it produced images, they're pushed below.
+          setItems((prev) => prev.filter((it) => it.kind !== "generating_image"));
           // Surface any image previews (screenshot / read of an image) inline in
           // the transcript — the tool panel is text-only.
           const previews = (details as { imagePreviews?: ImagePreview[] } | undefined)
             ?.imagePreviews;
           if (Array.isArray(previews) && previews.length > 0) {
-            streamingIdRef.current = null;
+            endStreamingText();
             pushItem({
               kind: "images",
               id: nextId(),
@@ -846,7 +929,7 @@ function App(): React.ReactElement {
         case "compaction_start": {
           const id = nextId();
           compactionIdRef.current = id;
-          streamingIdRef.current = null;
+          endStreamingText();
           pushItem({ kind: "compaction", id, status: "running" });
           break;
         }
@@ -873,10 +956,18 @@ function App(): React.ReactElement {
           break;
         case "run_end": {
           setRunning(false);
-          streamingIdRef.current = null;
+          endStreamingText();
           finalizeThinking();
-          // Final response is in; exit the tool panel (mirrors ggcoder).
+          // The queue drained into this run — un-dim any messages that were
+          // waiting, since the agent has now consumed them.
+          setItems((prev) =>
+            prev.map((it) => (it.kind === "user" && it.queued ? { ...it, queued: false } : it)),
+          );
+          // Exit the tool panel (mirrors ggcoder).
           setLiveToolFeed([]);
+          // Safety: clear any lingering image-generation placeholders in case
+          // tool_call_end didn't fire (e.g. hard cancel mid-fetch).
+          setItems((prev) => prev.filter((it) => it.kind !== "generating_image"));
           // Mark any still-running sub-agents in this run's group as aborted.
           const saGroupId = subagentGroupIdRef.current;
           if (saGroupId !== null) {
@@ -976,7 +1067,7 @@ function App(): React.ReactElement {
         case "hook": {
           const kind = String(d.kind ?? "ideal") as HookKind;
           if (kind in HOOK_PRESENTATION) {
-            streamingIdRef.current = null;
+            endStreamingText();
             pushItem({ kind: "hook", id: nextId(), hook: kind });
           }
           break;
@@ -997,7 +1088,7 @@ function App(): React.ReactElement {
           setPlanDone(new Set());
           setAttachments([]);
           setQueuedCount(0);
-          streamingIdRef.current = null;
+          endStreamingText();
           subagentGroupIdRef.current = null;
           break;
         case "session_title":
@@ -1019,7 +1110,7 @@ function App(): React.ReactElement {
           break;
       }
     },
-    [appendAssistant, pushItem, finalizeThinking],
+    [appendAssistant, pushItem, finalizeThinking, endStreamingText],
   );
 
   // Run the connect/ready flow against the current sidecar and hydrate state,
@@ -1049,8 +1140,43 @@ function App(): React.ReactElement {
       if (history.length > 0) {
         // A freshly hydrated session lands at the bottom (newest message).
         stickToBottomRef.current = true;
+        // Seed ↑/↓ recall from the resumed prompts (chronological), so history
+        // works after reopening a session — not just within the live one. App-
+        // button prompts (shimmer labels) weren't typed by the user, so skip
+        // them; everything else the user actually entered is included.
+        promptHistoryRef.current = history
+          .filter((h) => h.role === "user" && !(!h.command && recoverPromptLabel(h.text)))
+          .map((h) => {
+            const parsed = !h.command ? parseReferencedFiles(h.text) : null;
+            return (parsed ? parsed.text : h.text).trim();
+          })
+          .filter((t, i, a) => t.length > 0 && a[i - 1] !== t);
         setItems(
           history.map((h): Item => {
+            // Tool-produced images (screenshots, generate_image) — reconstructed
+            // from persisted ImageContent blocks, downsampled by the sidecar.
+            if (h.toolImages && h.toolImages.length > 0)
+              return {
+                kind: "images",
+                id: nextId(),
+                images: h.toolImages.map((img) => ({ src: img.src, path: img.path })),
+              };
+            // Sub-agent delegation group — reconstructed from persisted tool_call
+            // + tool_result pairing. toolUseCount/activities aren't persisted, so
+            // the resumed feed shows agent name + status only.
+            if (h.subagentGroup && h.subagentGroup.length > 0)
+              return {
+                kind: "subagent_group",
+                id: nextId(),
+                agents: h.subagentGroup.map((a, i) => ({
+                  toolCallId: `history-${i}`,
+                  agentName: a.agentName,
+                  status: a.status,
+                  activities: [],
+                  toolUseCount: a.toolUseCount,
+                  tokenUsage: { input: 0, output: 0 },
+                })),
+              };
             if (h.hook) return { kind: "hook", id: nextId(), hook: h.hook };
             // A resumed compacted session shows the quiet compaction notice in
             // place of the raw summary body (counts aren't persisted).
@@ -1309,8 +1435,63 @@ function App(): React.ReactElement {
     });
     setInput("");
     setSlashIndex(0);
-    streamingIdRef.current = null;
+    endStreamingText();
     void sendPrompt(trimmed);
+  }
+
+  // Record a sent prompt for ↑/↓ recall (skips consecutive duplicates, capped).
+  function recordHistory(text: string): void {
+    const h = promptHistoryRef.current;
+    if (text && h[h.length - 1] !== text) h.push(text);
+    if (h.length > 200) h.shift();
+    setHistoryIndex(null);
+    historyDraftRef.current = "";
+  }
+
+  // Replace the input with a recalled history entry and park the caret at the end.
+  function applyHistory(text: string): void {
+    setInput(text);
+    requestAnimationFrame(() => {
+      const el = inputRef.current;
+      if (el) el.selectionStart = el.selectionEnd = el.value.length;
+    });
+  }
+
+  // Walk prompt history with ↑ (dir -1, older) / ↓ (dir +1, newer). Returns true
+  // when it consumed the key. Only triggers when the caret is on the first line
+  // (↑) or last line (↓) so multi-line editing still moves the cursor normally.
+  function navigateHistory(dir: -1 | 1, el: HTMLTextAreaElement): boolean {
+    const hist = promptHistoryRef.current;
+    if (hist.length === 0) return false;
+    const collapsed = el.selectionStart === el.selectionEnd;
+    const caret = el.selectionStart ?? 0;
+    if (dir === -1) {
+      const onFirstLine = collapsed && !el.value.slice(0, caret).includes("\n");
+      if (!onFirstLine) return false;
+      if (historyIndex === null) {
+        historyDraftRef.current = el.value;
+        const idx = hist.length - 1;
+        setHistoryIndex(idx);
+        applyHistory(hist[idx]);
+      } else if (historyIndex > 0) {
+        const idx = historyIndex - 1;
+        setHistoryIndex(idx);
+        applyHistory(hist[idx]);
+      }
+      return true; // consume even at the oldest entry
+    }
+    if (historyIndex === null) return false; // not navigating — let ↓ move the caret
+    const onLastLine = collapsed && !el.value.slice(caret).includes("\n");
+    if (!onLastLine) return false;
+    if (historyIndex < hist.length - 1) {
+      const idx = historyIndex + 1;
+      setHistoryIndex(idx);
+      applyHistory(hist[idx]);
+    } else {
+      setHistoryIndex(null);
+      applyHistory(historyDraftRef.current);
+    }
+    return true;
   }
 
   // Submit the current input together with any staged attachments. Images are
@@ -1319,28 +1500,35 @@ function App(): React.ReactElement {
     const trimmed = input.trim();
     if (!readyRef.current) return;
     if (!trimmed && attachments.length === 0 && mentionedPaths.length === 0) return;
+    recordHistory(trimmed);
     // A user send always re-pins to the bottom — they want to see their message.
     stickToBottomRef.current = true;
     // Referenced files are appended to the prompt as a small block so the agent
     // knows which paths to read; they aren't shown in the user's bubble text.
     const prompt =
       mentionedPaths.length > 0 ? appendReferencedFiles(trimmed, mentionedPaths) : trimmed;
-    // While a run is in flight, a plain text message is QUEUED as steering (the
-    // sidecar injects it mid-loop). Attachments can't be queued — block those.
+    // While a run is in flight, the message is QUEUED as steering (the sidecar
+    // injects it mid-loop). Attachments queue too — they're persisted and ride
+    // the same native-block path when the queue drains. Queued rows render
+    // dimmed until run_end clears the flag.
     if (running) {
-      if (attachments.length > 0) return;
+      const queuedWire = attachments.map(toWire);
+      const queuedImgs = attachments.filter((a) => a.previewUrl).map((a) => a.previewUrl!);
       pushItem({
         kind: "user",
         id: nextId(),
         text: trimmed,
         command: isWorkflowCommand(trimmed),
+        images: queuedImgs.length > 0 ? queuedImgs : undefined,
         files: mentionedPaths.length > 0 ? mentionedPaths : undefined,
+        queued: true,
       });
       setInput("");
+      setAttachments([]);
       setSlashIndex(0);
       setMention(null);
       setMentionedPaths([]);
-      void sendPrompt(prompt);
+      void sendPrompt(prompt, queuedWire);
       return;
     }
     const wire = attachments.map(toWire);
@@ -1368,7 +1556,7 @@ function App(): React.ReactElement {
     setSlashIndex(0);
     setMention(null);
     setMentionedPaths([]);
-    streamingIdRef.current = null;
+    endStreamingText();
     void sendPrompt(prompt, wire);
   }
 
@@ -1424,7 +1612,7 @@ function App(): React.ReactElement {
     setPlanReview(null);
     if (!readyRef.current || running) return;
     pushItem({ kind: "info", id: nextId(), text: info });
-    streamingIdRef.current = null;
+    endStreamingText();
     void sendPrompt(prompt);
   }
 
@@ -1520,9 +1708,10 @@ function App(): React.ReactElement {
         ) : (
           <ProjectPicker
             onChosen={onProjectChosen}
-            // Secondary windows start on the picker and have no home screen, so
-            // they get no "back" affordance; the main window returns home.
-            onClose={isSecondaryWindow ? undefined : () => setEntryView("home")}
+            // Every window can return to the home screen (it shows global
+            // settings/auth, nothing window-specific) — secondary windows just
+            // default to opening on the picker.
+            onClose={() => setEntryView("home")}
           />
         )}
         <Toaster />
@@ -1545,15 +1734,11 @@ function App(): React.ReactElement {
           }}
           onClose={() => {
             setShowPicker(false);
-            // Secondary windows have no home screen — bouncing them "home" lands
-            // on a Projects picker whose back button is suppressed (the
-            // isSecondaryWindow guard below), stranding the user. The picker is
-            // only reachable here from an already-open project, so just close it
-            // to return to that project. The main window keeps going home.
-            if (!isSecondaryWindow) {
-              setNeedsProject(true);
-              setEntryView("home");
-            }
+            // Back from the over-a-project picker returns to the home screen for
+            // every window (the entry picker now offers a back-to-home button,
+            // so secondary windows are no longer stranded there).
+            setNeedsProject(true);
+            setEntryView("home");
           }}
         />
       </div>
@@ -1774,6 +1959,8 @@ function App(): React.ReactElement {
             onChange={(e) => {
               setInput(e.target.value);
               setSlashIndex(0);
+              // Typing exits history-recall mode so ↑/↓ start fresh next time.
+              if (historyIndex !== null) setHistoryIndex(null);
               updateMention(e.target.value, e.target.selectionStart ?? e.target.value.length);
             }}
             onClick={(e) => {
@@ -1806,6 +1993,14 @@ function App(): React.ReactElement {
                 e.preventDefault();
                 const cmd = slashMatches[clampedSlashIndex];
                 if (cmd) pickSlashCommand(cmd);
+              } else if (e.key === "ArrowUp" || e.key === "ArrowDown") {
+                // Menus are closed here (handled above), so arrows recall sent
+                // prompts shell-style — unless the caret is mid-text in a
+                // multi-line draft, where navigateHistory declines and the
+                // cursor moves normally.
+                if (navigateHistory(e.key === "ArrowUp" ? -1 : 1, e.currentTarget)) {
+                  e.preventDefault();
+                }
               } else if (e.key === "Enter" && !e.shiftKey) {
                 // Enter sends; Shift+Enter inserts a newline (textarea default).
                 e.preventDefault();
@@ -1976,7 +2171,13 @@ function App(): React.ReactElement {
 }
 
 // ── Row renderers ──────────────────────────────────────────
-function TranscriptRow({
+// Memoized per row: the streaming run rebuilds the `items` array on every
+// `text_delta`, but `appendAssistant` returns the SAME object reference for
+// every non-streaming row, and `onImageLoad` is a stable useCallback. So a
+// default shallow `memo` re-renders ONLY the row whose `item` reference changed
+// (the one actively streaming) — the rest bail out, keeping per-token cost O(1)
+// instead of O(transcript length).
+const TranscriptRow = memo(function TranscriptRow({
   item,
   onImageLoad,
 }: {
@@ -1998,7 +2199,8 @@ function TranscriptRow({
         );
       }
       return (
-        <div className="user-msg">
+        <div className={`user-msg${item.queued ? " queued" : ""}`}>
+          {item.queued && <span className="queued-pill">queued</span>}
           {item.images && item.images.length > 0 && (
             <div className="user-img-row">
               {item.images.map((src, i) => (
@@ -2115,6 +2317,17 @@ function TranscriptRow({
           })}
         </div>
       );
+    case "generating_image":
+      return (
+        <div className="img-grid">
+          <div className="img-gen-placeholder">
+            <Skeleton width={200} height={200} radius={12} />
+            <span className="img-gen-label">
+              {item.prompt.length > 60 ? item.prompt.slice(0, 57) + "\u2026" : item.prompt}
+            </span>
+          </div>
+        </div>
+      );
     case "plan":
       return <PlanModeLogo reason={item.reason} />;
     case "task":
@@ -2140,6 +2353,6 @@ function TranscriptRow({
     default:
       return null;
   }
-}
+});
 
 export default App;

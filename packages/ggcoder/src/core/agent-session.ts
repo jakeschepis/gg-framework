@@ -1,6 +1,7 @@
 import { agentLoop, isAbortError, type AgentEvent, type AgentTool } from "@kenkaiiii/gg-agent";
 import {
   ProviderError,
+  prewarmAnthropicCache,
   type Message,
   type Provider,
   type ThinkingLevel,
@@ -35,7 +36,7 @@ import {
   type ProcessManager,
 } from "../tools/index.js";
 import type { BackgroundProcess } from "./process-manager.js";
-import { MCPClientManager, getMCPServers, getAllMcpServers } from "./mcp/index.js";
+import { MCPClientManager, getAllMcpServers } from "./mcp/index.js";
 import { log } from "./logger.js";
 import { setEstimatorModel } from "./compaction/token-estimator.js";
 import { discoverAgents } from "./agents.js";
@@ -57,6 +58,17 @@ import fs from "node:fs/promises";
 import path from "node:path";
 
 // ── Options ────────────────────────────────────────────────
+
+/** A chat attachment (image / video / other file) prepared for the model. The
+ *  raw base64 `data` rides native blocks; `path` (when persisted to disk) lets
+ *  the agent's tools open the file directly. */
+export interface SessionAttachment {
+  kind: "image" | "video" | "file";
+  mediaType: string;
+  data: string;
+  name: string;
+  path?: string;
+}
 
 export interface AgentSessionOptions {
   provider: Provider;
@@ -86,6 +98,16 @@ export interface AgentSessionOptions {
    * resumable identity.
    */
   transient?: boolean;
+  /**
+   * If true, `initialize()` returns WITHOUT waiting for MCP servers to connect —
+   * the connection runs in the background and tools are appended when ready.
+   * Hosts whose readiness is gated on `initialize()` (the gg-app sidecar, which
+   * can't emit its listening handshake until init resolves) set this so a slow
+   * or hanging stdio MCP server (e.g. a first-run `npx -y …` download) can't
+   * delay the session from becoming usable. Default (false) keeps the CLI's
+   * connect-before-ready behavior so MCP tools are present on the first turn.
+   */
+  backgroundMcpConnect?: boolean;
   /**
    * Plan-mode callbacks. When provided, the `enter_plan`/`exit_plan` tools are
    * registered and the session manages plan-mode restrictions + system-prompt
@@ -151,10 +173,14 @@ export class AgentSession {
   private regroundingInjected = false;
   private compactionOccurred = false;
   private originalRequest = "";
+  /** True after the cache has been pre-warmed for this session. Ensures we only
+   *  fire the warm-up call once (before the first real turn). */
+  private cachePrewarmed = false;
   // Messages queued by the user while a run is in flight. Drained at the
   // mid-loop steering boundary (user steering wins over the hooks), mirroring
-  // the TUI's getSteeringMessages.
-  private userQueue: string[] = [];
+  // the TUI's getSteeringMessages. Each entry carries its own attachments so a
+  // user can queue media (images/video/files) mid-run, not just plain text.
+  private userQueue: Array<{ text: string; attachments: SessionAttachment[] }> = [];
   private processManager?: ProcessManager;
   private lspManager?: LspManager;
   private mcpManager?: MCPClientManager;
@@ -242,12 +268,13 @@ export class AgentSession {
       globalAgentsDir: paths.agentsDir,
       projectDir: this.cwd,
     });
-    const { tools, processManager, rebuildReadTool, lspManager } = createTools(this.cwd, {
+    const { tools, processManager, rebuildReadTool, lspManager } = await createTools(this.cwd, {
       agents,
       skills: this.skills,
       provider: this.provider,
       model: this.model,
       lspDiagnostics: this.settingsManager.get("lspDiagnostics"),
+      authStorage: this.authStorage,
       // Lazy — sessionId/model/provider can change after createTools() runs, so
       // sub-agent spawns read the current parent state at execution time.
       getProvider: () => this.provider,
@@ -268,26 +295,18 @@ export class AgentSession {
     this.processManager = processManager;
     this.lspManager = lspManager;
 
-    // Connect MCP servers (non-blocking — failures are logged and skipped)
+    // Connect MCP servers. The connect attempt itself can block for up to the
+    // per-server connect timeout (~30s) — a slow stdio server such as a
+    // first-run `npx -y @playwright/mcp` download stalls here. When the host
+    // gates its own readiness on initialize() (the gg-app sidecar can't emit
+    // its listening handshake until this resolves), `backgroundMcpConnect`
+    // moves the connect off the critical path so the session becomes usable
+    // immediately and tools are appended whenever the servers come up.
     this.mcpManager = new MCPClientManager();
-    try {
-      let apiKey: string | undefined;
-      if (this.provider === "glm") {
-        try {
-          const glmCreds = await this.authStorage.resolveCredentials("glm");
-          apiKey = glmCreds.accessToken;
-        } catch {
-          // GLM not configured — skip Z.AI MCP servers
-        }
-      }
-      const mcpTools = await this.mcpManager.connectAll(getMCPServers(this.provider, apiKey));
-      this.tools.push(...mcpTools);
-    } catch (err) {
-      log(
-        "WARN",
-        "mcp",
-        `MCP initialization failed: ${err instanceof Error ? err.message : String(err)}`,
-      );
+    if (this.opts.backgroundMcpConnect) {
+      void this.connectMcpServers();
+    } else {
+      await this.connectMcpServers();
     }
 
     const basePrompt =
@@ -378,6 +397,51 @@ export class AgentSession {
   }
 
   /**
+   * Connect all configured MCP servers and append their tools to `this.tools`.
+   * Resolves the GLM api key first (Z.AI's bundled servers need it). Never
+   * throws — a failed connect is logged and skipped — so it is safe to either
+   * `await` (CLI: tools ready before the first turn) or fire-and-forget
+   * (sidecar: `backgroundMcpConnect`, so a slow stdio server can't stall
+   * startup). Tools are pushed onto the live array the agent loop reads each
+   * turn, so background-connected servers become available on the next prompt.
+   */
+  private async connectMcpServers(): Promise<void> {
+    if (!this.mcpManager) return;
+    try {
+      let apiKey: string | undefined;
+      if (this.provider === "glm") {
+        try {
+          const glmCreds = await this.authStorage.resolveCredentials("glm");
+          apiKey = glmCreds.accessToken;
+        } catch {
+          // GLM not configured — skip Z.AI MCP servers
+        }
+      }
+      const mcpTools = await this.mcpManager.connectAll(
+        await getAllMcpServers(this.provider, apiKey, this.cwd),
+      );
+      this.tools.push(...mcpTools);
+      // Background connect resolves AFTER initialize() has already built the
+      // system prompt (the default path awaits this before buildSystemPrompt,
+      // so its prompt already lists the tools). Refresh messages[0] so the
+      // model is also told about the MCP tools by name on its next turn —
+      // mirrors the TUI's replaceSystemPrompt after connectInitialMcpTools.
+      // Safe ordering: this method's first await yields before initialize()
+      // sets `messages`, and connectAll (process spawn / network) always
+      // resolves long after the local-only remainder of init has finished.
+      if (this.opts.backgroundMcpConnect && mcpTools.length > 0) {
+        await this.rebuildSystemPromptInPlace();
+      }
+    } catch (err) {
+      log(
+        "WARN",
+        "mcp",
+        `MCP initialization failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
    * Process user input. Handles slash commands or runs agent loop.
    */
   async prompt(content: string): Promise<void> {
@@ -430,22 +494,34 @@ export class AgentSession {
    * agent can open them with its tools. Slash-command parsing is skipped —
    * attachments are always a direct conversational turn.
    */
-  async promptWithAttachments(
+  async promptWithAttachments(text: string, attachments: SessionAttachment[]): Promise<void> {
+    const parts = this.buildAttachmentParts(text, attachments);
+    if (parts.length === 0) return;
+    const userMessage: Message = { role: "user", content: parts };
+    this.messages.push(userMessage);
+    await this.persistMessage(userMessage);
+    this.lastPersistedIndex = this.messages.length;
+    await this.runLoop();
+  }
+
+  /**
+   * Build the native content blocks (text + image/video notes + file notes) for
+   * a user message with attachments. Shared by {@link promptWithAttachments} and
+   * the mid-run steering drain so queued media is delivered identically.
+   */
+  private buildAttachmentParts(
     text: string,
-    attachments: Array<{
-      kind: "image" | "video" | "file";
-      mediaType: string;
-      data: string;
-      name: string;
-      path?: string;
-    }>,
-  ): Promise<void> {
+    attachments: SessionAttachment[],
+  ): Array<TextContent | ImageContent | VideoContent> {
     const parts: Array<TextContent | ImageContent | VideoContent> = [];
     const fileNotes: string[] = [];
     const modelSupportsVideo = getModel(this.model)?.supportsVideo ?? false;
     for (const a of attachments) {
       if (a.kind === "image") {
         parts.push({ type: "image", mediaType: a.mediaType, data: a.data });
+        if (a.path) {
+          parts.push({ type: "text", text: `[Image saved at ${a.path}]` });
+        }
       } else if (a.kind === "video") {
         // Mirror the CLI's buildUserContentWithAttachments: never send inline
         // VideoContent in the user message. Video-capable models (Kimi/Gemini/
@@ -484,13 +560,7 @@ export class AgentSession {
       textParts.push(`Attached files (inspect with your tools):\n${fileNotes.join("\n")}`);
     }
     if (textParts.length > 0) parts.unshift({ type: "text", text: textParts.join("\n\n") });
-    if (parts.length === 0) return;
-
-    const userMessage: Message = { role: "user", content: parts };
-    this.messages.push(userMessage);
-    await this.persistMessage(userMessage);
-    this.lastPersistedIndex = this.messages.length;
-    await this.runLoop();
+    return parts;
   }
 
   /**
@@ -581,8 +651,17 @@ export class AgentSession {
     // User steering wins: drain any messages queued during this run first so the
     // agent sees them mid-loop instead of after it stops.
     if (this.userQueue.length > 0) {
-      const merged = this.userQueue.splice(0).join("\n\n");
-      return [{ role: "user", content: merged }];
+      const queued = this.userQueue.splice(0);
+      // Plain-text-only queue: keep the simple merged-string message.
+      if (queued.every((m) => m.attachments.length === 0)) {
+        const merged = queued.map((m) => m.text).join("\n\n");
+        return [{ role: "user", content: merged }];
+      }
+      // Any queued attachments → deliver one user message with text + media
+      // blocks built the same way as a non-queued attachment prompt.
+      const parts: Array<TextContent | ImageContent | VideoContent> = [];
+      for (const m of queued) parts.push(...this.buildAttachmentParts(m.text, m.attachments));
+      return [{ role: "user", content: parts }];
     }
     if (!this.settingsManager.get("idealReviewEnabled")) return null;
     if (!this.loopBreakInjected) {
@@ -687,7 +766,9 @@ export class AgentSession {
           this.provider === "moonshot" && isKimiCodingEndpoint(effectiveBaseUrl)
             ? kimiCodingHeaders()
             : undefined,
-        cacheRetention: "short",
+        // speedProfile "optimized": 1-h cache TTL (survives turns >5 min apart)
+        // + pre-warm before the first turn. "baseline": current 5-min default.
+        cacheRetention: this.isSpeedOptimized() ? "long" : "short",
         promptCacheKey: this.getPromptCacheKey(),
         supportsImages: modelInfo?.supportsImages,
         supportsVideo: modelInfo?.supportsVideo,
@@ -710,6 +791,11 @@ export class AgentSession {
     };
 
     try {
+      // Fire cache pre-warm before the first turn (Anthropic + speedProfile optimized).
+      // Runs concurrently with nothing — it must complete before runAgentLoop so
+      // the cache is warm when the real request arrives. Best-effort: swallowed
+      // inside maybePrewarmCache/prewarmAnthropicCache.
+      await this.maybePrewarmCache(creds);
       await runAgentLoop(creds.accessToken, creds.accountId, creds.projectId);
     } catch (err) {
       // Abort errors are expected (user cancellation) — don't retry or re-throw
@@ -958,10 +1044,11 @@ export class AgentSession {
     return this.planModeRef.current;
   }
 
-  /** Queue a user message to be injected mid-run as steering. Returns the new
-   *  queue length. No-op semantics are the caller's concern. */
-  queueMessage(text: string): number {
-    this.userQueue.push(text);
+  /** Queue a user message (optionally with attachments) to be injected mid-run
+   *  as steering. Returns the new queue length. No-op semantics are the caller's
+   *  concern. */
+  queueMessage(text: string, attachments: SessionAttachment[] = []): number {
+    this.userQueue.push({ text, attachments });
     return this.userQueue.length;
   }
 
@@ -970,9 +1057,13 @@ export class AgentSession {
     return this.userQueue.length;
   }
 
-  /** Clear the queue, returning the combined text (to restore to the composer). */
+  /** Clear the queue, returning the combined text (to restore to the composer).
+   *  Queued attachments are dropped on cancel — the composer only restores text. */
   drainQueue(): string {
-    return this.userQueue.splice(0).join("\n\n");
+    return this.userQueue
+      .splice(0)
+      .map((m) => m.text)
+      .join("\n\n");
   }
 
   /** Snapshot of background processes (bash run_in_background), newest-state. */
@@ -1082,6 +1173,49 @@ export class AgentSession {
   /** Replace the abort signal (e.g. after cancellation). */
   setSignal(signal: AbortSignal): void {
     this.opts = { ...this.opts, signal };
+  }
+
+  /** True when speedProfile is "optimized" (1-h cache TTL + pre-warm). */
+  private isSpeedOptimized(): boolean {
+    return this.settingsManager?.get("speedProfile") === "optimized";
+  }
+
+  /** Fire a cache pre-warm request for Anthropic so the first real turn is a
+   *  cache read instead of a cold write. No-op for other providers and when
+   *  speedProfile is not "optimized". Entirely best-effort — any failure is
+   *  swallowed so prewarm never blocks or aborts the real prompt. */
+  private async maybePrewarmCache(creds: {
+    accessToken: string;
+    accountId?: string;
+    baseUrl?: string;
+  }): Promise<void> {
+    if (this.cachePrewarmed || !this.isSpeedOptimized() || this.provider !== "anthropic") {
+      return;
+    }
+    this.cachePrewarmed = true;
+    try {
+      const userAgent = await getClaudeCliUserAgent();
+      const systemText =
+        typeof this.messages[0]?.content === "string" ? this.messages[0].content : "";
+      if (!systemText) return;
+      await prewarmAnthropicCache({
+        apiKey: creds.accessToken,
+        model: this.model,
+        system: systemText,
+        tools: this.tools.map((t) => ({
+          name: t.name,
+          description: t.description,
+          parameters: t.parameters,
+          ...(t.rawInputSchema ? { rawInputSchema: t.rawInputSchema } : {}),
+        })),
+        baseUrl: this.baseUrl ?? creds.baseUrl,
+        userAgent,
+        cacheRetention: "long",
+        signal: this.opts.signal,
+      });
+    } catch {
+      // Best-effort — prewarm failure must never block the session.
+    }
   }
 
   private getPromptCacheKey(): string | undefined {

@@ -1,5 +1,34 @@
 # @kenkaiiii/gg-boss
 
+## 4.13.2
+
+## 4.13.1
+
+## 4.13.0
+
+### Minor Changes
+
+- Update system prompt talk section for ADHD-readable responses
+
+  Rewrite `renderTalkSection()` so every reply leads with the outcome word
+  (Fixed/Done/Broken/Failed), enforces bottom-line-first scanning, one idea
+  per line, pick-don't-menu, concrete metrics, no unresolved it-depends, and
+  affirmative phrasing. Designed for fast scanning and low working memory.
+
+## 4.12.2
+
+### Patch Changes
+
+- Fix Windows sidecar crash: the session-folder name encoder (`encodeCwd`) now strips Windows extended-length path prefixes (`\\?\` and `\\?\UNC\`) and all reserved filename characters (`<>:"|?*`). Previously, Windows canonicalized cwds (`\\?\C:\Users\brams`) produced illegal folder names containing `?`, causing `mkdir` ENOENT and a fatal sidecar crash on startup — blocking OAuth/login for all Windows users.
+
+## 4.12.1
+
+## 4.12.0
+
+### Minor Changes
+
+- Add generate_image tool: generate and edit images via OpenAI gpt-image-2 through the Codex backend. Conditionally registered when OpenAI is connected. Includes inline image preview in transcript, shimmering skeleton placeholder during generation, 1:1 history reconstruction for tool-produced images and sub-agent groups on session resume, and image path exposure for multi-turn editing.
+
 ## 4.11.3
 
 ## 4.11.2
