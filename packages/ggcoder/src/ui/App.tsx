@@ -2425,7 +2425,8 @@ export function App(props: AppProps) {
               | "minimax"
               | "xiaomi"
               | "deepseek"
-              | "openrouter",
+              | "openrouter"
+              | "sakana",
           );
           await sm.set("defaultModel", newModelId);
         });

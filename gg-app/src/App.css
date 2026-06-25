@@ -368,6 +368,19 @@ body {
   text-align: center;
   overflow: hidden;
 }
+/* Ambient constellation backdrop — the lowest layer, under the meme cards and
+   all content. Vignette-masked so it fades at the edges. Non-interactive. */
+.home-backdrop {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  z-index: 0;
+  opacity: 0.55;
+  pointer-events: none;
+  mask-image: radial-gradient(ellipse 75% 75% at 50% 50%, #000 30%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 75% 75% at 50% 50%, #000 30%, transparent 100%);
+}
 /* Decorative floating meme cards — behind the logo/buttons, non-interactive. */
 .meme-layer {
   position: absolute;
@@ -863,11 +876,43 @@ body {
   background: var(--border);
   border-radius: 4px;
 }
+.modal-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  margin-bottom: 20px;
+}
 .modal-title {
   font-size: 15px;
   font-weight: 600;
   letter-spacing: -0.02em;
-  margin-bottom: 20px;
+}
+.modal-close {
+  appearance: none;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  width: 26px;
+  height: 26px;
+  border: 1px solid transparent;
+  border-radius: 999px;
+  background: transparent;
+  color: var(--text-dim);
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 20px;
+  line-height: 1;
+  padding: 0;
+  transition:
+    background var(--t-fast),
+    border-color var(--t-fast),
+    color var(--t-fast);
+}
+.modal-close:hover {
+  background: rgba(255, 255, 255, 0.06);
+  border-color: rgba(255, 255, 255, 0.1);
+  color: var(--text);
 }
 .modal-label {
   display: block;
@@ -876,8 +921,8 @@ body {
   margin-top: 22px;
   margin-bottom: 10px;
 }
-/* The first label shouldn't double up the title's bottom margin. */
-.modal-title + .modal-label {
+/* The first label shouldn't double up the title row's bottom margin. */
+.modal-head + .modal-label {
   margin-top: 4px;
 }
 .modal-input {
@@ -971,6 +1016,29 @@ body {
 .modal-btn:disabled {
   cursor: default;
   opacity: 0.4;
+}
+
+/* ── Notes modal (free-form per-project notebook) ── */
+.notes-input {
+  display: block;
+  box-sizing: border-box;
+  width: 100%;
+  /* Fill most of the viewport so it reads as a full notebook, not a chat box.
+     Scrolls internally once the notes outgrow the area. */
+  height: min(72vh, 680px);
+  resize: none;
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  padding: 14px 16px;
+  font-family: var(--sans);
+  font-size: 14px;
+  line-height: 1.6;
+  outline: none;
+  overflow-y: auto;
+}
+/* The notes modal is a workspace, not a small dialog — give it room. */
+.notes-modal {
+  width: min(900px, 94vw);
 }
 
 /* ── Tasks modal (project task list → run one / run all) ── */
@@ -1606,6 +1674,10 @@ body {
 .assistant-dot {
   flex: 0 0 auto;
   line-height: 1.55;
+  /* Same fixed gutter the activity bar's status icon uses, so the assistant dot
+     and the done/idle status icon share one left column. */
+  width: 16px;
+  text-align: left;
 }
 .assistant-text {
   flex: 1 1 auto;
@@ -1911,12 +1983,19 @@ body {
   min-width: 0;
 }
 
-.spinner {
-  /* Fixed width so varying glyph widths between animation frames don't reflow
-     the rest of the status row. */
+/* Status indicator gutter (idle caret / running spinner / done sparkle). Shares
+   the SAME fixed px width + left-align + gap as the assistant message dot, so
+   the icon left edge AND the label both line up with the transcript rows above
+   — a px gutter (not em) keeps that true across the bar's smaller font size. */
+.statusrow-icon {
   display: inline-block;
-  width: 1.2em;
-  text-align: center;
+  width: 16px;
+  text-align: left;
+  flex: 0 0 auto;
+}
+.spinner {
+  /* Brand-blue glow ties the working indicator to the wake-screen aesthetic. */
+  text-shadow: 0 0 8px rgba(77, 157, 255, 0.55);
 }
 
 @keyframes ggblink {
@@ -1993,11 +2072,12 @@ body {
   font-feature-settings: "tnum";
 }
 
-/* Idle "ready" line: icon + label aligned with a clean gap. */
+/* Idle "ready" line: icon + label aligned with a clean gap. The 6px gap matches
+   the assistant message row so the label column lines up. */
 .statusrow-ready {
   display: inline-flex;
   align-items: center;
-  gap: 8px;
+  gap: 6px;
 }
 
 /* Plan-step progress badge in the activity bar (amber "Plan Steps n/total"). */
@@ -2024,13 +2104,35 @@ body {
   padding-left: 12px;
   flex: 0 0 auto;
 }
+/* Right-side cluster (tool-panel toggle + cancel) in the running state. Pinned
+   right as a group; the inner cancel no longer needs its own auto margin. */
+.statusrow-right {
+  margin-left: auto;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  flex: 0 0 auto;
+}
+.statusrow.running .statusrow-right .cancel {
+  margin-left: 0;
+  padding-left: 0;
+}
+/* The tool-panel chevron lives in the activity bar (idle + running). Inherits
+   the nav-toggle look; nudge it to align with the bar's text baseline. */
+.statusrow-tools-toggle {
+  display: inline-flex;
+  align-items: center;
+}
+.tools-toggle {
+  flex: 0 0 auto;
+}
 .statusrow-left {
   min-width: 0;
   display: flex;
   align-items: center;
-  /* Flex collapses inter-element whitespace, so space the spinner / "Working…"
-     / meta group explicitly. */
-  gap: 8px;
+  /* 6px gap matches the assistant row so the done/working label column lines up
+     with the message text above (and spaces the spinner / "Working…" / meta). */
+  gap: 6px;
 }
 
 .inputwrap {
@@ -2573,6 +2675,55 @@ body {
 }
 .transcript-reveal {
   animation: reveal-up 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
+}
+
+/* ── Wake screen: Matrix-style empty state (the app addressing the user) ──
+   Fills the transcript area: faint brand-tinted digital rain behind a single
+   line of terminal text that types itself out and rests on the invitation. */
+.wake-screen {
+  position: relative;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  min-height: 100%;
+  width: 100%;
+  overflow: hidden;
+  user-select: none;
+}
+.wake-rain {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  /* Sit behind the text and never bleed past readable contrast. */
+  opacity: 0.32;
+  pointer-events: none;
+  mask-image: radial-gradient(ellipse 70% 80% at 50% 50%, #000 35%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 70% 80% at 50% 50%, #000 35%, transparent 100%);
+}
+.wake-text {
+  position: relative;
+  z-index: 1;
+  font-family: var(--mono);
+  font-size: 18px;
+  letter-spacing: 0.02em;
+  color: var(--text);
+  text-shadow: 0 0 12px rgba(77, 157, 255, 0.35);
+  white-space: pre;
+}
+.wake-cursor {
+  display: inline-block;
+  margin-left: 2px;
+  color: var(--primary);
+  animation: ggblink 1s step-end infinite;
+}
+.wake-cursor-rest {
+  color: var(--secondary);
+}
+@media (prefers-reduced-motion: reduce) {
+  .wake-cursor {
+    animation: none;
+  }
 }
 
 /* ── Skeletons: shape-preserving placeholders that crossfade to real content ──

@@ -213,7 +213,9 @@ describe("buildSystemPrompt", () => {
       "Ask first for destructive actions",
       "Preserve user work",
       "Rule precedence: project context files",
-      "Do not assume APIs",
+      "Your training data has a cutoff",
+      "treat it as a stale hint to verify, never as ground truth",
+      "Do not rely on memory for APIs",
       "Use `source_path`",
       "web_search` then `web_fetch",
       "ReferenceSources",
@@ -326,9 +328,9 @@ describe("buildSystemPrompt", () => {
 
     console.info(`system prompt size measurements: ${JSON.stringify(measurements)}`);
 
-    expect(measurements.normal.characters).toBeLessThan(4_800);
-    expect(measurements.planMode.characters).toBeLessThan(5_600);
-    expect(measurements.typescriptProjectContextToolsSkills.characters).toBeLessThan(9_500);
+    expect(measurements.normal.characters).toBeLessThan(5_100);
+    expect(measurements.planMode.characters).toBeLessThan(5_900);
+    expect(measurements.typescriptProjectContextToolsSkills.characters).toBeLessThan(9_800);
     expect(measurements.planMode.characters).toBeGreaterThan(measurements.normal.characters);
     expect(measurements.typescriptProjectContextToolsSkills.characters).toBeGreaterThan(
       measurements.normal.characters,

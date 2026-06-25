@@ -142,9 +142,17 @@ export async function prewarmAnthropicCache(options: {
       } as Anthropic.MessageCreateParamsNonStreaming,
       {
         signal: options.signal ?? undefined,
-        ...(isOAuth
-          ? { headers: { "anthropic-beta": "claude-code-20250219,oauth-2025-04-20" } }
-          : {}),
+        ...(() => {
+          // Mirror runStream's beta headers for the parts that affect caching:
+          // OAuth identity betas + the extended-cache-ttl beta, without which a
+          // 1-h pre-warm silently writes a 5-min cache and expires before the
+          // user's first turn.
+          const betas = [
+            ...(isOAuth ? ["claude-code-20250219", "oauth-2025-04-20"] : []),
+            ...(cacheControl?.ttl === "1h" ? ["extended-cache-ttl-2025-04-11"] : []),
+          ];
+          return betas.length ? { headers: { "anthropic-beta": betas.join(",") } } : {};
+        })(),
       },
     );
   } catch {
@@ -258,6 +266,11 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     ...(options.clearToolUses ? ["context-management-2025-06-27"] : []),
     "fine-grained-tool-streaming-2025-05-14",
     ...(!hasAdaptiveThinking ? ["interleaved-thinking-2025-05-14"] : []),
+    // The 1-h cache TTL (cacheRetention "long") is gated behind this beta. Without
+    // it Anthropic silently ignores ttl:"1h" and falls back to the 5-min default,
+    // so a pre-warmed cache expires before the user's first turn. cacheControl.ttl
+    // is only "1h" on the first-party endpoint (see toAnthropicCacheControl).
+    ...(cacheControl?.ttl === "1h" ? ["extended-cache-ttl-2025-04-11"] : []),
   ];
 
   const requestOptions = {

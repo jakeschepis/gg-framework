@@ -1,5 +1,35 @@
 # @kenkaiiii/ggcoder
 
+## 4.14.1
+
+### Patch Changes
+
+- Fix Anthropic 1h prompt-cache TTL by sending the extended-cache-ttl beta header on the streaming and prewarm paths, so `cacheRetention: "long"` no longer silently falls back to the 5-minute default.
+  - @kenkaiiii/gg-ai@4.14.1
+  - @kenkaiiii/gg-agent@4.14.1
+  - @kenkaiiii/gg-core@4.14.1
+
+## 4.14.0
+
+### Minor Changes
+
+- Add Sakana Fugu provider (Fugu, Fugu Ultra) with API-key login, high/xhigh reasoning, and a silent-reasoning stream-timeout extension.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@4.14.0
+- @kenkaiiii/gg-agent@4.14.0
+- @kenkaiiii/gg-core@4.14.0
+
+## 4.13.3
+
+### Patch Changes
+
+- Fix orphaned queued messages after an abort — drain the post-abort queue even when the run was interrupted, so a reprompt during async teardown isn't stranded.
+  - @kenkaiiii/gg-ai@4.13.3
+  - @kenkaiiii/gg-agent@4.13.3
+  - @kenkaiiii/gg-core@4.13.3
+
 ## 4.13.2
 
 ### Patch Changes

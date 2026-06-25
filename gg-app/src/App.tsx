@@ -46,7 +46,9 @@ import { ReferencedFiles, appendReferencedFiles, parseReferencedFiles } from "./
 import { ContextMeter } from "./ContextMeter";
 import { BackgroundTasksButton } from "./BackgroundTasksButton";
 import { TasksModal } from "./TasksModal";
+import { NotesModal } from "./NotesModal";
 import { ShimmerText } from "./ShimmerText";
+import { WakeScreen } from "./WakeScreen";
 import { ConfirmModal } from "./ConfirmModal";
 import { InitGitModal } from "./InitGitModal";
 import { PlanModeLogo } from "./PlanModeLogo";
@@ -300,6 +302,9 @@ function App(): React.ReactElement {
   // Updated live via the `tasks_list` SSE event while a run-all sweep advances.
   const [projectTasks, setProjectTasks] = useState<ProjectTask[]>([]);
   const [showTasks, setShowTasks] = useState(false);
+  // Free-form per-project notes, persisted to localStorage keyed by project cwd.
+  const [showNotes, setShowNotes] = useState(false);
+  const [notes, setNotes] = useState("");
   // Every window picks a project before connecting — on app load and on each new
   // window. The picker re-points this window's agent at the chosen cwd/session.
   const [needsProject, setNeedsProject] = useState(true);
@@ -342,6 +347,28 @@ function App(): React.ReactElement {
   const toggleNav = useCallback(
     () => setNavHiddenPersisted(!navHidden),
     [navHidden, setNavHiddenPersisted],
+  );
+  // Hide/show the live tool panel (the rolling feed above the activity bar).
+  // Mirrors navHidden: persisted across reloads, and auto-enabled when windows
+  // are tiled (tight space) so freshly opened windows boot with it collapsed.
+  const [toolsHidden, setToolsHidden] = useState(() => {
+    try {
+      return localStorage.getItem("gg-tools-hidden") === "1";
+    } catch {
+      return false;
+    }
+  });
+  const setToolsHiddenPersisted = useCallback((hidden: boolean) => {
+    try {
+      localStorage.setItem("gg-tools-hidden", hidden ? "1" : "0");
+    } catch {
+      /* ignore */
+    }
+    setToolsHidden(hidden);
+  }, []);
+  const toggleTools = useCallback(
+    () => setToolsHiddenPersisted(!toolsHidden),
+    [toolsHidden, setToolsHiddenPersisted],
   );
   const [newSessionBusy, setNewSessionBusy] = useState(false);
   // App self-update (GitHub releases). Drives the footer update banner.
@@ -425,6 +452,31 @@ function App(): React.ReactElement {
   useLayoutEffect(() => {
     maybeScrollToBottom();
   }, [items, liveToolFeed, running, doneStatus, queuedCount, maybeScrollToBottom]);
+
+  // Settle the scroll position after a session hydrates. The single layout-effect
+  // scroll above runs the instant `items` is set, but the transcript keeps
+  // growing afterward — web fonts swap in (FOUT reflows text taller), code blocks
+  // and markdown finish laying out — which leaves the view pinned a little above
+  // the true bottom. Re-pin across the next two frames and once fonts are ready,
+  // gated on stick-to-bottom so it never yanks the view if the user scrolled up.
+  useEffect(() => {
+    if (!hydrated) return;
+    let raf1 = 0;
+    let raf2 = 0;
+    raf1 = requestAnimationFrame(() => {
+      maybeScrollToBottom();
+      raf2 = requestAnimationFrame(maybeScrollToBottom);
+    });
+    let cancelled = false;
+    void document.fonts?.ready.then(() => {
+      if (!cancelled) maybeScrollToBottom();
+    });
+    return () => {
+      cancelled = true;
+      cancelAnimationFrame(raf1);
+      cancelAnimationFrame(raf2);
+    };
+  }, [hydrated, hydrateNonce, maybeScrollToBottom]);
 
   useEffect(() => {
     stateRef.current = state;
@@ -1268,11 +1320,42 @@ function App(): React.ReactElement {
     void deleteTask(id).then(setProjectTasks);
   }, []);
 
+  // Per-project notes: load from localStorage whenever the active project (cwd)
+  // changes, and write back on every edit. Keyed by cwd so each project keeps
+  // its own notebook; windows pointed at the same project share one.
+  const notesKey = state?.cwd ? `gg-notes:${state.cwd}` : null;
+  useEffect(() => {
+    if (!notesKey) {
+      setNotes("");
+      return;
+    }
+    try {
+      setNotes(localStorage.getItem(notesKey) ?? "");
+    } catch {
+      setNotes("");
+    }
+  }, [notesKey]);
+
+  const handleNotesChange = useCallback(
+    (value: string) => {
+      setNotes(value);
+      if (!notesKey) return;
+      try {
+        localStorage.setItem(notesKey, value);
+      } catch {
+        // Storage full/unavailable — keep the in-memory value for this session.
+      }
+    },
+    [notesKey],
+  );
+
   function onSelectModel(modelId: string): void {
     setModelMenuOpen(false);
     if (state && modelId === state.model) return;
     void switchModel(modelId).then((res) => {
       if (res) {
+        // Sakana Fugu easter egg: blow the fugu horn when a Fugu model is picked.
+        if (res.model.startsWith("fugu")) playSound("fugu");
         setState((s) =>
           s
             ? {
@@ -1816,6 +1899,13 @@ function App(): React.ReactElement {
               </button>
               <button
                 className="btn btn-sm btn-ghost"
+                title="Open your notes for this project"
+                onClick={() => setShowNotes(true)}
+              >
+                Notes
+              </button>
+              <button
+                className="btn btn-sm btn-ghost"
                 title="View and run this project's tasks"
                 onClick={openTasks}
               >
@@ -1823,6 +1913,14 @@ function App(): React.ReactElement {
                   ? `Tasks (${projectTasks.filter((t) => t.status !== "done").length})`
                   : "Tasks"}
               </button>
+              <RadioButton />
+              {/* <GazeButton /> */}
+              <WindowLayoutButton
+                onArrange={() => {
+                  setNavHiddenPersisted(true);
+                  setToolsHiddenPersisted(true);
+                }}
+              />
               {needsGitInit ? (
                 <button
                   className="btn btn-sm btn-ghost"
@@ -1849,9 +1947,6 @@ function App(): React.ReactElement {
                   </button>
                 )
               )}
-              <RadioButton />
-              {/* <GazeButton /> */}
-              <WindowLayoutButton onArrange={() => setNavHiddenPersisted(true)} />
             </span>
           </div>
         )}
@@ -1862,13 +1957,14 @@ function App(): React.ReactElement {
           <TranscriptSkeleton />
         ) : (
           <>
-            {items.length === 0 && (
-              <div className="line transcript-reveal" style={{ color: theme.textDim }}>
-                {status === "ready"
-                  ? "Ready. Type a message below to start coding."
-                  : `\u273b ${status}`}
-              </div>
-            )}
+            {items.length === 0 &&
+              (status === "ready" ? (
+                <WakeScreen />
+              ) : (
+                <div className="line transcript-reveal" style={{ color: theme.textDim }}>
+                  {`\u273b ${status}`}
+                </div>
+              ))}
             {items.map((it) => (
               <TranscriptRow key={it.id} item={it} onImageLoad={maybeScrollToBottom} />
             ))}
@@ -1877,7 +1973,7 @@ function App(): React.ReactElement {
       </div>
 
       <div className="liveregion">
-        <LiveToolPanel entries={liveToolFeed} />
+        {!toolsHidden && <LiveToolPanel entries={liveToolFeed} />}
         <ActivityBar
           running={running}
           tokens={tokens}
@@ -1888,6 +1984,9 @@ function App(): React.ReactElement {
           planTotal={planTotal}
           planDone={Math.min(planDone.size, planTotal)}
           onCancel={() => void cancel()}
+          toolsHidden={toolsHidden}
+          hasToolFeed={liveToolFeed.length > 0}
+          onToggleTools={toggleTools}
         />
       </div>
 
@@ -2153,6 +2252,14 @@ function App(): React.ReactElement {
           onAccept={acceptPlan}
           onFeedback={sendPlanFeedback}
           onReject={rejectPlan}
+        />
+      )}
+
+      {showNotes && (
+        <NotesModal
+          value={notes}
+          onChange={handleNotesChange}
+          onClose={() => setShowNotes(false)}
         />
       )}
 

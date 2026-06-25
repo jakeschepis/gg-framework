@@ -100,7 +100,8 @@ async function renderApprovedPlanSection(
 function renderResearchSection(): string {
   return (
     `## Research & Verification\n\n` +
-    `Do not assume APIs, CLI flags, config schema, internals, or error wording. Use \`source_path\` for installed deps and inspect with read/grep/find/ls; use \`web_search\` then \`web_fetch\` for authoritative docs. ` +
+    `Your training data has a cutoff; the real current date is the final line of this prompt. Assume your knowledge of library versions, APIs, CLI flags, config schema, defaults, and best practices has changed since then — treat it as a stale hint to verify, never as ground truth. ` +
+    `Do not rely on memory for APIs, CLI flags, config schema, internals, or error wording — verify first. Use \`source_path\` for installed deps and inspect with read/grep/find/ls; use \`web_search\` then \`web_fetch\` for authoritative docs. ` +
     `For public code, use ReferenceSources for curated repos or DiscoverRepos for current/top repos, then verify exact snippets with SearchCode literal text/RE2 (not semantic); \`path\` is a literal path substring and \`repo\` only after broad/peek proof. ` +
     `Run targeted checks when they are relevant to the change; read/fix failures; never report unrun or failing checks as passing.`
   );
