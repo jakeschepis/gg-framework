@@ -16,6 +16,7 @@ import {
   getServeStatus,
   startServe,
   stopServe,
+  openWhatsNewWindow,
 } from "./agent";
 import { useAppUpdate } from "./update";
 import { toast } from "./toast";
@@ -139,7 +140,19 @@ export function HomeScreen({ onProjects, onLogin }: Props): React.ReactElement {
           {appUpdate.phase === "installing" ? "Installing\u2026" : `Update to ${appUpdate.version}`}
         </button>
       ) : (
-        version && <span className="home-version">{`v${version}`}</span>
+        version && (
+          <div className="home-version-row">
+            <span className="home-version">{`v${version}`}</span>
+            <button
+              className="home-whatsnew"
+              type="button"
+              title="See the latest updates"
+              onClick={() => void openWhatsNewWindow().catch(() => {})}
+            >
+              What&apos;s new
+            </button>
+          </div>
+        )
       )}
       <AsciiLogo />
       <div className="home-tagline">Cause the other coding agents piss me off</div>
