@@ -14,6 +14,7 @@ import {
 } from "./edit-diff.js";
 import { localOperations, type ToolOperations } from "./operations.js";
 import { assertFresh, recordWrite, type ReadTracker } from "./read-tracker.js";
+import { resolveAnchoredEdit } from "../core/hashline.js";
 import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 
 type MutationCallback = (filePath: string) => void | Promise<void>;
@@ -33,6 +34,15 @@ function isPlanModeRef(value: unknown): value is { current: boolean } {
   );
 }
 
+const EditAnchorSchema = z.object({
+  start_line: z.number().int().min(1).describe("1-based line number of the first edited line"),
+  start_hash: z
+    .string()
+    .describe("Content anchor of the first line (from a read with anchors:true)"),
+  end_line: z.number().int().min(1).describe("1-based line number of the last edited line"),
+  end_hash: z.string().describe("Content anchor of the last line"),
+});
+
 const EditItem = z.object({
   old_text: z.string().describe("The exact text to find and replace"),
   new_text: z.string().describe("The replacement text"),
@@ -43,6 +53,11 @@ const EditItem = z.object({
       "Replace every occurrence of old_text instead of requiring a unique match. " +
         "Use for renames or repeated tokens. Defaults to false.",
     ),
+  anchor: EditAnchorSchema.optional().describe(
+    "Optional staleness guard. When set (using line+hash anchors from a read with anchors:true), " +
+      "the edit is rejected if the file changed since you read it. old_text/new_text still drive the " +
+      "actual replacement.",
+  ),
 });
 
 // Some models (Opus 4.6, GLM-5.1) occasionally send `edits` as a JSON string
@@ -121,7 +136,8 @@ function tryMatch(working: string, old: string, next: string, replaceAll: boolea
 type FailureKind =
   | { reason: "noop" }
   | { reason: "not_found"; closestSnippet: string | null; closestLine: number | null }
-  | { reason: "ambiguous"; occurrences: number; matchLines: string; more: string };
+  | { reason: "ambiguous"; occurrences: number; matchLines: string; more: string }
+  | { reason: "stale_anchor" };
 
 interface EditOutcome {
   ok: boolean;
@@ -150,7 +166,9 @@ export function createEditTool(
       "Each old_text should identify one location — include surrounding context; set replace_all: true only for deliberate global replacements/renames. " +
       "The matcher tolerates safe whitespace/quote/dash drift, but do not paraphrase. For long blocks, a line containing only `...` in BOTH old_text and new_text elides a middle preserved verbatim. " +
       "Partial-apply by default: failed edits are listed for retry, successful ones are still written — " +
-      "re-issue ONLY the listed failures, not the whole batch. Returns a unified diff.",
+      "re-issue ONLY the listed failures, not the whole batch. " +
+      "Optionally pin an edit with `anchor` (line+hash from a read with anchors:true) to reject it if the file changed since you read it. " +
+      "Returns a unified diff.",
     parameters: EditParams,
     executionMode: "sequential",
     async execute({ file_path, edits, atomic = false }) {
@@ -167,11 +185,28 @@ export function createEditTool(
       const originalNormalized = hasCRLF ? original.replace(/\r\n/g, "\n") : original;
 
       let working = originalNormalized;
+      // Anchors pin lines in the file AS READ, so they always verify against the
+      // original (pre-edit) line array — earlier edits in the batch don't shift
+      // what an anchor refers to.
+      const originalLines = originalNormalized.split("\n");
       const fileName = path.basename(resolved);
       const outcomes: EditOutcome[] = new Array(edits.length);
 
       for (let i = 0; i < edits.length; i++) {
-        const { old_text, new_text, replace_all } = edits[i];
+        const { old_text, new_text, replace_all, anchor } = edits[i];
+
+        // Optional staleness guard (opt-in). Runs BEFORE the fuzzy match ladder:
+        // if the model supplied an anchor and the file drifted since it read it,
+        // reject this edit instead of risking a misplaced fuzzy match. The fuzzy
+        // path below is byte-identical to today when `anchor` is absent.
+        if (anchor) {
+          const res = resolveAnchoredEdit(originalLines, anchor);
+          if (!res.ok) {
+            outcomes[i] = { ok: false, failure: { reason: "stale_anchor" } };
+            continue;
+          }
+        }
+
         const normalizedOld = hasCRLF ? old_text.replace(/\r\n/g, "\n") : old_text;
         const normalizedNew = hasCRLF ? new_text.replace(/\r\n/g, "\n") : new_text;
         const replaceAll = replace_all ?? false;
@@ -266,6 +301,9 @@ export function createEditTool(
       // and the snippet is its only guidance — keep it.
       const willPersistSuccesses = successCount > 0 && !atomic;
       const formatFailureMessage = (f: FailureKind): string => {
+        if (f.reason === "stale_anchor") {
+          return `the file changed since you read it (anchor mismatch) — re-read \`${file_path}\` and retry`;
+        }
         if (f.reason === "noop") {
           return `old_text and new_text are identical in ${fileName} — this edit would be a no-op. Either fix new_text or drop this edit.`;
         }

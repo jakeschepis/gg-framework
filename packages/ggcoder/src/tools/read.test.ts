@@ -3,6 +3,7 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import os from "node:os";
 import { createReadTool, BINARY_EXTENSIONS } from "./read.js";
+import { lineHash } from "../core/hashline.js";
 import type { ReadTracker } from "./read-tracker.js";
 
 describe("createReadTool", () => {
@@ -119,6 +120,64 @@ describe("createReadTool", () => {
     expect(entry).toBeDefined();
     expect(typeof entry?.mtimeMs).toBe("number");
     expect(entry?.hash).toMatch(/^[a-f0-9]{64}$/);
+  });
+});
+
+describe("anchors option", () => {
+  let tmpDir: string;
+
+  beforeEach(async () => {
+    tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "read-anchors-test-"));
+  });
+
+  afterEach(async () => {
+    await fs.rm(tmpDir, { recursive: true, force: true });
+  });
+
+  function ctx(id: string) {
+    return { signal: new AbortController().signal, toolCallId: id };
+  }
+
+  it("prefixes each line with a hash│ anchor when anchors: true", async () => {
+    const filePath = path.join(tmpDir, "a.txt");
+    await fs.writeFile(filePath, "alpha\nbeta\ngamma");
+
+    const tool = createReadTool(tmpDir);
+    const result = (await tool.execute(
+      { file_path: filePath, anchors: true },
+      ctx("a1"),
+    )) as string;
+
+    const lines = result.split("\n");
+    // hash (4 hex) + │ + 6-wide line number + tab + content, hash from real 0-based index.
+    expect(lines[0]).toBe(`${lineHash("alpha", 0)}│     1\talpha`);
+    expect(lines[1]).toBe(`${lineHash("beta", 1)}│     2\tbeta`);
+    expect(lines[2]).toBe(`${lineHash("gamma", 2)}│     3\tgamma`);
+  });
+
+  it("anchor hashes use the real file index under offset", async () => {
+    const filePath = path.join(tmpDir, "b.txt");
+    await fs.writeFile(filePath, "l1\nl2\nl3\nl4\nl5");
+
+    const tool = createReadTool(tmpDir);
+    const result = (await tool.execute(
+      { file_path: filePath, offset: 3, anchors: true },
+      ctx("a2"),
+    )) as string;
+
+    const lines = result.split("\n");
+    // First shown line is file line 3 (0-based index 2).
+    expect(lines[0]).toBe(`${lineHash("l3", 2)}│     3\tl3`);
+  });
+
+  it("default call (no anchors) is unchanged", async () => {
+    const filePath = path.join(tmpDir, "c.txt");
+    await fs.writeFile(filePath, "x\ny");
+
+    const tool = createReadTool(tmpDir);
+    const result = await tool.execute({ file_path: filePath }, ctx("a3"));
+
+    expect(result).toBe("     1\tx\n     2\ty");
   });
 });
 

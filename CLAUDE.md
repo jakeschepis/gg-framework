@@ -11,8 +11,6 @@ A modular TypeScript framework for building LLM-powered apps — from raw stream
 | `packages/gg-core` | `@kenkaiiii/gg-core` | Provider-agnostic, UI-free shared foundation: model registry, thinking levels, app paths, OAuth + auth storage, file-writer logger core, telegram + voice transcription, self-updater |
 | `packages/ggcoder` | `@kenkaiiii/ggcoder` | CLI coding agent + `app-sidecar` (the gg-app backend) |
 | `gg-app` | (private — Tauri desktop app) | **The desktop app — primary product we ship to users** |
-| `packages/gg-pixel` | `@kenkaiiii/gg-pixel` | Universal error tracking SDK (Node + Browser + Deno + Workers) |
-| `packages/gg-pixel-server` | (private — Cloudflare Worker) | Ingest backend (Workers + D1) |
 
 **Install CLI**: `npm i -g @kenkaiiii/ggcoder` · **Desktop app**: `cd gg-app && pnpm tauri dev`
 
@@ -322,8 +320,7 @@ Hard rules:
 - **Lazy + budgeted.** Nothing spawns until the first edit of a matching file; diagnostics are
   capped at 3s warm / 8s first-touch — overruns return nothing and leave the server warm.
 - **Errors only, capped at 5**, framed as informational so multi-file sequences aren't derailed.
-- Opt out with `"lspDiagnostics": false` in `~/.gg/settings.json`. Pools are per tool set:
-  `rebuildToolsForCwd` (pixel chdir) shuts the old one down; exit handlers call
+- Opt out with `"lspDiagnostics": false` in `~/.gg/settings.json`. Exit handlers call
   `lspManager.shutdownAll()` alongside `processManager`.
 - Tests: `src/core/lsp/*.test.ts` run against a fake stdio server fixture
   (`src/tools/__fixtures__/fake-lsp-server.mjs`) — CI never needs real language servers.
@@ -362,49 +359,8 @@ ggcoder mcp add --env AIRTABLE_API_KEY=key airtable -- npx -y airtable-mcp-serve
 ### Caveats
 
 - **Connection is startup-only.** MCP connects once at launch (`connectInitialMcpTools` in `cli.ts`). Adding a server via `ggcoder mcp` mid-session won't hot-load it — restart ggcoder.
-- **Pixel chdir flow.** Project-scoped servers load relative to `process.cwd()` at startup. The Pixel fix flow swaps cwd mid-session (`process.chdir` + `rebuildToolsForCwd`); project MCP servers won't follow that swap.
 - **WebSocket transport** is parsed but rejected (no WS client today).
 - **Env var expansion** (`${VAR}`) in `.mcp.json` is NOT expanded in v1 — values pass through literally.
-
-## Pixel — error tracking + auto-fix queue
-
-`@kenkaiiii/gg-pixel` is a drop-in error tracking SDK. Errors flow to a Cloudflare Worker (`gg-pixel-server`) backed by D1. `ggcoder pixel` opens an in-Ink overlay that lists open errors per project and hands each one off to the existing agent loop — same UX as the Task pane.
-
-### CLI
-
-```bash
-ggcoder pixel install          # Detect framework, wire up SDK + .env, register project key
-ggcoder pixel                  # Open the in-Ink overlay (also: Ctrl+E inside running ggcoder)
-ggcoder pixel fix <error_id>   # Fix one error end-to-end (subprocess flow, for non-TTY use)
-ggcoder pixel run              # Auto-fix every open error (non-interactive)
-```
-
-### In-Ink fix flow (the main path)
-
-`Ctrl+E` from inside ggcoder, or `ggcoder pixel`, opens `PixelOverlay`. Keys: `↑↓ navigate · Enter fix one · f fix all · d delete · Esc close`.
-
-When a fix starts, `startPixelFix(errorId)` in `App.tsx` swaps **four** things in lockstep before calling `agentLoop.run(prep.prompt)`:
-
-1. `process.chdir(prep.projectPath)` — for code reading `process.cwd()` directly.
-2. `setCurrentTools(rebuildToolsForCwd(prep.projectPath))` — read/write/edit/bash/find/grep/ls/tasks/sub-agent are all baked with `cwd` at creation, so they MUST be rebuilt; chdir alone is not enough.
-3. System prompt is rebuilt with the new project root (`buildSystemPrompt(prep.projectPath, …)`) and swapped into `messagesRef.current[0]` — this is the only place the model itself learns "where it is".
-4. `setDisplayedCwd(prep.projectPath)` — Banner + Footer read this. Because Banner lives inside Ink's `<Static>`, also bump `staticKey` so Static remounts and re-renders the banner with the new path.
-
-Reset chat state (`setHistory`, `setLiveItems`, `setStaticKey`, screen clear) **AFTER** the chdir is committed — otherwise the old-cwd banner gets written first and you see two banners stacked.
-
-`onDone` in `useAgentLoop` finalizes the fix: `finalizePixelFix(prep)` observes the `fix/pixel-{id}` branch + commits and patches the D1 status to `awaiting_review` or `failed`. Run-all picks up the next open error via the same path.
-
-### Backend
-
-`packages/gg-pixel-server/` — Hono on Workers + D1. Routes:
-- `POST /ingest` — SDK posts events; server dedupes by `(project_id, fingerprint)`. Validated + size-capped + per-project unique-fingerprint cap (10K). CORS-open since the publishable `project_key` is the auth boundary for ingest only.
-- `POST /api/projects` — globally rate-limited (100/hr). Returns `{ id, key, secret }` once on creation; the `secret` is the bearer token for every other `/api/*` call from that project's owner.
-- `GET /api/projects/:id/errors` — bearer-authed (`Authorization: Bearer sk_live_…`); 403 if the secret doesn't own the project.
-- `GET /api/errors/:id` — bearer-authed + cross-project scoped (403 if the bearer's project doesn't own the row).
-- `PATCH /api/errors/:id` — bearer-authed + scoped. Drives `open → in_progress → awaiting_review → merged` (or `failed`).
-- `DELETE /api/errors/:id` — bearer-authed + scoped (used by `d` in the overlay).
-
-`~/.gg/projects.json` stores `{ name, path, secret }` per project. The CLI reads the secret on every management call. Re-run `ggcoder pixel install` to refresh the secret if a mapping is legacy (no `secret` field).
 
 ## Slash Commands
 

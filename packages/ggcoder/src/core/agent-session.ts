@@ -47,6 +47,7 @@ import {
   type IdealReviewStats,
   evaluateIdealReview,
   buildIdealReviewMessage,
+  detectTestDrift,
 } from "./ideal-review.js";
 import {
   evaluateLoopBreak,
@@ -55,6 +56,7 @@ import {
   detectTextRepetition,
 } from "./loop-breaker.js";
 import { buildRegroundingMessage } from "./regrounding.js";
+import { wrapSteeringText, STEERING_PREFIX } from "./steering.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -654,14 +656,19 @@ export class AgentSession {
     // agent sees them mid-loop instead of after it stops.
     if (this.userQueue.length > 0) {
       const queued = this.userQueue.splice(0);
+      // Frame the queued text as concurrent steering — without this wrapper the
+      // model treats a mid-run message as a fresh request that supersedes the
+      // original task and silently drops it.
       // Plain-text-only queue: keep the simple merged-string message.
       if (queued.every((m) => m.attachments.length === 0)) {
         const merged = queued.map((m) => m.text).join("\n\n");
-        return [{ role: "user", content: merged }];
+        return [{ role: "user", content: wrapSteeringText(merged) }];
       }
       // Any queued attachments → deliver one user message with text + media
       // blocks built the same way as a non-queued attachment prompt.
-      const parts: Array<TextContent | ImageContent | VideoContent> = [];
+      const parts: Array<TextContent | ImageContent | VideoContent> = [
+        { type: "text", text: STEERING_PREFIX },
+      ];
       for (const m of queued) parts.push(...this.buildAttachmentParts(m.text, m.attachments));
       return [{ role: "user", content: parts }];
     }
@@ -695,10 +702,13 @@ export class AgentSession {
     if (!this.settingsManager.get("idealReviewEnabled")) return null;
     if (this.idealReviewInjected) return null;
     const decision = evaluateIdealReview(this.hookStats);
-    if (!decision.shouldReview) return null;
+    // Test drift fires the review even on a small change the score would skip:
+    // a green-but-stale test is exactly what the volume gate sleeps through.
+    const driftedFiles = detectTestDrift(this.hookFileEditCounts.keys(), this.cwd).slice(0, 5);
+    if (!decision.shouldReview && driftedFiles.length === 0) return null;
     this.idealReviewInjected = true;
     this.eventBus.emit("hook", { kind: "ideal" });
-    return [buildIdealReviewMessage(decision.reasons)];
+    return [buildIdealReviewMessage(decision.reasons, driftedFiles)];
   }
 
   /** Auto-compact if needed, run agent loop with auth retry, and persist messages. */

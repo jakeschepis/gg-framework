@@ -91,7 +91,6 @@ import {
   getModel,
 } from "./core/model-registry.js";
 import { MCPClientManager, getAllMcpServers } from "./core/mcp/index.js";
-import { runPixel } from "./cli/pixel.js";
 import { runLogin, runLogout, runDoctor } from "./cli/auth.js";
 import { runMcp } from "./cli/mcp.js";
 import {
@@ -229,7 +228,6 @@ function createCliSubcommandHandlers(): Record<CliSubcommandName, () => void> {
   };
 
   return {
-    pixel: () => runWithStandardErrorHandling(() => runPixel({ runInkTUI }), true),
     mcp: () => runWithStandardErrorHandling(runMcp),
     login: () => runWithStandardErrorHandling(runLogin),
     logout: () => runWithStandardErrorHandling(runLogout),
@@ -394,7 +392,6 @@ async function runInkTUI(opts: {
   continueRecent?: boolean;
   resumeSessionPath?: string;
   theme?: "auto" | ThemeName;
-  initialOverlay?: "pixel";
   idealReviewEnabled?: boolean;
   lspDiagnostics?: boolean;
 }): Promise<void> {
@@ -543,32 +540,6 @@ async function runInkTUI(opts: {
       planToolCallbacks.onExitPlan?.(planPath) ?? Promise.resolve("Plan review is unavailable."),
   });
 
-  // The active LSP pool follows the active tool set — rebuilds (pixel chdir)
-  // shut the old pool down and swap in the new one.
-  let activeLspManager = lspManager;
-
-  // Rebuilds the cwd-bound tools for a different project root. Used by the
-  // pixel-fix flow so the agent operates in the error's project, not in
-  // wherever ggcoder was launched from.
-  const rebuildToolsForCwd = async (newCwd: string) => {
-    activeLspManager?.shutdownAll();
-    const { tools: rebuilt, lspManager: rebuiltLspManager } = await createTools(newCwd, {
-      agents,
-      skills,
-      provider,
-      model,
-      planModeRef,
-      onPreFileMutation,
-      lspDiagnostics: opts.lspDiagnostics,
-      authStorage,
-      onEnterPlan: (reason) => planToolCallbacks.onEnterPlan?.(reason),
-      onExitPlan: (planPath) =>
-        planToolCallbacks.onExitPlan?.(planPath) ?? Promise.resolve("Plan review is unavailable."),
-    });
-    activeLspManager = rebuiltLspManager;
-    return rebuilt;
-  };
-
   // MCP startup can involve `npx` installing/booting servers. Do it after the
   // TUI paints so a slow network or npm cache never looks like "nothing happens".
   const mcpManager = new MCPClientManager();
@@ -596,7 +567,7 @@ async function runInkTUI(opts: {
   // Kill all background processes on exit (synchronous — catches all exit paths)
   process.on("exit", () => {
     processManager.shutdownAll();
-    activeLspManager?.shutdownAll();
+    lspManager?.shutdownAll();
     mcpManager.dispose().catch(() => {});
   });
 
@@ -757,9 +728,7 @@ async function runInkTUI(opts: {
     planModeRef,
     skills,
     checkpointStore: checkpointRef.current ?? undefined,
-    initialOverlay: opts.initialOverlay,
     idealReviewEnabled: opts.idealReviewEnabled,
-    rebuildToolsForCwd,
     rebuildReadTool,
     connectInitialMcpTools,
     planCallbacks: planToolCallbacks,
@@ -1177,8 +1146,6 @@ async function runAgentHome(): Promise<void> {
     agentHome: { token },
   });
 }
-
-// ── Pixel ──────────────────────────────────────────────────
 
 // ── Helpers ────────────────────────────────────────────────
 

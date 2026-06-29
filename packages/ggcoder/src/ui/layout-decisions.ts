@@ -7,7 +7,7 @@ import {
   shouldTopSpaceStreamingAssistant as shouldTopSpaceStreamingAssistantFromTranscript,
 } from "./transcript/spacing.js";
 
-export type OverlayPaneKind = "model" | "skills" | "plan" | "theme" | "pixel";
+export type OverlayPaneKind = "model" | "skills" | "plan" | "theme";
 
 export function shouldHideHistoryForOverlayView(
   isOverlayView: boolean,

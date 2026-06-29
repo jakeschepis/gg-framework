@@ -11,6 +11,10 @@
  * Cross-tool preferences for those tools live in TOOL_STEERING instead.
  */
 export const TOOL_PROMPT_HINTS: Record<string, string> = {
+  code_search:
+    "Find the most relevant functions/classes/types for a query via AST chunking + BM25 " +
+    "ranking. Returns whole ranked symbol chunks with `file:line → symbol` headers — far fewer " +
+    "tokens than reading whole files. TS/JS only.",
   source_path:
     "Resolve installed package/repo source via opensrc. Use before assuming dependency APIs; inspect returned absolute path with read/grep/find/ls.",
   web_search:
@@ -52,6 +56,10 @@ export const TOOL_STEERING_CLAUSES: ReadonlyArray<{ needs: readonly string[]; te
     needs: ["bash", "find", "grep"],
     text: "Use `find`/`grep` rather than `bash` to locate files and search content.",
   },
+  {
+    needs: ["code_search", "grep", "read"],
+    text: "Prefer `code_search` for “where/how is X implemented” in TS/JS; use `grep` for exact strings or non-TS files.",
+  },
 ];
 
 /** Build the steering line from whichever clauses apply to the active tools. */
@@ -70,6 +78,7 @@ export const DEFAULT_TOOL_NAMES: readonly string[] = [
   "bash",
   "find",
   "grep",
+  "code_search",
   "ls",
   "source_path",
   "web_fetch",

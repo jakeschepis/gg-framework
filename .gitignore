@@ -55,3 +55,6 @@ packages/ggcoder/ideal-sim/
 
 # prompt-bench scratch sandboxes
 experiments/prompt-bench/.bench-sandbox-*
+
+# scratch — top coding agents scan
+top-coding-agents.md

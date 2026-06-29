@@ -18,6 +18,7 @@ import {
 import { getClaudeCliUserAgent } from "../../core/claude-code-version.js";
 import { kimiCodingHeaders, isKimiCodingEndpoint } from "../../core/oauth/kimi.js";
 import { log } from "../../core/logger.js";
+import { wrapSteeringContent } from "../../core/steering.js";
 
 /** Extract plain text from this run's user input — the verbatim request that
  *  the re-grounding hook re-pins after a compaction. Captured at run start so
@@ -119,7 +120,7 @@ export interface AgentLoopOptions {
     messages: Message[],
     options?: { force?: boolean },
   ) => Message[] | Promise<Message[]>;
-  getIdealReviewMessage?: (stats: IdealReviewStats) => Message | null;
+  getIdealReviewMessage?: (stats: IdealReviewStats, touchedFiles: string[]) => Message | null;
   /** Polled mid-loop when the agent appears stuck (repeated failures / calls /
    *  edits, or degenerate output). Return a user message to break the loop. */
   getLoopBreakMessage?: (stats: LoopBreakStats) => Message | null;
@@ -617,8 +618,11 @@ export function useAgentLoop(
                 const batch = queueRef.current.splice(0);
                 setQueuedCount(0);
                 const merged = mergeUserContent(batch.map((q) => q.content));
+                // Show the user their verbatim message; send the framed version
+                // so the model treats it as concurrent steering, not a fresh
+                // request that supersedes the original task.
                 onQueuedStart?.(merged);
-                return [{ role: "user" as const, content: merged }];
+                return [{ role: "user" as const, content: wrapSteeringContent(merged) }];
               }
 
               // Loop-breaker: at most once per run, when the agent looks stuck.
@@ -659,9 +663,10 @@ export function useAgentLoop(
               const followUp = (await getFollowUpMessages?.()) ?? null;
               if (followUp && followUp.length > 0) return followUp;
               if (idealReviewInjectedRef.current || !options.getIdealReviewMessage) return null;
-              const idealReviewMessage = options.getIdealReviewMessage({
-                ...idealReviewStatsRef.current,
-              });
+              const idealReviewMessage = options.getIdealReviewMessage(
+                { ...idealReviewStatsRef.current },
+                [...fileEditCountsRef.current.keys()],
+              );
               if (!idealReviewMessage) return null;
               idealReviewInjectedRef.current = true;
               return [idealReviewMessage];

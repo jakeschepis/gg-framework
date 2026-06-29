@@ -29,7 +29,6 @@ interface ChatInputControls {
   onShiftTab: () => void;
   onToggleTasks: () => void;
   onToggleSkills: () => void;
-  onTogglePixel: () => void;
   onToggleMarkdown: () => void;
   cwd: string;
   commands: SlashCommandInfo[];
@@ -258,7 +257,6 @@ export function ChatScreen({
           onRunAllTasks={taskPicker.onRunAll}
           onDeleteTask={taskPicker.onDelete}
           onToggleSkills={inputControls.onToggleSkills}
-          onTogglePixel={inputControls.onTogglePixel}
           onToggleMarkdown={inputControls.onToggleMarkdown}
           cwd={inputControls.cwd}
           commands={inputControls.commands}

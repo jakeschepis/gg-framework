@@ -22,6 +22,36 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.6.1",
+    date: "2026-06-29",
+    items: [
+      "The agent stops leaving your tests behind. When it changes code that already has a test, it now notices the test wasn't updated and fixes it right then, before handing back to you. No more silently stale tests passing green while your code moved on.",
+    ],
+  },
+  {
+    version: "0.6.0",
+    date: "2026-06-29",
+    items: [
+      "Finding code in your project just got scary fast. I taught the agent a brand new way to search that reads your code by what it actually means, jumping straight to the right function or class instead of skimming whole files. It burns a fraction of the tokens, so answers land quicker and your bill stays lighter.",
+      "Your files are safer than ever during edits. I added a guard that catches when a file has shifted since the agent last looked, so it stops and re-checks instead of plowing ahead and scrambling your code. Fewer botched edits, more trust.",
+    ],
+  },
+  {
+    version: "0.5.4",
+    date: "2026-06-28",
+    items: [
+      "Type a follow-up mid-task and it actually gets respected now. I fixed a big one: when you fired off a second message while the agent was working, it used to latch onto that new note and quietly forget what you originally asked. Now it folds both together, whether you are adding more or course-correcting, and finishes everything you told it.",
+    ],
+  },
+  {
+    version: "0.5.3",
+    date: "2026-06-28",
+    items: [
+      "Your home screen just got a whole lot funnier. I loaded up a fresh stack of memes built for how we actually code in 2026, accepting every suggestion, praying through npm install, and letting the agent cook. Refresh and you will catch new ones every few seconds.",
+      "This window now remembers way more. I cranked the history up to the last 50 updates so you can scroll back through everything I have been shipping, not just the latest handful.",
+    ],
+  },
+  {
     version: "0.5.2",
     date: "2026-06-27",
     items: [
@@ -89,11 +119,11 @@ export const CHANGELOG: ChangelogEntry[] = [
 
 /**
  * The most recent changelog bullets for the modal, capped at `maxItems` total
- * bullet points (default 20) across versions — newest first, version grouping
+ * bullet points (default 50) across versions — newest first, version grouping
  * preserved. A version whose bullets would spill past the cap is included with
  * only the bullets that fit.
  */
-export function recentChangelog(maxItems = 20): ChangelogEntry[] {
+export function recentChangelog(maxItems = 50): ChangelogEntry[] {
   const out: ChangelogEntry[] = [];
   let count = 0;
   for (const entry of CHANGELOG) {

@@ -69,8 +69,6 @@ export interface RenderAppConfig {
   planModeRef?: { current: boolean };
   skills?: Skill[];
   checkpointStore?: CheckpointStore;
-  initialOverlay?: "pixel";
-  rebuildToolsForCwd?: (cwd: string) => Promise<AgentTool[]>;
   rebuildReadTool?: (model: string) => AgentTool;
   connectInitialMcpTools?: () => Promise<AgentTool[]>;
   planCallbacks?: {
@@ -95,7 +93,7 @@ interface RuntimeState {
  * Session state that needs to survive unmount/remount for paths that
  * KEEP the conversation (overlay close, plan reject) — and which we
  * deliberately wipe for paths that start a fresh session (`/clear`,
- * plan accept, pixel fix).
+ * plan accept).
  *
  * App.tsx mirrors its in-React state into this object via useEffects,
  * so when `resetUI` rebuilds the Ink instance, the new App can re-seed
@@ -103,7 +101,7 @@ interface RuntimeState {
  * as our reset mechanism (the only thing that actually escapes Ink's
  * cumulative live-area drift).
  */
-type OverlayKind = "model" | "skills" | "plan" | "theme" | "pixel" | null;
+type OverlayKind = "model" | "skills" | "plan" | "theme" | null;
 
 export interface SessionStore {
   messages: Message[];
@@ -118,14 +116,14 @@ export interface SessionStore {
   sessionId?: string;
   sessionTitle?: string;
   sessionTitleGenerated: boolean;
-  /** Which overlay (Skills, Plan, Pixel, Theme, Model) is open. */
+  /** Which overlay (Skills, Plan, Theme, Model) is open. */
   overlay?: OverlayKind;
   /** Plan overlay auto-expand-newest flag (only meaningful when overlay==='plan'). */
   planAutoExpand?: boolean;
   /**
    * Action to run on the next mount (consumed once). Used by paths that
    * remount AND immediately drive the agent — plan accept / reject,
-   * pixel fix, etc. The new App reads this on mount, fires the agent,
+   * etc. The new App reads this on mount, fires the agent,
    * and clears the field.
    */
   pendingAction?: {
@@ -150,12 +148,6 @@ export interface SessionStore {
    * sessionStore.history before the unmount, so the chat isn't lost.
    */
   pendingResetUI?: boolean;
-  /**
-   * Pixel fix auto-chaining flag. Survives the deferred resetUI() that may
-   * fire when the agent goes idle (e.g. after a pane was toggled mid-fix).
-   * Without this, the second fix onward loses the chaining intent.
-   */
-  runAllPixel?: boolean;
   /** Plan mode display/restriction state. */
   planMode?: boolean;
   /** Whether pre-final ideal review is enabled for this UI session. */
@@ -411,7 +403,7 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
     sessionId: config.sessionId,
     sessionTitle: undefined,
     sessionTitleGenerated: false,
-    overlay: config.initialOverlay ?? null,
+    overlay: null,
     planAutoExpand: false,
     pendingAction: undefined,
     planMode: config.planModeRef?.current ?? false,
@@ -595,8 +587,6 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
             planModeRef: config.planModeRef,
             skills: config.skills,
             checkpointStore: config.checkpointStore,
-            initialOverlay: config.initialOverlay,
-            rebuildToolsForCwd: config.rebuildToolsForCwd,
             rebuildReadTool: config.rebuildReadTool,
             connectInitialMcpTools: config.connectInitialMcpTools,
             planCallbacks: config.planCallbacks,

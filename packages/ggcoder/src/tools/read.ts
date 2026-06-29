@@ -7,6 +7,7 @@ import { truncateHead } from "./truncate.js";
 import { writeOverflow } from "./overflow.js";
 import { localOperations, type ToolOperations } from "./operations.js";
 import { recordRead, type ReadTracker } from "./read-tracker.js";
+import { lineHash } from "../core/hashline.js";
 import {
   IMAGE_EXTENSIONS,
   IMAGE_MEDIA_TYPES,
@@ -75,6 +76,13 @@ const ReadParams = z.object({
     .optional()
     .describe("Line number to start reading from (1-based)"),
   limit: z.number().int().min(1).optional().describe("Maximum number of lines to read"),
+  anchors: z
+    .boolean()
+    .optional()
+    .describe(
+      "Prefix each line with a stable `hash│` content anchor so a later `edit` can target lines " +
+        "by anchor and reject stale edits. Default false.",
+    ),
 });
 
 export function createReadTool(
@@ -104,7 +112,7 @@ export function createReadTool(
         : "") +
       "Other binary files return a notice instead of content.",
     parameters: ReadParams,
-    async execute({ file_path, offset, limit }, context) {
+    async execute({ file_path, offset, limit, anchors }, context) {
       const resolved = resolvePath(cwd, file_path);
       await rejectSymlink(resolved);
       const ext = path.extname(resolved).toLowerCase();
@@ -230,13 +238,18 @@ export function createReadTool(
       const content = lines.join("\n");
       const result = truncateHead(content);
 
-      // Prepend line numbers (cat -n style)
+      // Prepend line numbers (cat -n style). With `anchors`, also prefix each
+      // line with a `hash│` content anchor. The hash is computed from the REAL
+      // file line content and its REAL 0-based file index (startLine + i) so it
+      // matches exactly what edit's anchor guard verifies against the file bytes
+      // — anchors are display-only and never touch the tracked content.
       const actualStart = startLine + 1;
       const numbered = result.content
         .split("\n")
         .map((line, i) => {
           const lineNum = String(actualStart + i).padStart(6, " ");
-          return `${lineNum}\t${line}`;
+          const numberedLine = `${lineNum}\t${line}`;
+          return anchors ? `${lineHash(line, startLine + i)}│${numberedLine}` : numberedLine;
         })
         .join("\n");
 
