@@ -1,10 +1,11 @@
-import { memo, useCallback, useMemo, useRef, useState } from "react";
+import { memo, useCallback, useContext, useMemo, useRef, useState, createContext } from "react";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import rehypeHighlight from "rehype-highlight";
-import { Check, Copy } from "lucide-react";
+import { Check, Copy, CornerDownLeft } from "lucide-react";
 import { openUrl } from "@tauri-apps/plugin-opener";
-import { openProjectPath } from "./agent";
+import { openProjectPath, sendPrompt } from "./agent";
+import { codeLanguage, codeNodeText } from "./markdown-prompt";
 import { marked } from "marked";
 import "highlight.js/styles/github-dark.css";
 
@@ -103,6 +104,75 @@ function selectWordAtPoint(x: number, y: number): boolean {
 }
 
 /**
+ * True once the surrounding Ken bubble has FINISHED streaming. While Ken is
+ * still typing the prompt, this is false and the "Send to GG Coder" button is
+ * withheld so the user can't fire a half-written prompt by accident. Defaults to
+ * true so ordinary (non-streaming) renders — resumed history, GG Coder text —
+ * always show the button. Provided by Markdown; consumed by PromptBlock.
+ */
+const PromptReadyContext = createContext(true);
+
+/**
+ * Handler the "Send to GG Coder" button calls when clicked. App provides one
+ * that pushes a shimmering "Sent to GG Coder" user bubble into the transcript
+ * (like a slash command renders) and then sends the prompt. Defaults to null, in
+ * which case the button falls back to sending directly with no transcript row
+ * (safe for any render outside App). */
+const PromptSendContext = createContext<((text: string) => void) | null>(null);
+
+/**
+ * A Ken-recommended GG Coder prompt. Ken wraps every runnable prompt in a
+ * ```prompt fence; we render the body in a styled block with a "Send to GG
+ * Coder" button that fires it into the build session exactly as if the user
+ * typed it. The button only appears once Ken's reply has finished streaming
+ * (PromptReadyContext), and once sent it stays "Sent" so it's clear it landed.
+ */
+function PromptBlock({ body }: { body: string }): React.ReactElement {
+  const ready = useContext(PromptReadyContext);
+  const onSend = useContext(PromptSendContext);
+  const [sent, setSent] = useState(false);
+  const send = useCallback(() => {
+    const text = body.replace(/\n$/, "").trim();
+    if (!text) return;
+    // Route through App so it can render the shimmering "Sent to GG Coder" user
+    // bubble; fall back to a direct send if no handler is provided. Stays "Sent"
+    // (disabled) afterward so the user can see it landed and can't double-fire.
+    if (onSend) onSend(text);
+    else void sendPrompt(text).catch(() => {});
+    setSent(true);
+  }, [body, onSend]);
+  return (
+    <div className="ken-prompt-block">
+      <pre className="ken-prompt-body">{body.replace(/\n$/, "")}</pre>
+      {ready && (
+        <button
+          type="button"
+          className={`ken-prompt-send${sent ? " sent" : ""}`}
+          onClick={send}
+          disabled={sent}
+          title={sent ? "Sent to GG Coder" : "Send this prompt to GG Coder"}
+        >
+          {sent ? <Check size={12} /> : <CornerDownLeft size={12} />}
+          {sent ? "Sent" : "Send to GG Coder"}
+        </button>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Dispatch for ReactMarkdown's `pre` override. Hook-free so the branch is safe:
+ * a ```prompt fence (Ken's runnable-prompt contract) renders as a PromptBlock
+ * with a "Send to GG Coder" button; everything else is a normal CodeBlock.
+ */
+function PreBlock({ children }: { children?: React.ReactNode }): React.ReactElement {
+  if (codeLanguage(children) === "prompt") {
+    return <PromptBlock body={codeNodeText(children)} />;
+  }
+  return <CodeBlock>{children}</CodeBlock>;
+}
+
+/**
  * A fenced code block wrapped with a hover-revealed copy button. The raw text
  * is read from the rendered `<pre>` (so it includes the exact code, minus the
  * syntax-highlight markup). Double-click is handled manually (see
@@ -166,20 +236,44 @@ function parseMarkdownIntoBlocks(markdown: string): string[] {
   }
 }
 
+/**
+ * Whether a marked block's raw text is a COMPLETE ```prompt fence (closing ```
+ * present), as opposed to one still being streamed. marked auto-closes an open
+ * fence into a code token at EOF, so a closed block's raw ends with ``` while a
+ * still-streaming one ends with the body. This is what reveals Ken's "Send to GG
+ * Coder" button the instant the prompt finishes, not when his whole reply ends.
+ */
+function isPromptBlockComplete(raw: string): boolean {
+  const t = raw.trim();
+  if (!/^`{3,}[ \t]*prompt\b/i.test(t)) return false;
+  const firstNewline = t.indexOf("\n");
+  if (firstNewline === -1) return false; // only the opening line so far
+  const body = t.slice(firstNewline + 1).trimEnd();
+  return /`{3,}\s*$/.test(body);
+}
+
 const MemoizedMarkdownBlock = memo(
-  function MarkdownBlock({ content }: { content: string }): React.ReactElement {
+  function MarkdownBlock({
+    content,
+    promptReady,
+  }: {
+    content: string;
+    promptReady: boolean;
+  }): React.ReactElement {
     const normalized = content.replace(/\\n/g, "\n").replace(/^\n+|\n+$/g, "");
     return (
-      <ReactMarkdown
-        remarkPlugins={[remarkGfm]}
-        rehypePlugins={[rehypeHighlight]}
-        components={{ a: ExternalLink, pre: CodeBlock }}
-      >
-        {normalized}
-      </ReactMarkdown>
+      <PromptReadyContext.Provider value={promptReady}>
+        <ReactMarkdown
+          remarkPlugins={[remarkGfm]}
+          rehypePlugins={[rehypeHighlight]}
+          components={{ a: ExternalLink, pre: PreBlock }}
+        >
+          {normalized}
+        </ReactMarkdown>
+      </PromptReadyContext.Provider>
     );
   },
-  (prev, next) => prev.content === next.content,
+  (prev, next) => prev.content === next.content && prev.promptReady === next.promptReady,
 );
 
 /**
@@ -196,8 +290,20 @@ export const Markdown = memo(function Markdown({ children }: Props): React.React
   return (
     <div className="markdown">
       {blocks.map((block, index) => (
-        <MemoizedMarkdownBlock key={index} content={block} />
+        // A ```prompt block reveals its "Send to GG Coder" button as soon as ITS
+        // own closing fence arrives (per-block), not when the whole reply ends —
+        // so the button shows right after Ken finishes the prompt even if he
+        // keeps talking after it.
+        <MemoizedMarkdownBlock
+          key={index}
+          content={block}
+          promptReady={isPromptBlockComplete(block)}
+        />
       ))}
     </div>
   );
 });
+
+/** Provider for the "Send to GG Coder" click handler. App wraps the transcript
+ *  with this so prompt-block buttons push a transcript row + send. */
+export const PromptSendProvider = PromptSendContext.Provider;

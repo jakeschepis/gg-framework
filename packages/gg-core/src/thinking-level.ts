@@ -34,7 +34,7 @@ function isAnthropicOpus48Or47Model(provider: Provider, model: string): boolean 
 
 function isAnthropicAdaptiveModel(provider: Provider, model: string): boolean {
   return (
-    provider === "anthropic" && /opus-4-8|opus-4-7|opus-4-6|sonnet-4-6|fable-5|mythos-5/.test(model)
+    provider === "anthropic" && /opus-4-8|opus-4-7|opus-4-6|sonnet-5|fable-5|mythos-5/.test(model)
   );
 }
 

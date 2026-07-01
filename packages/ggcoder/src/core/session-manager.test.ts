@@ -3,7 +3,12 @@ import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import { SessionManager, type SessionEntry } from "./session-manager.js";
+import {
+  SessionManager,
+  KEN_TURN_CUSTOM_KIND,
+  type SessionEntry,
+  type CustomEntry,
+} from "./session-manager.js";
 
 const tempDirs: string[] = [];
 
@@ -65,6 +70,78 @@ describe("SessionManager persistence failure handling", () => {
     const lines = content.trim().split("\n");
     expect(lines).toHaveLength(2);
     expect(JSON.parse(lines[1] ?? "")).toMatchObject({ type: "message", id: "ok" });
+  });
+});
+
+function kenEntry(id: string, data: unknown, kind: string = KEN_TURN_CUSTOM_KIND): CustomEntry {
+  return { type: "custom", kind, id, parentId: null, timestamp: new Date().toISOString(), data };
+}
+
+describe("SessionManager.getKenTurns", () => {
+  const manager = new SessionManager("/unused");
+
+  it("reads valid Ken turns in file order", () => {
+    const entries: SessionEntry[] = [
+      kenEntry("k1", { version: 1, question: "what next?", reply: "do X", afterMessageCount: 0 }),
+      entry("m1"),
+      kenEntry("k2", { version: 1, question: "and now?", reply: "do Y", afterMessageCount: 1 }),
+    ];
+    const turns = manager.getKenTurns(entries);
+    expect(turns).toHaveLength(2);
+    expect(turns[0]).toMatchObject({ question: "what next?", reply: "do X", afterMessageCount: 0 });
+    expect(turns[1]).toMatchObject({ question: "and now?", reply: "do Y", afterMessageCount: 1 });
+  });
+
+  it("ignores message entries and other custom kinds", () => {
+    const entries: SessionEntry[] = [
+      entry("m1"),
+      kenEntry("d1", { version: 1, item: { kind: "x", id: "y" } }, "display_item"),
+      kenEntry("k1", { version: 1, question: "q", reply: "r", afterMessageCount: 2 }),
+    ];
+    expect(manager.getKenTurns(entries)).toHaveLength(1);
+  });
+
+  it("drops malformed Ken payloads (missing fields / wrong version)", () => {
+    const entries: SessionEntry[] = [
+      kenEntry("k1", { version: 2, question: "q", reply: "r" }),
+      kenEntry("k2", { version: 1, question: "q" }),
+      kenEntry("k3", { version: 1, reply: "r" }),
+      kenEntry("k4", null),
+      kenEntry("k5", { version: 1, question: "ok", reply: "good", afterMessageCount: 3 }),
+    ];
+    const turns = manager.getKenTurns(entries);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({ question: "ok", reply: "good", afterMessageCount: 3 });
+  });
+
+  it("defaults a missing afterMessageCount to 0", () => {
+    const turns = manager.getKenTurns([kenEntry("k1", { version: 1, question: "q", reply: "r" })]);
+    expect(turns[0]?.afterMessageCount).toBe(0);
+  });
+
+  it("round-trips Ken turns through a written session file", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager2 = new SessionManager(sessionsDir);
+    const created = await manager2.create(sessionsDir, "anthropic", "test-model");
+    await manager2.appendEntry(created.path, entry("m1"));
+    await manager2.appendEntry(
+      created.path,
+      kenEntry("k1", {
+        version: 1,
+        question: "persist me",
+        reply: "persisted",
+        afterMessageCount: 1,
+      }),
+    );
+    const loaded = await manager2.load(created.path);
+    // The Ken turn must NOT appear in the LLM message history.
+    const msgs = manager2.getMessages(loaded.entries, loaded.header.leafId);
+    expect(msgs.every((m) => m.role !== "system")).toBe(true);
+    expect(JSON.stringify(msgs)).not.toContain("persist me");
+    // But it must be readable as a Ken turn.
+    const turns = manager2.getKenTurns(loaded.entries);
+    expect(turns).toHaveLength(1);
+    expect(turns[0]).toMatchObject({ question: "persist me", reply: "persisted" });
   });
 });
 

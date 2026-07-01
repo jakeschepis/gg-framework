@@ -119,7 +119,7 @@ function printHelpAndExit(): never {
       c(COLORS.textDim, "       model for the orchestrator (default: claude-opus-4-8)\n") +
       "  " +
       c(COLORS.primary, "--worker-model <id>") +
-      c(COLORS.textDim, "     model for workers (default: claude-sonnet-4-6)\n") +
+      c(COLORS.textDim, "     model for workers (default: claude-sonnet-5)\n") +
       "  " +
       c(COLORS.primary, "--help, -h") +
       c(COLORS.textDim, "              show this help\n\n") +
@@ -185,7 +185,7 @@ async function runServeSubcommand(argv: string[]): Promise<void> {
     bossProvider: settings.bossProvider ?? "anthropic",
     bossModel: cliBossModel ?? settings.bossModel ?? "claude-opus-4-8",
     workerProvider: settings.workerProvider ?? "anthropic",
-    workerModel: cliWorkerModel ?? settings.workerModel ?? "claude-sonnet-4-6",
+    workerModel: cliWorkerModel ?? settings.workerModel ?? "claude-sonnet-5",
   });
 
   await runBossServeMode({
@@ -304,7 +304,7 @@ async function runOrchestrator(args: CliArgs): Promise<void> {
   const preferredBossProvider = args.bossProvider ?? settings.bossProvider ?? "anthropic";
   const preferredBossModel = args.bossModel ?? settings.bossModel ?? "claude-opus-4-8";
   const preferredWorkerProvider = args.workerProvider ?? settings.workerProvider ?? "anthropic";
-  const preferredWorkerModel = args.workerModel ?? settings.workerModel ?? "claude-sonnet-4-6";
+  const preferredWorkerModel = args.workerModel ?? settings.workerModel ?? "claude-sonnet-5";
 
   // Fall back to a logged-in provider instead of crashing when the saved
   // boss/worker provider isn't authenticated (matches ggcoder startup).

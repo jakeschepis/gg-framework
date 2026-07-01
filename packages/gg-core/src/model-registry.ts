@@ -1,4 +1,5 @@
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
+import { XIAOMI_CREDITS_KEY } from "./auth-storage.js";
 
 export interface ModelInfo {
   id: string;
@@ -33,7 +34,7 @@ export interface ModelInfo {
    * enabled to pick the strongest setting per model:
    *   - OpenAI GPT-5.5-era: `xhigh`
    *   - OpenAI Pro/Codex/old: clamped to what the model accepts
-   *   - Claude Fable 5 / Mythos 5, Opus 4.8 / 4.7 / 4.6 and Sonnet 4.6: `max`
+   *   - Claude Fable 5 / Mythos 5, Opus 4.8 / 4.7 / 4.6 and Sonnet 5: `max`
    *     (Fable 5 / Mythos 5 use always-on adaptive thinking, low→max ladder)
    *   - Claude Haiku 4.5: `high` (no adaptive `max` tier)
    *   - GLM / Moonshot / Xiaomi / MiniMax / Qwen: `high` — binary-thinking
@@ -41,6 +42,22 @@ export interface ModelInfo {
    *   - DeepSeek V4: `xhigh` (DeepSeek maps `xhigh` → its internal `max`)
    */
   maxThinkingLevel: ThinkingLevel;
+  /**
+   * Ordered preference of auth-storage keys this model resolves credentials
+   * from, for providers that split auth across multiple distinct
+   * endpoints/keys (currently only Xiaomi: the Token Plan endpoint vs. the
+   * API Credits endpoint). The first key with stored credentials wins, so a
+   * model can both prefer one endpoint AND fall back to another the user has
+   * configured instead:
+   *   - `mimo-v2.5-pro` / `mimo-v2.5`: `["xiaomi", XIAOMI_CREDITS_KEY]` —
+   *     prefer the Token Plan, fall back to API Credits (API Credits serves
+   *     every MiMo model, so a Credits-only user still reaches these).
+   *   - `mimo-v2.5-pro-ultraspeed`: `[XIAOMI_CREDITS_KEY]` only — not served
+   *     over the Token Plan endpoint, so there's no fallback to it.
+   * Falls back to `[provider]` — the normal single-credential case — when
+   * unset. Read via `getAuthStorageKeys()` / `getAuthStorageKey()`.
+   */
+  authStorageKeys?: string[];
 }
 
 // Provider display order — mirrors `PROVIDERS` in ui/login.tsx so the
@@ -91,11 +108,11 @@ export const MODELS: ModelInfo[] = [
     maxThinkingLevel: "max",
   },
   {
-    id: "claude-sonnet-4-6",
-    name: "Claude Sonnet 4.6",
+    id: "claude-sonnet-5",
+    name: "Claude Sonnet 5",
     provider: "anthropic",
     contextWindow: 1_000_000,
-    maxOutputTokens: 64_000,
+    maxOutputTokens: 128_000,
     supportsThinking: true,
     supportsImages: true,
     supportsVideo: false,
@@ -315,6 +332,24 @@ export const MODELS: ModelInfo[] = [
     supportsVideo: false,
     costTier: "medium",
     maxThinkingLevel: "high",
+    authStorageKeys: ["xiaomi", XIAOMI_CREDITS_KEY],
+  },
+  // UltraSpeed: lower-latency sibling of the Pro coding flagship, same
+  // text-only capability surface, premium-priced for the throughput gain.
+  // API-only — not served over the Token Plan endpoint, so credentials
+  // resolve from the distinct API Credits key only (see authStorageKeys doc).
+  {
+    id: "mimo-v2.5-pro-ultraspeed",
+    name: "MiMo-V2.5-Pro-UltraSpeed",
+    provider: "xiaomi",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 131_072,
+    supportsThinking: true,
+    supportsImages: false,
+    supportsVideo: false,
+    costTier: "high",
+    maxThinkingLevel: "high",
+    authStorageKeys: [XIAOMI_CREDITS_KEY],
   },
   // Omni series: native full-modal understanding (image + audio + video).
   // Video/image ride the OpenAI-compatible transport as base64 data URLs
@@ -331,6 +366,7 @@ export const MODELS: ModelInfo[] = [
     maxVideoBytes: 36 * 1024 * 1024,
     costTier: "medium",
     maxThinkingLevel: "high",
+    authStorageKeys: ["xiaomi", XIAOMI_CREDITS_KEY],
   },
   // ── DeepSeek ───────────────────────────────────────────
   {
@@ -381,6 +417,24 @@ export function getModelsForProvider(provider: Provider): ModelInfo[] {
   return MODELS.filter((m) => m.provider === provider);
 }
 
+/**
+ * Ordered auth-storage keys to try resolving credentials from for
+ * `(provider, model)`, first match wins. Almost every model just uses its
+ * provider id (one credential per provider). Models with `authStorageKeys`
+ * set (currently only Xiaomi) can prefer one endpoint and fall back to
+ * another — e.g. `mimo-v2.5-pro` prefers the Token Plan but falls back to API
+ * Credits, while the API-only `mimo-v2.5-pro-ultraspeed` has no fallback.
+ */
+export function getAuthStorageKeys(provider: Provider, modelId: string): string[] {
+  const model = MODELS.find((m) => m.id === modelId && m.provider === provider);
+  return model?.authStorageKeys ?? [provider];
+}
+
+/** The preferred (first) auth-storage key for `(provider, model)` — see `getAuthStorageKeys()`. */
+export function getAuthStorageKey(provider: Provider, modelId: string): string {
+  return getAuthStorageKeys(provider, modelId)[0]!;
+}
+
 /** Default video payload cap (bytes) when a video model doesn't declare one. */
 export const DEFAULT_MAX_VIDEO_BYTES = 20 * 1024 * 1024;
 
@@ -405,7 +459,7 @@ export function getDefaultModel(provider: Provider): ModelInfo {
   if (provider === "deepseek") return MODELS.find((m) => m.id === "deepseek-v4-pro")!;
   if (provider === "openrouter") return MODELS.find((m) => m.id === "qwen/qwen3.6-plus")!;
   if (provider === "sakana") return MODELS.find((m) => m.id === "fugu")!;
-  return MODELS.find((m) => m.id === "claude-sonnet-4-6")!;
+  return MODELS.find((m) => m.id === "claude-sonnet-5")!;
 }
 
 export interface ContextWindowOptions {
@@ -436,7 +490,7 @@ export function getMaxThinkingLevel(modelId: string): ThinkingLevel {
 
 /**
  * Get the model to use for compaction summarization.
- * - Anthropic: always Sonnet 4.6
+ * - Anthropic: always Sonnet 5
  * - OpenAI: cheapest (Codex Mini)
  * - Gemini: use the current model
  * - GLM: GLM-4.7 Flash (cheap alternative)
@@ -444,7 +498,7 @@ export function getMaxThinkingLevel(modelId: string): ThinkingLevel {
  */
 export function getSummaryModel(provider: Provider, currentModelId: string): ModelInfo {
   if (provider === "anthropic") {
-    return MODELS.find((m) => m.id === "claude-sonnet-4-6")!;
+    return MODELS.find((m) => m.id === "claude-sonnet-5")!;
   }
   if (provider === "openai" || provider === "glm" || provider === "deepseek") {
     const low = getModelsForProvider(provider).find((m) => m.costTier === "low");

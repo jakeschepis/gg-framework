@@ -47,7 +47,10 @@ export const TOOL_PROMPT_HINTS: Record<string, string> = {
  * equivalent to the full per-tool hint list in the prompt-bench ablation
  * while costing ~95% fewer words.
  */
-export const TOOL_STEERING_CLAUSES: ReadonlyArray<{ needs: readonly string[]; text: string }> = [
+export const TOOL_STEERING_CLAUSES: ReadonlyArray<{
+  needs: readonly string[];
+  text: string;
+}> = [
   {
     needs: ["edit", "write"],
     text: "Prefer `edit` over `write` for changes to existing files.",
@@ -59,6 +62,10 @@ export const TOOL_STEERING_CLAUSES: ReadonlyArray<{ needs: readonly string[]; te
   {
     needs: ["code_search", "grep", "read"],
     text: "Prefer `code_search` for “where/how is X implemented” in TS/JS; use `grep` for exact strings or non-TS files.",
+  },
+  {
+    needs: ["read", "grep", "ls", "find"],
+    text: "Batch independent read-only calls (read, grep, ls, find) into one turn — they run in parallel, so it's faster than one per turn; only serialize a call that depends on a previous result.",
   },
 ];
 

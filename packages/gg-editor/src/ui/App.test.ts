@@ -10,7 +10,7 @@ describe("parseModelSelection", () => {
   });
 
   it("keeps bare model ids for backward compatibility", () => {
-    expect(parseModelSelection("claude-sonnet-4-6")).toEqual({ model: "claude-sonnet-4-6" });
+    expect(parseModelSelection("claude-sonnet-5")).toEqual({ model: "claude-sonnet-5" });
   });
 
   it("rejects malformed selector values", () => {

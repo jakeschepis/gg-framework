@@ -1,5 +1,59 @@
 # @kenkaiiii/ggcoder
 
+## 5.3.0
+
+### Minor Changes
+
+- Add Xiaomi MiMo-V2.5-Pro-UltraSpeed, served over a separate API Credits endpoint. Xiaomi auth now supports both the existing Token Plan key and a new API Credits key — `mimo-v2.5-pro`/`mimo-v2.5` prefer the Token Plan and fall back to API Credits when that's all that's configured, while UltraSpeed requires API Credits. `ggcoder login` and the desktop login modal both let you choose which endpoint to authenticate with.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.3.0
+- @kenkaiiii/gg-agent@5.3.0
+- @kenkaiiii/gg-core@5.3.0
+
+## 5.2.0
+
+### Minor Changes
+
+- Add Claude Sonnet 5 (`claude-sonnet-5`, 1M context, 128k output, adaptive thinking) replacing Sonnet 4.6, and fix the Anthropic non-streaming fallback so it no longer trips the SDK's "Streaming is required for operations that may take longer than 10 minutes" pre-flight throw on large max_tokens.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.2.0
+- @kenkaiiii/gg-agent@5.2.0
+- @kenkaiiii/gg-core@5.2.0
+
+## 5.1.2
+
+### Patch Changes
+
+- Add a tool-steering clause that nudges the model to batch independent read-only calls (read, grep, ls, find) into one turn, cutting round-trips since tool execution is already parallel.
+  - @kenkaiiii/gg-ai@5.1.2
+  - @kenkaiiii/gg-agent@5.1.2
+  - @kenkaiiii/gg-core@5.1.2
+
+## 5.1.1
+
+### Patch Changes
+
+- Fix the gg-app Ken mentor sidecar so it follows model switches after it has been created.
+  - @kenkaiiii/gg-ai@5.1.1
+  - @kenkaiiii/gg-agent@5.1.1
+  - @kenkaiiii/gg-core@5.1.1
+
+## 5.1.0
+
+### Minor Changes
+
+- Add Ken Kai, a read-only mentor agent: a second AgentSession scoped by an `allowedTools` allow-list plus an `allowedMcpServers` whitelist (kencode-search) so it can research real code but never mutate the repo, with its advisory turns persisted alongside the build session as non-LLM custom entries that survive resume and compaction.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.1.0
+- @kenkaiiii/gg-agent@5.1.0
+- @kenkaiiii/gg-core@5.1.0
+
 ## 5.0.0
 
 ### Major Changes

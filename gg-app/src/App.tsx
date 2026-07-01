@@ -4,6 +4,8 @@ import {
   waitForReady,
   getState,
   sendPrompt,
+  sendKenPrompt,
+  cancelKen,
   cancel,
   newSession,
   cycleThinking,
@@ -26,7 +28,6 @@ import {
   windowLabel,
   setWindowTitle,
   openProjectPath,
-  type SidecarEvent,
   type AgentState,
   type ModelOption,
   type SlashCommand,
@@ -37,8 +38,11 @@ import {
   enhancePrompt,
   type PromptSegment,
 } from "./agent";
-import { ActivityBar, formatTokenCount } from "./ActivityBar";
-import { LiveToolPanel, type LiveToolEntry, LIVE_TOOL_PANEL_ROWS } from "./LiveToolPanel";
+import { ActivityBar } from "./ActivityBar";
+import { KenActivityBar } from "./KenActivityBar";
+import { useKenMentor } from "./useKenMentor";
+import { useAgentEvents, HOOK_PRESENTATION, type HookKind } from "./useAgentEvents";
+import { LiveToolPanel, type LiveToolEntry } from "./LiveToolPanel";
 import { SubAgentFeed, type SubAgentLine } from "./SubAgentFeed";
 import { CompactionNotice } from "./CompactionNotice";
 import { ModelMenu } from "./ModelMenu";
@@ -64,17 +68,12 @@ import { BackButton } from "./BackButton";
 import { HomeScreen } from "./HomeScreen";
 import { Toaster } from "./Toaster";
 import { LoginScreen } from "./LoginScreen";
-import { Markdown } from "./Markdown";
+import { Markdown, PromptSendProvider } from "./Markdown";
 import { FooterSkeleton, TranscriptSkeleton, Skeleton } from "./Skeleton";
 import { useAppUpdate } from "./update";
 import { recoverPromptLabel } from "./prompt-labels";
 import { playSound } from "./sounds";
-import {
-  segmentDoneMarkers,
-  hasDoneMarker,
-  countPlanSteps,
-  findCompletedSteps,
-} from "./plan-steps";
+import { segmentDoneMarkers, hasDoneMarker, countPlanSteps } from "./plan-steps";
 import { Paperclip, AtSign } from "lucide-react";
 import { AttachmentBar } from "./AttachmentBar";
 import { EnhancedSegments } from "./PromptEnhancement";
@@ -83,9 +82,42 @@ import { toast } from "./toast";
 import { fileToPending, toWire, type PendingAttachment } from "./attachments";
 import "./App.css";
 
+const DEFAULT_INPUT_PLACEHOLDER = "Type a message, / commands, @ files, @Ken for help";
+const INPUT_PLACEHOLDERS = [
+  DEFAULT_INPUT_PLACEHOLDER,
+  "Need a second opinion? Ask @Ken",
+  "Stuck on what to do next? Ask @Ken",
+  DEFAULT_INPUT_PLACEHOLDER,
+  "Want a second set of eyes? Ask @Ken",
+  "Unsure how to proceed? Ask @Ken",
+  "Need a quick review? Ask @Ken",
+] as const;
+const RUNNING_INPUT_PLACEHOLDERS = [
+  "Agent is working. Add a follow-up if you want",
+  "Got another thought? Queue it here",
+  "Agent is on it. You can stack the next note",
+  "Thinking ahead? Drop the next instruction",
+  "Keep going. Your next message will queue up",
+] as const;
+const INPUT_PLACEHOLDER_INTERVAL_MS = 12_000;
+const PLACEHOLDER_SHUFFLE_CHARS = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+const PLACEHOLDER_SHUFFLE_FRAMES = 18;
+const PLACEHOLDER_SHUFFLE_FRAME_MS = 24;
+
+function shufflePlaceholderFrame(target: string, frame: number): string {
+  const revealCount = Math.ceil((target.length * frame) / PLACEHOLDER_SHUFFLE_FRAMES);
+  return Array.from(target, (char, index) => {
+    if (index < revealCount || /\s|[.,?/@]/.test(char)) return char;
+    const pick = Math.floor(Math.random() * PLACEHOLDER_SHUFFLE_CHARS.length);
+    return PLACEHOLDER_SHUFFLE_CHARS[pick];
+  }).join("");
+}
+
 // ── Transcript model ───────────────────────────────────────
 // Tool activity lives in the pinned LiveToolPanel, never in the transcript.
-type Item =
+// Exported (type-only) so the Ken mentor hook can produce/typecheck ken + error
+// transcript items without a runtime import cycle.
+export type Item =
   // `command` marks a workflow slash command — rendered as just the short
   // `/name` with a highlight + shimmer, never the expanded prompt body.
   // `label` overrides what's shown with a friendly shimmer phrase (e.g.
@@ -104,8 +136,19 @@ type Item =
       // True while this message is still waiting in the mid-run steering queue.
       // Rendered dimmed; cleared at run_end once the agent has consumed it.
       queued?: boolean;
+      // True when this prompt was addressed to Ken (`@Ken …`). Renders the bubble
+      // in Ken's color so the transcript shows it went to the mentor, not GG Coder.
+      ken?: boolean;
+      // True when this bubble came from clicking a "Send to GG Coder" button on
+      // one of Ken's recommended prompts. Renders as a shimmering "Sent to GG
+      // Coder" label in Ken's color (like a slash command shows `/name`), instead
+      // of the full prompt body that was actually sent to GG Coder.
+      kenSent?: boolean;
     }
   | { kind: "assistant"; id: number; text: string }
+  // Ken Kai (mentor agent) reply — magenta-tinted bubble + "Ken Kai" badge,
+  // streamed from the ken_* SSE events. Never mistaken for GG Coder.
+  | { kind: "ken"; id: number; text: string }
   | { kind: "info"; id: number; text: string }
   | { kind: "error"; id: number; text: string }
   // Agent self-correction hook notice (ideal review / loop-break / re-grounding),
@@ -138,30 +181,6 @@ export interface TranscriptImage {
   /** Source file path, shown as a caption + used as a stable key. */
   path?: string;
 }
-
-/** Tool detail image preview (screenshot / read), mirrors the sidecar shape. */
-interface ImagePreview {
-  base64: string;
-  mediaType: string;
-  path?: string;
-}
-
-// Hook kind → notice copy + tone color, mirroring the TUI's app-items.ts.
-type HookKind = "ideal" | "loop_break" | "regrounding";
-const HOOK_PRESENTATION: Record<HookKind, { text: string; color: string }> = {
-  ideal: {
-    text: "Hook engaged. Running an ideal review before finalizing.",
-    color: theme.secondary,
-  },
-  loop_break: {
-    text: "Hook engaged. Breaking a stuck loop and rethinking the approach.",
-    color: theme.warning,
-  },
-  regrounding: {
-    text: "Hook engaged. Re-grounding on the original request after compaction.",
-    color: theme.primary,
-  },
-};
 
 let idSeq = 0;
 const nextId = (): number => ++idSeq;
@@ -198,60 +217,28 @@ function thinkingColor(level: string | null | undefined): string {
   return MAX_POWER_COLOR; // xhigh / max
 }
 
-function formatElapsed(ms: number): string {
-  const s = Math.round(ms / 1000);
-  if (s < 60) return `${s}s`;
-  const m = Math.floor(s / 60);
-  const r = s % 60;
-  return r > 0 ? `${m}m ${r}s` : `${m}m`;
-}
-
-// Port of packages/ggcoder/src/ui/duration-summary.ts, adapted to the sidecar's
-// underscore tool names. Picks a contextual done-verb from which tools ran.
-function pickDoneVerb(toolsUsed: ReadonlySet<string>): string {
-  const has = (name: string): boolean => toolsUsed.has(name);
-  const writing = has("edit") || has("write");
-  const reading = has("read") || has("grep") || has("find") || has("ls");
-
-  if (has("subagent") && writing) return "Orchestrated changes in";
-  if (has("subagent")) return "Delegated work in";
-  if (has("web_fetch") && writing) return "Researched & coded in";
-  if (has("web_fetch") && reading) return "Researched in";
-  if (has("web_fetch")) return "Fetched the web in";
-  if (has("bash") && writing) return "Built & ran in";
-  if (has("edit") && has("write")) return "Crafted code in";
-  if (has("edit") && has("bash")) return "Refactored & tested in";
-  if (has("edit")) return "Refactored in";
-  if (has("write") && has("bash")) return "Wrote & ran in";
-  if (has("write")) return "Wrote code in";
-  if (has("bash") && has("grep")) return "Hacked away in";
-  if (has("bash") && reading) return "Ran & investigated in";
-  if (has("bash")) return "Executed commands in";
-  if (has("grep") && has("read")) return "Investigated in";
-  if (has("grep") && has("find")) return "Scoured the codebase in";
-  if (has("grep")) return "Searched in";
-  if (has("read") && has("find")) return "Explored in";
-  if (has("read")) return "Studied the code in";
-  if (has("find") || has("ls")) return "Browsed files in";
-
-  const phrases = [
-    "Brewed up a response in",
-    "Cooked up an answer in",
-    "Worked out a reply in",
-    "Conjured a response in",
-    "Pondered for",
-    "Reasoned for",
-  ];
-  return phrases[Math.floor(Math.random() * phrases.length)] ?? "Worked in";
-}
-
 function hasDraggedFiles(dataTransfer: DataTransfer | null): boolean {
   return Array.from(dataTransfer?.types ?? []).includes("Files");
 }
 
 function App(): React.ReactElement {
   const [items, setItems] = useState<Item[]>([]);
+  // Ken Kai (mentor agent): own running flag, token/thinking metrics, streaming
+  // bubble, and `ken_*` SSE handling. Lives in its own hook; App just consumes
+  // the state for rendering and delegates ken events to `handleKenEvent`.
+  const {
+    kenRunning,
+    kenTokens,
+    kenRunStartTs,
+    kenIsThinking,
+    kenThinkingStartTs,
+    kenThinkingAccumMs,
+    handleKenEvent,
+  } = useKenMentor({ setItems, nextId });
   const [input, setInput] = useState("");
+  const [placeholderIndex, setPlaceholderIndex] = useState(0);
+  const [displayPlaceholder, setDisplayPlaceholder] = useState(DEFAULT_INPUT_PLACEHOLDER);
+  const displayPlaceholderRef = useRef(DEFAULT_INPUT_PLACEHOLDER);
   // Shell-style prompt history for ↑/↓ recall in the chat input. Newest entries
   // last. `historyIndex` is null while editing a fresh draft; stepping ↑ walks
   // backwards into history, ↓ forwards. `historyDraftRef` stashes the in-progress
@@ -423,25 +410,11 @@ function App(): React.ReactElement {
   const stateRef = useRef<AgentState | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
-  const streamingIdRef = useRef<number | null>(null);
-  // Transcript id of the active sub-agent group for this run (null until the
-  // first subagent spawns). Lets later parallel agents join the same in-chat
-  // feed instead of each opening a fresh block.
-  const subagentGroupIdRef = useRef<number | null>(null);
-  // Transcript id of the in-flight compaction notice, so compaction_end can
-  // flip the same row from shimmer → summary instead of pushing a new line.
-  const compactionIdRef = useRef<number | null>(null);
-  const runStartRef = useRef<number>(0);
-  const toolsUsedRef = useRef<Set<string>>(new Set());
-  const tokensRef = useRef<number>(0);
-  // Accumulated assistant text this run, for detecting [DONE:n] plan-step
-  // markers that may split across deltas.
-  const assistantTextRef = useRef<string>("");
-  // Thinking spans: start timestamp of the active span (or null), plus the sum
-  // of completed spans this run. Refs are the source of truth; state mirrors
-  // them for render. Finalizing a span happens outside setState updaters.
-  const thinkingStartRef = useRef<number | null>(null);
-  const thinkingAccumRef = useRef<number>(0);
+  // NOTE: the build-session event machine's private refs (streaming bubble id,
+  // rAF buffer, per-run accumulators, sub-agent / compaction group ids) now live
+  // inside the useAgentEvents hook. Only the cross-cutting refs that App's render
+  // + other handlers also touch (stateRef above, the plan refs + stickToBottom
+  // below) stay here and are passed into the hook.
 
   // Whether the transcript is "pinned" to the bottom. Auto-scroll only runs
   // while pinned. The user scrolling up un-pins it — so they can read freely
@@ -516,6 +489,40 @@ function App(): React.ReactElement {
   useEffect(() => {
     stateRef.current = state;
   }, [state]);
+
+  const inputPlaceholder = running
+    ? RUNNING_INPUT_PLACEHOLDERS[placeholderIndex % RUNNING_INPUT_PLACEHOLDERS.length]
+    : INPUT_PLACEHOLDERS[placeholderIndex % INPUT_PLACEHOLDERS.length];
+  const setAnimatedPlaceholder = useCallback((text: string) => {
+    displayPlaceholderRef.current = text;
+    setDisplayPlaceholder(text);
+  }, []);
+  useEffect(() => {
+    if (input.length > 0) return;
+    const id = window.setInterval(() => {
+      setPlaceholderIndex((i) => i + 1);
+    }, INPUT_PLACEHOLDER_INTERVAL_MS);
+    return () => window.clearInterval(id);
+  }, [input.length]);
+  useEffect(() => {
+    if (input.length > 0) {
+      setAnimatedPlaceholder(inputPlaceholder);
+      return;
+    }
+    if (displayPlaceholderRef.current === inputPlaceholder) return;
+
+    let frame = 0;
+    const id = window.setInterval(() => {
+      frame += 1;
+      const text =
+        frame >= PLACEHOLDER_SHUFFLE_FRAMES
+          ? inputPlaceholder
+          : shufflePlaceholderFrame(inputPlaceholder, frame);
+      setAnimatedPlaceholder(text);
+      if (frame >= PLACEHOLDER_SHUFFLE_FRAMES) window.clearInterval(id);
+    }, PLACEHOLDER_SHUFFLE_FRAME_MS);
+    return () => window.clearInterval(id);
+  }, [input.length, inputPlaceholder, setAnimatedPlaceholder]);
 
   // Stop the browser from navigating to / opening a file dropped anywhere
   // (which would replace the whole UI with the raw file). The active chat view
@@ -683,538 +690,42 @@ function App(): React.ReactElement {
     return () => document.removeEventListener("click", onClick, true);
   }, []);
 
-  // Side effects (nextId, ref mutation) happen outside the updater — updaters
-  // must stay pure since React may invoke them more than once.
-  //
-  // Throttled via requestAnimationFrame: text_delta events arrive at 50-100/sec.
-  // Without throttling, each triggers a full React re-render + markdown re-parse.
-  // We buffer chunks in a ref and flush once per animation frame (~16ms),
-  // reducing re-renders by 5-10× with no visible difference.
-  const pendingChunksRef = useRef<string>("");
-  const rafIdRef = useRef<number | null>(null);
-
-  const flushChunks = useCallback(() => {
-    rafIdRef.current = null;
-    const chunk = pendingChunksRef.current;
-    if (!chunk) return;
-    pendingChunksRef.current = "";
-    const current = streamingIdRef.current;
-    if (current === null) return; // streaming ended while waiting
-    setItems((prev) =>
-      prev.map((it) =>
-        it.kind === "assistant" && it.id === current ? { ...it, text: it.text + chunk } : it,
-      ),
-    );
-  }, []);
-
-  const appendAssistant = useCallback(
-    (text: string) => {
-      const current = streamingIdRef.current;
-      if (current === null) {
-        // First token of a new assistant turn: create immediately (no delay
-        // on first paint — the user should see the bubble appear right away).
-        const id = nextId();
-        streamingIdRef.current = id;
-        setItems((prev) => [...prev, { kind: "assistant", id, text }]);
-      } else {
-        // Subsequent tokens: buffer and flush via rAF
-        pendingChunksRef.current += text;
-        if (rafIdRef.current === null) {
-          rafIdRef.current = requestAnimationFrame(flushChunks);
-        }
-      }
-    },
-    [flushChunks],
-  );
-
-  // Flush any pending buffered text and end the current streaming section.
-  // Called whenever streaming transitions to tool calls, a new prompt, etc.
-  // Without this, the last few buffered tokens (waiting for rAF) would be lost.
-  const endStreamingText = useCallback(() => {
-    if (rafIdRef.current !== null) {
-      cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
-    }
-    if (pendingChunksRef.current) {
-      const chunk = pendingChunksRef.current;
-      pendingChunksRef.current = "";
-      const current = streamingIdRef.current;
-      if (current !== null) {
-        setItems((prev) =>
-          prev.map((it) =>
-            it.kind === "assistant" && it.id === current ? { ...it, text: it.text + chunk } : it,
-          ),
-        );
-      }
-    }
-    streamingIdRef.current = null;
-  }, []);
-
-  const pushItem = useCallback((item: Item) => {
-    setItems((prev) => [...prev, item]);
-  }, []);
-
-  // End the active thinking span (if any), folding its duration into the
-  // accumulator. Called when text/tools begin or the run ends. Side effects on
-  // refs happen here, outside any setState updater, keeping updaters pure.
-  const finalizeThinking = useCallback(() => {
-    const start = thinkingStartRef.current;
-    if (start !== null) {
-      thinkingAccumRef.current += Date.now() - start;
-      thinkingStartRef.current = null;
-      setThinkingAccumMs(thinkingAccumRef.current);
-      setThinkingStartTs(null);
-    }
-    setIsThinking(false);
-  }, []);
-
-  const handleEvent = useCallback(
-    (e: SidecarEvent) => {
-      const d = e.data as Record<string, unknown>;
-      switch (e.type) {
-        case "ready":
-          setState(d as unknown as AgentState);
-          setTasks((d.tasks as BackgroundTask[] | undefined) ?? []);
-          setStatus("ready");
-          break;
-        case "run_start":
-          setRunning(true);
-          endStreamingText();
-          subagentGroupIdRef.current = null;
-          compactionIdRef.current = null;
-          runStartRef.current = Date.now();
-          toolsUsedRef.current = new Set();
-          tokensRef.current = 0;
-          assistantTextRef.current = "";
-          thinkingStartRef.current = null;
-          thinkingAccumRef.current = 0;
-          setLiveToolFeed([]);
-          setTokens(0);
-          setDoneStatus(null);
-          setIsThinking(false);
-          setThinkingStartTs(null);
-          setThinkingAccumMs(0);
-          setStatus("thinking\u2026");
-          break;
-        case "thinking_delta": {
-          if (thinkingStartRef.current === null) {
-            const now = Date.now();
-            thinkingStartRef.current = now;
-            setThinkingStartTs(now);
-            setIsThinking(true);
-          }
-          break;
-        }
-        case "text_delta": {
-          finalizeThinking();
-          const chunk = String(d.text ?? "");
-          appendAssistant(chunk);
-          // Track plan-step completion for the activity bar. Accumulate the
-          // run's assistant text (markers can split across deltas) and union in
-          // any [DONE:n] step numbers seen so far.
-          assistantTextRef.current += chunk;
-          const done = findCompletedSteps(assistantTextRef.current);
-          if (done.length > 0) {
-            const next = new Set(planDoneRef.current);
-            for (const n of done) {
-              if (n >= 1 && n <= planTotalRef.current) next.add(n);
-            }
-            if (next.size !== planDoneRef.current.size) {
-              planDoneRef.current = next;
-              setPlanDone(next);
-            }
-          }
-          break;
-        }
-        case "server_tool_call": {
-          // Native server tools (e.g. Anthropic web_search) stream text both
-          // before and after them within the SAME turn. End the current
-          // assistant bubble so the post-tool text starts a fresh paragraph
-          // instead of gluing onto the pre-tool text ("…command.Let me pull…").
-          finalizeThinking();
-          endStreamingText();
-          assistantTextRef.current = "";
-          break;
-        }
-        case "tool_call_start": {
-          finalizeThinking();
-          endStreamingText();
-          const toolCallId = String(d.toolCallId ?? "");
-          const name = String(d.name ?? "tool");
-          const args = (d.args as Record<string, unknown>) ?? {};
-          toolsUsedRef.current.add(name);
-          // Tools live ONLY in the pinned panel, never in the transcript. Keep a
-          // bounded tail so memory stays flat across long sessions; the panel
-          // itself renders just the last LIVE_TOOL_PANEL_ROWS.
-          setLiveToolFeed((prev) =>
-            [...prev, { toolCallId, name, args, status: "running" as const }].slice(
-              -(LIVE_TOOL_PANEL_ROWS * 2),
-            ),
-          );
-          // Sub-agents also get a persistent, live feed in the transcript so the
-          // user can watch parallel delegations by name + what each is doing.
-          if (name === "subagent") {
-            const newAgent: SubAgentLine = {
-              toolCallId,
-              agentName: typeof args.agent === "string" ? args.agent : undefined,
-              status: "running",
-              activities: [],
-              toolUseCount: 0,
-              tokenUsage: { input: 0, output: 0 },
-            };
-            const groupId = subagentGroupIdRef.current;
-            if (groupId !== null) {
-              setItems((prev) =>
-                prev.map((it) =>
-                  it.kind === "subagent_group" && it.id === groupId
-                    ? { ...it, agents: [...it.agents, newAgent] }
-                    : it,
-                ),
-              );
-            } else {
-              const id = nextId();
-              subagentGroupIdRef.current = id;
-              endStreamingText();
-              pushItem({ kind: "subagent_group", id, agents: [newAgent] });
-            }
-          }
-          // Image generation: show a shimmering square placeholder while the
-          // tool runs. It gets replaced by the real image on tool_call_end.
-          if (name === "generate_image") {
-            const prompt = typeof args.prompt === "string" ? args.prompt : "generating image…";
-            endStreamingText();
-            pushItem({ kind: "generating_image", id: nextId(), prompt });
-          }
-          break;
-        }
-        case "tool_call_update": {
-          // Live progress from a running sub-agent (toolUseCount + the tool it's
-          // currently running). Append distinct activities into its feed.
-          const id = String(d.toolCallId ?? "");
-          const update = d.update as
-            | {
-                toolUseCount?: number;
-                currentActivity?: string;
-                tokenUsage?: { input: number; output: number };
-              }
-            | undefined;
-          const groupId = subagentGroupIdRef.current;
-          if (!update || groupId === null) break;
-          const activity = update.currentActivity;
-          setItems((prev) =>
-            prev.map((it) => {
-              if (it.kind !== "subagent_group" || it.id !== groupId) return it;
-              return {
-                ...it,
-                agents: it.agents.map((a) => {
-                  if (a.toolCallId !== id) return a;
-                  const last = a.activities[a.activities.length - 1];
-                  const activities =
-                    activity && activity !== last ? [...a.activities, activity] : a.activities;
-                  return {
-                    ...a,
-                    toolUseCount: update.toolUseCount ?? a.toolUseCount,
-                    tokenUsage: update.tokenUsage ?? a.tokenUsage,
-                    activities: activities.slice(-12),
-                  };
-                }),
-              };
-            }),
-          );
-          break;
-        }
-        case "tool_call_end": {
-          const id = String(d.toolCallId ?? "");
-          const isError = Boolean(d.isError);
-          const result = typeof d.result === "string" ? d.result : undefined;
-          const details = d.details;
-          // Finalize a sub-agent's in-chat row: flip status + record duration.
-          const groupId = subagentGroupIdRef.current;
-          if (groupId !== null) {
-            const endDetails = details as
-              | { durationMs?: number; tokenUsage?: { input: number; output: number } }
-              | undefined;
-            const durationMs = endDetails?.durationMs;
-            const finalTokens = endDetails?.tokenUsage;
-            setItems((prev) =>
-              prev.map((it) => {
-                // Only the active group, and only when the ended tool is actually
-                // one of its agents (tool_call_end carries no name to filter on).
-                if (it.kind !== "subagent_group" || it.id !== groupId) return it;
-                if (!it.agents.some((a) => a.toolCallId === id)) return it;
-                return {
-                  ...it,
-                  agents: it.agents.map((a) =>
-                    a.toolCallId === id
-                      ? {
-                          ...a,
-                          status: isError ? ("error" as const) : ("done" as const),
-                          durationMs: durationMs ?? a.durationMs,
-                          tokenUsage: finalTokens ?? a.tokenUsage,
-                        }
-                      : a,
-                  ),
-                };
-              }),
-            );
-          }
-          // Update the entry in place to its done state — it stays in the pinned
-          // panel (mirrors ggcoder), it does NOT move into the transcript.
-          setLiveToolFeed((prev) =>
-            prev.map((entry) =>
-              entry.toolCallId === id
-                ? { ...entry, status: "done" as const, isError, result, details }
-                : entry,
-            ),
-          );
-          // Remove any generating_image placeholders — the tool has finished
-          // (success or failure). If it produced images, they're pushed below.
-          setItems((prev) => prev.filter((it) => it.kind !== "generating_image"));
-          // Surface any image previews (screenshot / read of an image) inline in
-          // the transcript — the tool panel is text-only.
-          const previews = (details as { imagePreviews?: ImagePreview[] } | undefined)
-            ?.imagePreviews;
-          if (Array.isArray(previews) && previews.length > 0) {
-            endStreamingText();
-            pushItem({
-              kind: "images",
-              id: nextId(),
-              images: previews.map((p) => ({
-                src: `data:${p.mediaType};base64,${p.base64}`,
-                path: p.path,
-              })),
-            });
-          }
-          break;
-        }
-        case "turn_end": {
-          const usage = d.usage as
-            | {
-                inputTokens?: number;
-                outputTokens?: number;
-                cacheRead?: number;
-                cacheWrite?: number;
-              }
-            | undefined;
-          if (usage && typeof usage.outputTokens === "number") {
-            tokensRef.current += usage.outputTokens;
-            setTokens(tokensRef.current);
-          }
-          // Context-window usage (footer meter). Mirrors ggcoder: Anthropic has
-          // separate input/output limits so only the input side counts; every
-          // other provider shares one window, so add the output too.
-          if (usage) {
-            const inputContext =
-              (usage.inputTokens ?? 0) + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-            const isAnthropic = stateRef.current?.provider === "anthropic";
-            setContextTokens(inputContext + (isAnthropic ? 0 : (usage.outputTokens ?? 0)));
-          }
-          break;
-        }
-        case "agent_done": {
-          const usage = d.totalUsage as { outputTokens?: number } | undefined;
-          if (usage && typeof usage.outputTokens === "number") {
-            // Authoritative final total — set rather than add to avoid
-            // double-counting the per-turn accumulation above.
-            if (usage.outputTokens > tokensRef.current) {
-              tokensRef.current = usage.outputTokens;
-              setTokens(tokensRef.current);
-            }
-          }
-          break;
-        }
-        case "compaction_start": {
-          const id = nextId();
-          compactionIdRef.current = id;
-          endStreamingText();
-          pushItem({ kind: "compaction", id, status: "running" });
-          break;
-        }
-        case "compaction_end": {
-          const originalCount = typeof d.originalCount === "number" ? d.originalCount : undefined;
-          const newCount = typeof d.newCount === "number" ? d.newCount : undefined;
-          const id = compactionIdRef.current;
-          compactionIdRef.current = null;
-          setItems((prev) =>
-            prev.map((it) =>
-              it.kind === "compaction" && it.id === id
-                ? { ...it, status: "done" as const, originalCount, newCount }
-                : it,
-            ),
-          );
-          break;
-        }
-        case "error":
-          pushItem({
-            kind: "error",
-            id: nextId(),
-            text: `error: ${String(d.message ?? "unknown")}`,
-          });
-          break;
-        case "run_end": {
-          setRunning(false);
-          endStreamingText();
-          finalizeThinking();
-          // The queue drained into this run — un-dim any messages that were
-          // waiting, since the agent has now consumed them.
-          setItems((prev) =>
-            prev.map((it) => (it.kind === "user" && it.queued ? { ...it, queued: false } : it)),
-          );
-          // Exit the tool panel (mirrors ggcoder).
-          setLiveToolFeed([]);
-          // Safety: clear any lingering image-generation placeholders in case
-          // tool_call_end didn't fire (e.g. hard cancel mid-fetch).
-          setItems((prev) => prev.filter((it) => it.kind !== "generating_image"));
-          // Mark any still-running sub-agents in this run's group as aborted.
-          const saGroupId = subagentGroupIdRef.current;
-          if (saGroupId !== null) {
-            setItems((prev) =>
-              prev.map((it) =>
-                it.kind === "subagent_group" && it.id === saGroupId
-                  ? {
-                      ...it,
-                      aborted: d.cancelled ? true : it.aborted,
-                      agents: it.agents.map((a) =>
-                        a.status === "running"
-                          ? { ...a, status: d.cancelled ? ("error" as const) : ("done" as const) }
-                          : a,
-                      ),
-                    }
-                  : it,
-              ),
-            );
-          }
-          subagentGroupIdRef.current = null;
-          if (d.cancelled) {
-            setDoneStatus(null);
-            setStatus("cancelled");
-          } else {
-            const elapsedMs = runStartRef.current ? Date.now() - runStartRef.current : 0;
-            const verb = pickDoneVerb(toolsUsedRef.current);
-            const parts = [`${verb} ${formatElapsed(elapsedMs)}`];
-            if (tokensRef.current > 0) {
-              parts.push(`\u2193 ${formatTokenCount(tokensRef.current)} tokens`);
-            }
-            setDoneStatus(parts.join(" \u2022 "));
-            setStatus("ready");
-            const completedPlan =
-              planTotalRef.current > 0 &&
-              Array.from({ length: planTotalRef.current }, (_, i) => i + 1).every((step) =>
-                planDoneRef.current.has(step),
-              );
-            if (completedPlan) {
-              planTotalRef.current = 0;
-              planDoneRef.current = new Set();
-              setPlanTotal(0);
-              setPlanDone(new Set());
-            }
-            playSound("done");
-            // A run may have created/removed `.gg/commands/*.md` (e.g.
-            // /setup-commit writing commit.md). Refresh so the top-right
-            // commit button flips /setup-commit → /commit without a restart.
-            void listCommands().then((cmds) => {
-              if (cmds.length > 0) setCommands(cmds);
-            });
-          }
-          break;
-        }
-        case "model_change":
-          setState((s) => (s ? { ...s, ...(d as Partial<AgentState>) } : s));
-          break;
-        case "thinking_change":
-          setState((s) =>
-            s
-              ? {
-                  ...s,
-                  thinkingLevel: (d.thinkingLevel as string | null) ?? null,
-                  supportedThinkingLevels: (d.supportedThinkingLevels as string[]) ?? [],
-                }
-              : s,
-          );
-          break;
-        case "plan_enter":
-          setState((s) => (s ? { ...s, planMode: true } : s));
-          pushItem({ kind: "plan", id: nextId(), reason: String(d.reason ?? "") });
-          break;
-        case "plan_exit":
-          setState((s) => (s ? { ...s, planMode: false } : s));
-          // Open the review modal (Accept / Feedback / Reject) with the plan, and
-          // stash its path so accept can bake it into the system prompt.
-          planReviewPathRef.current = typeof d.planPath === "string" ? d.planPath : null;
-          setPlanReview(String(d.content ?? ""));
-          break;
-        case "tasks":
-          setTasks((d.tasks as BackgroundTask[] | undefined) ?? []);
-          break;
-        case "tasks_list":
-          // Project task list refresh (run-all advance, status flips).
-          setProjectTasks((d.tasks as ProjectTask[] | undefined) ?? []);
-          break;
-        case "task_start":
-          // A task run just opened a fresh session; show its title at the top of
-          // the (already-cleared) transcript so the user sees what's running.
-          pushItem({ kind: "task", id: nextId(), title: String(d.title ?? "") });
-          break;
-        case "tasks_run_done":
-          // Run-all sweep finished — nothing to render; the modal reflects it.
-          break;
-        case "queued":
-          setQueuedCount(Number(d.count ?? 0));
-          break;
-        case "hook": {
-          const kind = String(d.kind ?? "ideal") as HookKind;
-          if (kind in HOOK_PRESENTATION) {
-            endStreamingText();
-            pushItem({ kind: "hook", id: nextId(), hook: kind });
-          }
-          break;
-        }
-        case "session_reset":
-          // Sidecar started a fresh session — clear the transcript + counters.
-          stickToBottomRef.current = true;
-          setItems([]);
-          setLiveToolFeed([]);
-          setTokens(0);
-          setDoneStatus(null);
-          setContextTokens(0);
-          setSessionTitle(null);
-          setPlanReview(null);
-          {
-            // On an accept-driven reset, restore the approved plan's step count
-            // instead of zeroing it (the widget tracks the implementation run).
-            const carriedTotal = pendingPlanTotalRef.current ?? 0;
-            pendingPlanTotalRef.current = null;
-            planTotalRef.current = carriedTotal;
-            planDoneRef.current = new Set();
-            setPlanTotal(carriedTotal);
-            setPlanDone(new Set());
-          }
-          setAttachments([]);
-          setQueuedCount(0);
-          endStreamingText();
-          subagentGroupIdRef.current = null;
-          break;
-        case "session_title":
-          setSessionTitle(String(d.title ?? "") || null);
-          break;
-        case "extras":
-          // Context window / git branch refresh (model switch, run end).
-          setState((s) =>
-            s
-              ? {
-                  ...s,
-                  contextWindow: (d.contextWindow as number | undefined) ?? s.contextWindow,
-                  gitBranch: (d.gitBranch as string | null | undefined) ?? s.gitBranch,
-                  isGitRepo: (d.isGitRepo as boolean | undefined) ?? s.isGitRepo,
-                }
-              : s,
-          );
-          setTasks((d.tasks as BackgroundTask[] | undefined) ?? []);
-          break;
-      }
-    },
-    [appendAssistant, pushItem, finalizeThinking, endStreamingText],
-  );
+  // Build-session SSE handling + assistant-streaming helpers live in the
+  // useAgentEvents hook (mirrors useKenMentor). It owns the event machine's
+  // private refs + the streaming helpers; App keeps owning the build-session
+  // state (its render + other handlers use it) and passes the setters +
+  // cross-cutting refs in. App consumes `handleEvent` (for the SSE subscription)
+  // and the two helpers it still calls directly (`pushItem`, `endStreamingText`).
+  const { handleEvent, pushItem, endStreamingText } = useAgentEvents({
+    setItems,
+    nextId,
+    handleKenEvent,
+    setState,
+    setTasks,
+    setProjectTasks,
+    setStatus,
+    setRunning,
+    setLiveToolFeed,
+    setTokens,
+    setContextTokens,
+    setDoneStatus,
+    setIsThinking,
+    setThinkingStartTs,
+    setThinkingAccumMs,
+    setPlanTotal,
+    setPlanDone,
+    setSessionTitle,
+    setPlanReview,
+    setQueuedCount,
+    setAttachments,
+    setCommands,
+    stateRef,
+    planDoneRef,
+    planTotalRef,
+    planReviewPathRef,
+    pendingPlanTotalRef,
+    stickToBottomRef,
+  });
 
   // Run the connect/ready flow against the current sidecar and hydrate state,
   // models, and commands. Re-invoked after a project switch respawns the
@@ -1284,6 +795,11 @@ function App(): React.ReactElement {
             // A resumed compacted session shows the quiet compaction notice in
             // place of the raw summary body (counts aren't persisted).
             if (h.compacted) return { kind: "compaction", id: nextId(), status: "done" };
+            // Persisted Ken (mentor) turns: his reply restores as a Ken bubble,
+            // the `@Ken` question as a Ken-tinted user bubble (matches live).
+            if (h.ken && h.role === "assistant") return { kind: "ken", id: nextId(), text: h.text };
+            if (h.ken && h.role === "user")
+              return { kind: "user", id: nextId(), text: h.text, ken: true };
             if (h.role !== "user") return { kind: h.role, id: nextId(), text: h.text };
             // App-button prompts (e.g. "Initialize Git") were shown live as a
             // friendly shimmer label, not the expanded body. The label is
@@ -1448,9 +964,23 @@ function App(): React.ReactElement {
   // Clamp so a shrinking match list never points past the end.
   const clampedSlashIndex = slashMatches.length > 0 ? slashIndex % slashMatches.length : 0;
 
+  // `@Ken` is the mentor-agent address, not a file mention. When the input leads
+  // with it (case-insensitive, word-boundary so `@kennedy.ts` still picks files),
+  // Ken is "active": the file picker is suppressed and the input is tinted in
+  // Ken's color with a shimmering marker, so it's obvious the message goes to Ken.
+  const kenActive = /^@ken\b/i.test(input.trimStart());
+  // Split the input for the `@Ken` highlight overlay: any leading whitespace,
+  // the literal `@Ken` token (preserving the user's casing), then the rest. Only
+  // the token shimmers; lead+rest render in the normal input color.
+  const kenInputParts = (() => {
+    const m = /^(\s*)(@ken)/i.exec(input);
+    if (!m) return null;
+    return { lead: m[1], token: m[2], rest: input.slice(m[1].length + m[2].length) };
+  })();
   // `@`-mention picker: open whenever a mention token is active and the search
   // returned at least one file. Clamp the highlighted row to the result count.
-  const mentionOpen = mention !== null && fileMatches.length > 0;
+  // Never open while `@Ken` is active — that token addresses Ken, not a file.
+  const mentionOpen = mention !== null && fileMatches.length > 0 && !kenActive;
   const clampedFileIndex = fileMatches.length > 0 ? fileIndex % fileMatches.length : 0;
   // Footer background-tasks indicator only shows while something is actually
   // running (exited tasks shouldn't keep the bar item around).
@@ -1506,9 +1036,10 @@ function App(): React.ReactElement {
     setMention(detectMention(text, caret));
   }
 
-  // Debounced file search whenever the active mention query changes.
+  // Debounced file search whenever the active mention query changes. Skipped when
+  // `@Ken` is active so typing `@ken` never spawns a file lookup or picker.
   useEffect(() => {
-    if (mention === null) {
+    if (mention === null || kenActive) {
       setFileMatches([]);
       return;
     }
@@ -1525,7 +1056,7 @@ function App(): React.ReactElement {
       cancelled = true;
       clearTimeout(t);
     };
-  }, [mention]);
+  }, [mention, kenActive]);
 
   // Pick a file: drop the typed `@query` from the input, add the file as a chip
   // (deduped), and restore the caret where the token was. The path lives in chip
@@ -1572,6 +1103,22 @@ function App(): React.ReactElement {
     endStreamingText();
     void sendPrompt(trimmed);
   }
+
+  // Click handler for the "Send to GG Coder" button on Ken's recommended prompts.
+  // Pushes a shimmering "Sent to GG Coder" user bubble (the full prompt body went
+  // to GG Coder, but the transcript shows the short Ken-colored label, like a
+  // slash command shows `/name`), then sends the prompt to the build session.
+  const sendKenRecommendedPrompt = useCallback(
+    (text: string) => {
+      const trimmed = text.trim();
+      if (!trimmed || !readyRef.current) return;
+      stickToBottomRef.current = true;
+      pushItem({ kind: "user", id: nextId(), text: trimmed, kenSent: true });
+      endStreamingText();
+      void sendPrompt(trimmed).catch(() => {});
+    },
+    [pushItem, endStreamingText],
+  );
 
   // Record a sent prompt for ↑/↓ recall (skips consecutive duplicates, capped).
   function recordHistory(text: string): void {
@@ -1727,6 +1274,26 @@ function App(): React.ReactElement {
     const trimmed = input.trim();
     if (!readyRef.current) return;
     if (!trimmed && attachments.length === 0 && mentionedPaths.length === 0) return;
+
+    // `@Ken <prompt>` (case-insensitive, optional colon) routes to Ken Kai, the
+    // read-only mentor agent — NOT GG Coder. Ken runs concurrently with any
+    // build run; his reply streams into a magenta bubble via ken_* events.
+    const kenMatch = /^@ken\b:?\s*/i.exec(trimmed);
+    if (kenMatch) {
+      const question = trimmed.slice(kenMatch[0].length).trim();
+      if (!question) return;
+      recordHistory(trimmed);
+      stickToBottomRef.current = true;
+      pushItem({ kind: "user", id: nextId(), text: trimmed, ken: true });
+      setInput("");
+      setSlashIndex(0);
+      setMention(null);
+      setMentionedPaths([]);
+      setEnhancement(null);
+      void sendKenPrompt(question);
+      return;
+    }
+
     recordHistory(trimmed);
     // A user send always re-pins to the bottom — they want to see their message.
     stickToBottomRef.current = true;
@@ -2125,29 +1692,46 @@ function App(): React.ReactElement {
                   {`\u273b ${status}`}
                 </div>
               ))}
-            {items.map((it) => (
-              <TranscriptRow key={it.id} item={it} onImageLoad={maybeScrollToBottom} />
-            ))}
+            <PromptSendProvider value={sendKenRecommendedPrompt}>
+              {items.map((it) => (
+                <TranscriptRow key={it.id} item={it} onImageLoad={maybeScrollToBottom} />
+              ))}
+            </PromptSendProvider>
           </>
         )}
       </div>
 
       <div className="liveregion">
+        {kenRunning && (
+          <KenActivityBar
+            runStartTs={kenRunStartTs}
+            tokens={kenTokens}
+            isThinking={kenIsThinking}
+            thinkingStartTs={kenThinkingStartTs}
+            thinkingAccumMs={kenThinkingAccumMs}
+            onCancel={() => void cancelKen()}
+          />
+        )}
         {!toolsHidden && <LiveToolPanel entries={liveToolFeed} />}
-        <ActivityBar
-          running={running}
-          tokens={tokens}
-          doneStatus={doneStatus}
-          isThinking={isThinking}
-          thinkingStartTs={thinkingStartTs}
-          thinkingAccumMs={thinkingAccumMs}
-          planTotal={planTotal}
-          planDone={Math.min(planDone.size, planTotal)}
-          onCancel={() => void cancel()}
-          toolsHidden={toolsHidden}
-          hasToolFeed={liveToolFeed.length > 0}
-          onToggleTools={toggleTools}
-        />
+        {/* Ken's bar REPLACES the main bar while Ken runs and the build is idle —
+            otherwise the idle "Ready for work" line stacks under Ken's spinner.
+            When the build is also running, both bars show (Ken on top). */}
+        {(running || !kenRunning) && (
+          <ActivityBar
+            running={running}
+            tokens={tokens}
+            doneStatus={doneStatus}
+            isThinking={isThinking}
+            thinkingStartTs={thinkingStartTs}
+            thinkingAccumMs={thinkingAccumMs}
+            planTotal={planTotal}
+            planDone={Math.min(planDone.size, planTotal)}
+            onCancel={() => void cancel()}
+            toolsHidden={toolsHidden}
+            hasToolFeed={liveToolFeed.length > 0}
+            onToggleTools={toggleTools}
+          />
+        )}
       </div>
 
       <div className={`inputwrap${isFileDragOver ? " dragover" : ""}`}>
@@ -2206,20 +1790,30 @@ function App(): React.ReactElement {
                 onDone={onEnhanceAnimDone}
               />
             )}
+            {/* `@Ken` active: a textarea can't color just one token, so we mirror
+                the input in an aligned overlay where the leading `@Ken` shimmers
+                in Ken's color. The textarea text below is made transparent (caret
+                stays visible) so only this styled copy shows. Metrics match
+                `.input` 1:1 so wrapping/caret line up. */}
+            {kenActive && kenInputParts && (
+              <div className="ken-input-highlight" aria-hidden="true">
+                {kenInputParts.lead}
+                <ShimmerText base={theme.ken} bright="#ffffff">
+                  {kenInputParts.token}
+                </ShimmerText>
+                {kenInputParts.rest}
+              </div>
+            )}
             <textarea
               ref={inputRef}
-              className={`input${enhanceAnim ? " input-anim" : ""}`}
+              className={`input${enhanceAnim ? " input-anim" : ""}${kenActive ? " input-ken" : ""}`}
               rows={1}
               // Lock the input while the dissolve→decode animation plays: the caret
               // is invisible, so typing would be silently discarded and Enter would
               // submit the un-enhanced draft mid-animation.
               readOnly={enhanceAnim !== null}
               value={input}
-              placeholder={
-                running
-                  ? "Agent is working \u2014 queue a follow-up…"
-                  : "Type your message, / for commands, @ to add files"
-              }
+              placeholder={displayPlaceholder}
               onPaste={(e) => {
                 const files = Array.from(e.clipboardData.files);
                 if (files.length > 0) {
@@ -2286,8 +1880,11 @@ function App(): React.ReactElement {
                   e.preventDefault();
                   submit();
                 } else if (e.key === "Escape") {
+                  // Cancel the build if it's running; otherwise cancel Ken so the
+                  // "esc to cancel" on his bar actually works.
                   if (slashOpen) setInput("");
                   else if (running) void cancel();
+                  else if (kenRunning) void cancelKen();
                 }
               }}
               autoFocus
@@ -2492,6 +2089,18 @@ const TranscriptRow = memo(function TranscriptRow({
 }): React.ReactElement | null {
   switch (item.kind) {
     case "user":
+      if (item.kenSent) {
+        // Sent from a Ken "Send to GG Coder" button: show a shimmering "Sent to GG
+        // Coder" in Ken's color (like a slash command shows `/name`), not the
+        // full prompt body. The full body still went to GG Coder.
+        return (
+          <div className="user-msg command labelled user-ken-sent">
+            <span className="command-shimmer" style={{ color: theme.ken }}>
+              Sent to GG Coder
+            </span>
+          </div>
+        );
+      }
       if (item.command) {
         // Workflow command: show just the short `/name` (or a friendly `label`
         // phrase) with a highlight + shimmer sweep. The full expanded prompt
@@ -2505,7 +2114,7 @@ const TranscriptRow = memo(function TranscriptRow({
         );
       }
       return (
-        <div className={`user-msg${item.queued ? " queued" : ""}`}>
+        <div className={`user-msg${item.queued ? " queued" : ""}${item.ken ? " user-ken" : ""}`}>
           {item.queued && <span className="queued-pill">queued</span>}
           {item.images && item.images.length > 0 && (
             <div className="user-img-row">
@@ -2561,6 +2170,21 @@ const TranscriptRow = memo(function TranscriptRow({
         </>
       );
     }
+    case "ken":
+      // Ken Kai's reply: the whole bubble is tinted in Ken's color (dot + all
+      // text), which is the ONLY differentiator from a normal GG Coder reply.
+      // No badge, no byline. The Markdown component special-cases ```prompt
+      // fences into a "Send to GG Coder" button.
+      return (
+        <div className="assistant-msg ken-msg">
+          <span className="assistant-dot" style={{ color: theme.ken }}>
+            {DOT}
+          </span>
+          <div className="assistant-text">
+            <Markdown>{item.text}</Markdown>
+          </div>
+        </div>
+      );
     case "info":
       return (
         <div className="line info" style={{ color: theme.textDim }}>

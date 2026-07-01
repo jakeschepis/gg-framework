@@ -34,6 +34,22 @@ import { isJsonObject } from "../utils/json.js";
  */
 const anthropicClientCache = new Map<string, Anthropic>();
 
+/**
+ * Upper HTTP timeout for the non-streaming fallback request.
+ *
+ * The Anthropic SDK refuses any non-streaming `messages.create` whose
+ * `max_tokens` implies a >10-minute worst case — it throws "Streaming is
+ * required for operations that may take longer than 10 minutes" *client-side*,
+ * before any network call (see `calculateNonstreamingTimeout`: the throw fires
+ * when `(60*60*max_tokens)/128000 > 600s`, i.e. any `max_tokens > ~21333`).
+ * Adaptive-thinking Opus/Sonnet models set `max_tokens` to their full output
+ * ceiling (~32K), so the fallback tripped this every time. The SDK only runs
+ * that pre-flight check when the *client* carries no explicit `timeout`, so we
+ * set one here to bypass it. The agent loop already bounds this call with its
+ * own abort signal (NON_STREAMING_HARD_TIMEOUT_MS), so this is just a ceiling.
+ */
+const NON_STREAMING_REQUEST_TIMEOUT_MS = 600_000;
+
 function createClient(options: StreamOptions): Anthropic {
   const isOAuth = options.apiKey?.startsWith("sk-ant-oat");
   const userAgent = isOAuth ? (options.userAgent ?? "claude-cli/2.1.75 (external, cli)") : "";
@@ -256,7 +272,7 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     stream: useStreaming,
   } as Anthropic.MessageCreateParams;
 
-  // Adaptive thinking models (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 4.6) don't need the
+  // Adaptive thinking models (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 5) don't need the
   // interleaved-thinking beta — they have it built in.
   const hasAdaptiveThinking = isAdaptiveThinkingModel(options.model);
 
@@ -284,7 +300,13 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   // recover when the request is replayed over a plain HTTP response.
   if (!useStreaming) {
     try {
-      const message = (await client.messages.create(
+      // withOptions() clones the client (sharing auth state) with an explicit
+      // timeout set, which suppresses the SDK's bogus "Streaming is required…"
+      // pre-flight throw for large max_tokens. See NON_STREAMING_REQUEST_TIMEOUT_MS.
+      const nonStreamingClient = client.withOptions({
+        timeout: NON_STREAMING_REQUEST_TIMEOUT_MS,
+      });
+      const message = (await nonStreamingClient.messages.create(
         { ...params, stream: false } as Anthropic.MessageCreateParamsNonStreaming,
         requestOptions,
       )) as Anthropic.Message;

@@ -27,14 +27,14 @@ describe("thinking-level helpers", () => {
   });
 
   it("cycles Anthropic adaptive Sonnet models without xhigh", () => {
-    expect(getSupportedThinkingLevels("anthropic", "claude-sonnet-4-6")).toEqual([
+    expect(getSupportedThinkingLevels("anthropic", "claude-sonnet-5")).toEqual([
       "low",
       "medium",
       "high",
       "max",
     ]);
-    expect(getNextThinkingLevel("anthropic", "claude-sonnet-4-6", "high")).toBe("max");
-    expect(isThinkingLevelSupported("anthropic", "claude-sonnet-4-6", "xhigh")).toBe(false);
+    expect(getNextThinkingLevel("anthropic", "claude-sonnet-5", "high")).toBe("max");
+    expect(isThinkingLevelSupported("anthropic", "claude-sonnet-5", "xhigh")).toBe(false);
   });
 
   it("cycles Sakana Fugu through high and xhigh", () => {

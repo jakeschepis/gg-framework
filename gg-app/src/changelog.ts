@@ -22,6 +22,48 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.9.0",
+    date: "2026-07-01",
+    items: [
+      "Xiaomi just got a turbo button. MiMo-V2.5-Pro-UltraSpeed is in the model picker now, built for when you want answers fast and don't mind paying a bit more for the speed.",
+      "Connecting Xiaomi now gives you a real choice. Pick Token Plan or API Credits right in the login screen, and I'll route every MiMo model to whichever one you've actually got set up. No more guessing which key goes where.",
+    ],
+  },
+  {
+    version: "0.8.0",
+    date: "2026-07-01",
+    items: [
+      "Claude Sonnet 5 just landed. I wired up Anthropic's newest brain so you can pick it the moment you launch, with a roomy 1M context and double the room to think out loud. Smarter answers, longer memory, same one-click switch.",
+      "Long, heavy sessions no longer choke. I hunted down a nasty error that could halt big agent runs mid-task and erased it, so the toughest jobs now run all the way through without a hiccup.",
+    ],
+  },
+  {
+    version: "0.7.2",
+    date: "2026-06-30",
+    items: [
+      "GG Coder just got faster at the boring part. When it needs to read a few files or search around, it now grabs them all at once instead of one at a time. Less waiting on every step, more time actually building.",
+    ],
+  },
+  {
+    version: "0.7.1",
+    date: "2026-06-30",
+    items: [
+      "I made @Ken much easier to remember right when you are about to type. The input now quietly rotates in helpful Ken hints, then shuffles into place instead of snapping.",
+      "Ken now follows your model switch. Pick a new model and @Ken uses it too, so his advice comes from the same brain you chose for the main agent.",
+    ],
+  },
+  {
+    version: "0.7.0",
+    date: "2026-06-30",
+    items: [
+      "Say hey to Ken. I put myself right inside the app as your mentor. Type @Ken and I'll tell you what to build next, call out when something is off, and hand you the exact prompt to run. I am not the one writing the code, I am the one keeping you on the rails.",
+      "I do not guess and I do not just nod along. When I size up your code or a plan I actually go check it. I search real shipping repos and read the live docs before I answer, and if something smells unverified I dig in and tell you what I found.",
+      "I have taste and I am hard on tools. Ask me what to use and I will not parrot whatever is trendy. I research what is actually good right now and steer you to the lean pick that fits your project, not the bloated mainstream one.",
+      "Every prompt I write comes with a Send to GG Coder button. One click and it runs. No copy paste, no fuss. I keep it one focused step at a time so nothing snowballs into a mess.",
+      "Our chats stick around. Close the app, come back later, and my advice plus everything you sent is right where you left it.",
+    ],
+  },
+  {
     version: "0.6.1",
     date: "2026-06-29",
     items: [

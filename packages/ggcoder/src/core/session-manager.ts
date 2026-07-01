@@ -57,6 +57,23 @@ interface DisplayItemPayload {
   item: CompletedItem;
 }
 
+/** Custom-entry kind for a Ken Kai (mentor agent) turn. Ken's advisory
+ *  conversation is NOT part of the LLM message history (GG Coder never sees it),
+ *  but it's persisted alongside the build session so it survives resume. Stored
+ *  as a `custom` entry with `parentId: null` so it is NEVER on the message DAG
+ *  branch — this keeps it out of `getMessages()` AND avoids racing the build
+ *  session's leaf pointer (Ken runs concurrently). `afterMessageCount` is the
+ *  number of non-system messages that existed when the turn was recorded, used
+ *  to interleave Ken turns back into the transcript chronologically. */
+export const KEN_TURN_CUSTOM_KIND = "ken_turn";
+
+export interface KenTurnPayload {
+  version: 1;
+  question: string;
+  reply: string;
+  afterMessageCount: number;
+}
+
 export type SessionEntry =
   | MessageEntry
   | ModelChangeEntry
@@ -457,6 +474,26 @@ export class SessionManager {
       const payload = entry.data as Partial<DisplayItemPayload> | undefined;
       const item = payload?.version === 1 ? payload.item : undefined;
       return isCompletedItemLike(item) ? [item] : [];
+    });
+  }
+
+  /** Read all persisted Ken turns in file order. Returns them regardless of
+   *  branch (Ken turns are not chained into the DAG), validated + normalized. */
+  getKenTurns(entries: SessionEntry[]): KenTurnPayload[] {
+    return entries.flatMap((entry): KenTurnPayload[] => {
+      if (entry.type !== "custom" || entry.kind !== KEN_TURN_CUSTOM_KIND) return [];
+      const p = entry.data as Partial<KenTurnPayload> | undefined;
+      if (p?.version === 1 && typeof p.question === "string" && typeof p.reply === "string") {
+        return [
+          {
+            version: 1,
+            question: p.question,
+            reply: p.reply,
+            afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
+          },
+        ];
+      }
+      return [];
     });
   }
 

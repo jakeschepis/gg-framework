@@ -32,6 +32,7 @@ const SOURCE_STYLES: Record<string, { label: string; color: string }> = {
   ggcoder: { label: "gg-coder", color: theme.primary }, // blue
   "claude-code": { label: "Claude Code", color: "#d97757" }, // Anthropic clay
   codex: { label: "Codex", color: "#aeb6c2" }, // neutral silver
+  ken: { label: "Ken Kai", color: theme.ken }, // orchid/magenta mentor
 };
 
 export function sourceStyle(source: string): { label: string; color: string } {

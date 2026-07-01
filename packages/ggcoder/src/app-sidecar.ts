@@ -22,8 +22,12 @@ import type { AddressInfo } from "node:net";
 import { runJsonMode } from "./modes/json-mode.js";
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { AgentSession } from "./core/agent-session.js";
+import { buildKenSystemPrompt } from "./core/ken-prompt.js";
+import { buildKenDigest } from "./core/ken-context.js";
+import { collectProjectContext } from "./system-prompt.js";
+import type { KenTurnPayload } from "./core/session-manager.js";
 import { AuthStorage } from "./core/auth-storage.js";
-import { MOONSHOT_OAUTH_KEY } from "@kenkaiiii/gg-core";
+import { MOONSHOT_OAUTH_KEY, XIAOMI_CREDITS_KEY } from "@kenkaiiii/gg-core";
 import { loginAnthropic } from "./core/oauth/anthropic.js";
 import { loginOpenAI } from "./core/oauth/openai.js";
 import { loginGemini } from "./core/oauth/gemini.js";
@@ -207,6 +211,10 @@ interface HistoryEntryForWire {
   hook?: "ideal" | "loop_break" | "regrounding" | null;
   command?: boolean;
   compacted?: boolean;
+  /** True when this entry is a Ken Kai (mentor) turn: a `user` row is the `@Ken`
+   *  question, an `assistant` row is Ken's reply. The webview renders these in
+   *  Ken's color (user bubble tinted; assistant as a Ken bubble). */
+  ken?: boolean;
   toolImages?: Array<{ src: string; path?: string }>;
   subagentGroup?: Array<{
     agentName?: string;
@@ -682,6 +690,60 @@ async function main(): Promise<void> {
   process.on("SIGTERM", () => void shutdown());
 }
 
+/** Ken's read-only tool allow-list. Excludes every mutating tool (write/edit/
+ *  bash/tasks/subagent/generate_image/enter_plan/exit_plan/task_*) so the mentor
+ *  agent can research + see, but never change the repo. */
+const KEN_ALLOWED_TOOLS = [
+  "read",
+  "grep",
+  "find",
+  "ls",
+  "source_path",
+  "web_fetch",
+  "web_search",
+  "screenshot",
+];
+
+/** MCP servers Ken is allowed to use. kencode-search lets him look into real
+ *  public repos / verify against actual code instead of assuming — core to how
+ *  he's meant to work. Read-only research; no other MCP server is connected. */
+const KEN_ALLOWED_MCP_SERVERS = ["kencode-search"];
+
+/** Extract the plain text of the most recent assistant message (Ken's reply).
+ *  Strips tool-call / image blocks, returning just the prose Ken streamed. */
+function lastAssistantText(messages: ReturnType<AgentSession["getMessages"]>): string {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (m.role !== "assistant") continue;
+    if (typeof m.content === "string") return m.content;
+    return m.content
+      .map((c) => (c.type === "text" && "text" in c && typeof c.text === "string" ? c.text : ""))
+      .join("");
+  }
+  return "";
+}
+
+/**
+ * Assemble Ken's context digest for one `@Ken` question: project docs (up the
+ * tree) + git/env + the build session's compaction summary + recent activity.
+ * Prepended to the user's question as Ken's prompt body each turn.
+ */
+async function buildKenContext(
+  buildSession: AgentSession,
+  cwd: string,
+  gitBranch: string | null,
+  question: string,
+): Promise<string> {
+  const projectContext = await collectProjectContext(cwd).catch(() => [] as string[]);
+  return buildKenDigest({
+    question,
+    projectContext,
+    cwd,
+    gitBranch,
+    messages: buildSession.getMessages(),
+  });
+}
+
 interface SessionContext {
   id: string;
   cwd: string;
@@ -873,6 +935,72 @@ async function createSession(
   // A single embedded serve session lives in this sidecar process. Only the main
   // window's home screen exposes the controls, so there's one bot per app.
   let serveController: ServeController | null = null;
+
+  // ── Ken Kai (mentor agent) ─────────────────────────────────
+  // A second, read-only AgentSession on this same window. The user talks to him
+  // with `@Ken …`; he reads GG Coder's transcript (one-way — GG Coder never sees
+  // Ken's) and hands back runnable prompts + mentorship. Created lazily on the
+  // first `@Ken` so windows that never use Ken pay zero cost. His events ride the
+  // SAME SSE stream with `ken_`-prefixed types, routed to the Ken bubble.
+  let kenSession: AgentSession | null = null;
+  let kenAbort = new AbortController();
+  let kenRunning = false;
+  let pendingKenModel: { provider: Provider; model: string } | null = null;
+  const kenToolCallNames = new Map<string, string>();
+
+  async function syncKenModel(provider: Provider, model: string): Promise<void> {
+    if (kenRunning) {
+      pendingKenModel = { provider, model };
+      return;
+    }
+    if (!kenSession) return;
+    const st = kenSession.getState();
+    if (st.provider === provider && st.model === model) return;
+    await kenSession.switchModel(provider, model);
+    log("INFO", "app-sidecar", "ken session model synced", { provider, model });
+  }
+
+  async function ensureKenSession(): Promise<AgentSession> {
+    if (kenSession) return kenSession;
+    const st = session.getState();
+    const ken = new AgentSession({
+      provider: st.provider,
+      model: st.model,
+      cwd,
+      systemPrompt: buildKenSystemPrompt(),
+      allowedTools: KEN_ALLOWED_TOOLS,
+      allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
+      transient: true,
+      signal: kenAbort.signal,
+    });
+    await ken.initialize();
+    // Bridge Ken's bus to the shared SSE fan-out with ken_-prefixed types so the
+    // webview routes them to the Ken bubble, never GG Coder's.
+    ken.eventBus.on("text_delta", (d) => broadcast("ken_text_delta", d));
+    ken.eventBus.on("thinking_delta", (d) => broadcast("ken_thinking_delta", d));
+    ken.eventBus.on("tool_call_start", (d) => {
+      kenToolCallNames.set(d.toolCallId, d.name);
+      broadcast("ken_tool_call_start", d);
+    });
+    ken.eventBus.on("tool_call_update", (d) => broadcast("ken_tool_call_update", d));
+    ken.eventBus.on("tool_call_end", (d) => {
+      kenToolCallNames.delete(d.toolCallId);
+      broadcast("ken_tool_call_end", d);
+    });
+    // Native server tools (Anthropic web_search) stream text both before AND
+    // after them in the same turn; forward so the webview can break the bubble
+    // (otherwise "...work.Local tools..." glues together). Mirrors the build bus.
+    ken.eventBus.on("server_tool_call", (d) => broadcast("ken_server_tool_call", d));
+    ken.eventBus.on("turn_end", (d) => broadcast("ken_turn_end", d));
+    ken.eventBus.on("error", (d) => {
+      const message = d.error instanceof Error ? d.error.message : String(d.error);
+      log("ERROR", "app-sidecar", "ken error", { message });
+      broadcast("ken_error", { message });
+    });
+    kenSession = ken;
+    log("INFO", "app-sidecar", "ken session ready", { provider: st.provider, model: st.model });
+    return ken;
+  }
 
   // Resumed session: if it already has a conversation, generate its title now so
   // the title bar shows it immediately on load (not just after the next prompt).
@@ -1243,8 +1371,32 @@ async function createSession(
 
         const history: HistoryEntryForWire[] = [];
 
+        // Ken (mentor) turns to interleave: group by the non-system message count
+        // they were recorded after, so each lands right after that message. A
+        // turn becomes two wire rows: the `@Ken` question (user) + Ken's reply
+        // (assistant), both flagged `ken` so the webview tints them.
+        const kenByCount = new Map<number, KenTurnPayload[]>();
+        for (const turn of session.getKenTurns()) {
+          const list = kenByCount.get(turn.afterMessageCount) ?? [];
+          list.push(turn);
+          kenByCount.set(turn.afterMessageCount, list);
+        }
+        const flushKen = (count: number): void => {
+          const turns = kenByCount.get(count);
+          if (!turns) return;
+          kenByCount.delete(count);
+          for (const turn of turns) {
+            history.push({ role: "user", text: `@Ken ${turn.question}`, ken: true });
+            history.push({ role: "assistant", text: turn.reply, ken: true });
+          }
+        };
+        let nonSystemCount = 0;
+        // Turns recorded before any build message (anchor 0) render at the top.
+        flushKen(0);
+
         for (const msg of messages) {
           if (msg.role === "system") continue;
+          nonSystemCount++;
 
           if (msg.role === "tool") {
             // Tool result messages: check for ImageContent blocks (screenshots,
@@ -1354,7 +1506,15 @@ async function createSession(
               });
             }
           }
+
+          // Interleave any Ken turns recorded right after this message.
+          flushKen(nonSystemCount);
         }
+
+        // Flush remaining Ken turns whose anchor is at/after the message count
+        // (e.g. asked before any build message, or anchors beyond the current
+        // count after compaction shrank the history) so none are dropped.
+        for (const count of [...kenByCount.keys()].sort((a, b) => a - b)) flushKen(count);
 
         json(res, 200, { history });
       })();
@@ -1428,6 +1588,64 @@ async function createSession(
           }
         });
       });
+      return;
+    }
+
+    // Ken Kai (mentor): an independent read-only advisory run on the kenSession.
+    // Runs concurrently with a build run — its events are ken_-prefixed so the
+    // webview keeps the bubbles separate. The context digest is assembled fresh
+    // from the BUILD session's transcript each turn (one-way mirror).
+    if (method === "POST" && url === "/ken/prompt") {
+      void readBody(req).then(async (raw) => {
+        let text: string;
+        try {
+          text = (JSON.parse(raw) as { text?: string }).text ?? "";
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (!text.trim()) {
+          json(res, 400, { error: "empty prompt" });
+          return;
+        }
+        if (kenRunning) {
+          json(res, 409, { error: "Ken is already thinking — wait for his reply." });
+          return;
+        }
+        json(res, 202, { accepted: true });
+        kenRunning = true;
+        broadcast("ken_run_start", { text });
+        try {
+          const ken = await ensureKenSession();
+          const digest = await buildKenContext(session, cwd, gitBranch, text);
+          await ken.prompt(digest);
+          // Record the turn against the BUILD session so it persists + survives
+          // resume (advisory custom entry, never an LLM message). Reply is Ken's
+          // last assistant message; skip persistence if he produced nothing.
+          const reply = lastAssistantText(ken.getMessages());
+          if (reply.trim()) await session.persistKenTurn(text, reply);
+        } catch (err) {
+          const message = err instanceof Error ? err.message : String(err);
+          log("ERROR", "app-sidecar", "ken run failed", { message });
+          broadcast("ken_error", { message });
+        } finally {
+          kenRunning = false;
+          broadcast("ken_run_end", {});
+          const pending = pendingKenModel;
+          pendingKenModel = null;
+          if (pending) await syncKenModel(pending.provider, pending.model);
+        }
+      });
+      return;
+    }
+
+    if (method === "POST" && url === "/ken/cancel") {
+      kenAbort.abort();
+      kenAbort = new AbortController();
+      kenSession?.setSignal(kenAbort.signal);
+      kenRunning = false;
+      broadcast("ken_run_end", { cancelled: true });
+      json(res, 200, { cancelled: true });
       return;
     }
 
@@ -1579,6 +1797,7 @@ async function createSession(
           return;
         }
         await session.switchModel(target.provider, target.id);
+        await syncKenModel(target.provider, target.id);
         // Clamp the reasoning level to what the new model supports (mirrors the
         // CLI): keep thinking on at the first supported tier if it was on but
         // the prior level is unsupported here; leave it off if it was off.
@@ -1733,10 +1952,12 @@ async function createSession(
       void readBody(req).then(async (raw) => {
         let provider = "";
         let key: string;
+        let variant: string | undefined;
         try {
-          const body = JSON.parse(raw) as { provider?: string; key?: string };
+          const body = JSON.parse(raw) as { provider?: string; key?: string; variant?: string };
           provider = body.provider ?? "";
           key = (body.key ?? "").trim();
+          variant = body.variant;
         } catch {
           json(res, 400, { error: "invalid JSON body" });
           return;
@@ -1750,13 +1971,21 @@ async function createSession(
           json(res, 400, { error: "API key is required" });
           return;
         }
+        // Providers with multiple API-key variants (currently only Xiaomi: Token
+        // Plan vs. API Credits) store under the chosen variant's key/baseUrl,
+        // defaulting to the first variant. Single-variant providers fall back to
+        // the legacy provider-id storage key + flat apiKeyBaseUrl.
+        const chosenVariant =
+          meta.apiKeyVariants?.find((v) => v.key === variant) ?? meta.apiKeyVariants?.[0];
+        const storageKey = chosenVariant?.key ?? provider;
+        const baseUrl = chosenVariant?.baseUrl ?? meta.apiKeyBaseUrl;
         const creds: OAuthCredentials = {
           accessToken: key,
           refreshToken: "",
           expiresAt: Date.now() + 365 * 24 * 60 * 60 * 1000 * 100, // ~100y
-          ...(meta.apiKeyBaseUrl ? { baseUrl: meta.apiKeyBaseUrl } : {}),
+          ...(baseUrl ? { baseUrl } : {}),
         };
-        await auth.setCredentials(provider, creds);
+        await auth.setCredentials(storageKey, creds);
         broadcast("auth_done", { provider });
         json(res, 200, { ok: true });
       });
@@ -1846,6 +2075,9 @@ async function createSession(
         // Moonshot's OAuth credential lives under a distinct key — clear both so
         // "disconnect" fully removes Kimi OAuth and the API key.
         if (provider === "moonshot") await auth.clearCredentials(MOONSHOT_OAUTH_KEY);
+        // Xiaomi's API Credits credential lives under a distinct key — clear it
+        // too so "disconnect" fully removes both the Token Plan and Credits keys.
+        if (provider === "xiaomi") await auth.clearCredentials(XIAOMI_CREDITS_KEY);
         broadcast("auth_done", { provider });
         json(res, 200, { ok: true });
       });
@@ -2137,6 +2369,8 @@ async function createSession(
     // Stop the Telegram serve loop + dispose its per-chat sessions.
     if (serveController) await serveController.stop().catch(() => {});
     for (const c of clients) c.res.end();
+    kenAbort.abort();
+    await kenSession?.dispose().catch(() => {});
     await session.dispose().catch(() => {});
   }
 

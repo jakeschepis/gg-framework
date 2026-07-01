@@ -329,7 +329,7 @@ describe("buildSystemPrompt", () => {
     console.info(`system prompt size measurements: ${JSON.stringify(measurements)}`);
 
     expect(measurements.normal.characters).toBeLessThan(5_100);
-    expect(measurements.planMode.characters).toBeLessThan(5_900);
+    expect(measurements.planMode.characters).toBeLessThan(6_300);
     expect(measurements.typescriptProjectContextToolsSkills.characters).toBeLessThan(9_800);
     expect(measurements.planMode.characters).toBeGreaterThan(measurements.normal.characters);
     expect(measurements.typescriptProjectContextToolsSkills.characters).toBeGreaterThan(

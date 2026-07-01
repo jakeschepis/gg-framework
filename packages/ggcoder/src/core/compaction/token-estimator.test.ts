@@ -8,9 +8,9 @@ import {
 import type { Message } from "@kenkaiiii/gg-ai";
 
 // Use a known model so the chars-per-token ratio is deterministic in tests.
-// "claude-sonnet-4-6" → ratio = 3.2
+// "claude-sonnet-5" → ratio = 3.2
 beforeAll(() => {
-  setEstimatorModel("claude-sonnet-4-6");
+  setEstimatorModel("claude-sonnet-5");
 });
 
 describe("estimateTokens", () => {
@@ -156,6 +156,6 @@ describe("setEstimatorModel", () => {
     expect(claudeTokens).toBeGreaterThan(gptTokens);
 
     // Reset for other tests
-    setEstimatorModel("claude-sonnet-4-6");
+    setEstimatorModel("claude-sonnet-5");
   });
 });

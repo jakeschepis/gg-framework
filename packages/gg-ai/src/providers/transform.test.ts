@@ -426,10 +426,10 @@ describe("toAnthropicThinking", () => {
   });
 
   it("clamps xhigh to high on adaptive Anthropic models that do not support xhigh", () => {
-    expect(toAnthropicThinking("xhigh", MAX_TOKENS, "claude-sonnet-4-6").outputConfig).toEqual({
+    expect(toAnthropicThinking("xhigh", MAX_TOKENS, "claude-sonnet-5").outputConfig).toEqual({
       effort: "high",
     });
-    expect(toAnthropicThinking("max", MAX_TOKENS, "claude-sonnet-4-6").outputConfig).toEqual({
+    expect(toAnthropicThinking("max", MAX_TOKENS, "claude-sonnet-5").outputConfig).toEqual({
       effort: "max",
     });
   });

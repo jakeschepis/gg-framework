@@ -3,8 +3,9 @@ import { theme } from "./theme";
 
 // Braille rotation spinner — the native language of CLI coding tools (ora,
 // npm, cargo). Smooth, monospace, and unmistakably "ours" rather than the
-// Matrix-flavored sparkle it replaces.
-const FRAMES = [
+// Matrix-flavored sparkle it replaces. Exported so Ken's activity row spins
+// with the exact same frames (aligned, not a separate visual language).
+export const SPINNER_FRAMES = [
   "\u280b",
   "\u2819",
   "\u2839",
@@ -16,7 +17,9 @@ const FRAMES = [
   "\u2807",
   "\u280f",
 ];
-const FRAME_MS = 80;
+export const SPINNER_FRAME_MS = 80;
+const FRAMES = SPINNER_FRAMES;
+const FRAME_MS = SPINNER_FRAME_MS;
 
 function formatElapsed(ms: number): string {
   const s = Math.round(ms / 1000);

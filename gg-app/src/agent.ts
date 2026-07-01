@@ -218,6 +218,43 @@ export async function cancel(): Promise<void> {
   }
 }
 
+// ── Ken Kai (mentor agent) ──────────────────────────────────
+// Ken is a second, read-only agent in this window. The user reaches him with
+// `@Ken …`; he reads GG Coder's transcript and hands back runnable prompts +
+// blunt mentorship. His replies stream over the SAME SSE channel as GG Coder's
+// but with `ken_`-prefixed event types, so the webview routes them to a separate
+// magenta bubble:
+//   ken_run_start { text }         — Ken started thinking
+//   ken_text_delta { text }        — streaming reply text
+//   ken_thinking_delta { text }    — streaming reasoning
+//   ken_tool_call_start/_update/_end — Ken's read-only tool activity
+//   ken_turn_end { … }            — a turn finished
+//   ken_run_end { cancelled? }     — Ken finished (or was cancelled)
+//   ken_error { message }          — Ken failed
+
+/** Ask Ken Kai. Fires the read-only mentor run; reply arrives via `ken_*`
+ *  SSE events. Lazily boots Ken's session on first use. */
+export async function sendKenPrompt(text: string): Promise<void> {
+  await logInfo(`ken prompt: ${text.slice(0, 80)}`);
+  try {
+    await waitForReady();
+    await invoke("agent_ken_prompt", { text });
+  } catch (e) {
+    await logError(`agent_ken_prompt failed: ${String(e)}`);
+    throw e;
+  }
+}
+
+/** Cancel Ken's in-flight run (does not touch GG Coder's run). */
+export async function cancelKen(): Promise<void> {
+  try {
+    await waitForReady();
+    await invoke("agent_ken_cancel");
+  } catch (e) {
+    await logError(`agent_ken_cancel failed: ${String(e)}`);
+  }
+}
+
 /**
  * Accept the pending plan: bakes its `## Steps` into the agent's system prompt
  * so it emits `[DONE:n]` progress markers as it implements each step (which the
@@ -247,6 +284,10 @@ export interface HistoryEntry {
   /** True when this user message is a post-compaction summary marker, so the
    *  webview renders the quiet compaction notice instead of the summary body. */
   compacted?: boolean;
+  /** True when this entry is a persisted Ken Kai (mentor) turn: a `user` row is
+   *  the `@Ken` question, an `assistant` row is Ken's reply. Rendered in Ken's
+   *  color (user bubble tinted, assistant as a Ken bubble) on resume. */
+  ken?: boolean;
   /** Tool-produced images rendered inline (same as live `images` items),
    *  reconstructed from ImageContent blocks in persisted tool results. */
   toolImages?: Array<{ src: string; path?: string }>;
@@ -272,6 +313,18 @@ export async function listHistory(): Promise<HistoryEntry[]> {
 // ── Provider auth (login) ──────────────────────────────────
 export type AuthMethod = "oauth" | "apikey";
 
+/**
+ * One API-key option for a provider that splits auth across multiple distinct
+ * endpoints/credentials (currently only Xiaomi: Token Plan vs. API Credits).
+ */
+export interface ApiKeyVariant {
+  /** Storage key in auth.json (distinct from the provider `value`). */
+  key: string;
+  /** Display label, e.g. "Token Plan" or "API Credits". */
+  label: string;
+  baseUrl?: string;
+}
+
 export interface AuthProvider {
   value: string;
   label: string;
@@ -279,6 +332,8 @@ export interface AuthProvider {
   methods: AuthMethod[];
   apiKeyLabel?: string;
   apiKeyBaseUrl?: string;
+  /** When set, the API-key flow must ask which variant before submitting. */
+  apiKeyVariants?: ApiKeyVariant[];
   /** Live connection status from ~/.gg/auth.json. */
   connected: boolean;
 }
@@ -307,8 +362,8 @@ export async function authStatus(): Promise<AuthProvider[]> {
  * user's sidecar may not have booted yet, and a sidecar round-trip would hang.
  * Throws with a user-facing message on error.
  */
-export async function authApiKey(provider: string, key: string): Promise<void> {
-  await invoke("app_auth_apikey", { provider, key });
+export async function authApiKey(provider: string, key: string, variant?: string): Promise<void> {
+  await invoke("app_auth_apikey", { provider, key, variant });
 }
 
 /**

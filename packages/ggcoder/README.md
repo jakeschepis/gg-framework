@@ -69,12 +69,12 @@ Switch mid-conversation with `/model`. Not locked to anyone.
 
 | Provider | Models | Auth |
 |---|---|---|
-| **Anthropic** | Claude Opus 4.8, Sonnet 4.6, Haiku 4.5 | OAuth |
+| **Anthropic** | Claude Opus 4.8, Sonnet 5, Haiku 4.5 | OAuth |
 | **OpenAI** | GPT-5.5, GPT-5.5 Pro, GPT-5.4, GPT-5.3 Codex | OAuth |
 | **Moonshot** | Kimi K2.7 | API key |
 | **Z.AI (GLM)** | GLM-5.1, GLM-4.7, GLM-4.7 Flash | API key |
 | **MiniMax** | MiniMax M3 (image + video) | API key |
-| **Xiaomi (MiMo)** | MiMo-V2.5-Pro, MiMo-V2.5 (image + video) | API key |
+| **Xiaomi (MiMo)** | MiMo-V2.5-Pro, MiMo-V2.5-Pro-UltraSpeed, MiMo-V2.5 (image + video) | API key |
 | **DeepSeek** | DeepSeek V4 Pro, V4 Flash | API key |
 | **OpenRouter** | Qwen3.6-Plus + multi-provider gateway | API key |
 

@@ -194,7 +194,7 @@ describe("compaction thresholds across all models", () => {
 
   const modelThresholds: { model: string; contextWindow: number }[] = [
     { model: "claude-opus-4-8", contextWindow: 1_000_000 },
-    { model: "claude-sonnet-4-6", contextWindow: 1_000_000 },
+    { model: "claude-sonnet-5", contextWindow: 1_000_000 },
     { model: "claude-haiku-4-5-20251001", contextWindow: 200_000 },
     { model: "gpt-5.3-codex", contextWindow: 400_000 },
     { model: "gpt-5.1-codex-mini", contextWindow: 200_000 },
@@ -543,7 +543,7 @@ import { stream } from "@kenkaiiii/gg-ai";
 describe("compact", () => {
   const baseOptions = {
     provider: "anthropic" as const,
-    model: "claude-sonnet-4-6-20250514",
+    model: "claude-sonnet-5",
     apiKey: "test-key",
     contextWindow: 200_000,
   };

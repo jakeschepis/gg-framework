@@ -130,7 +130,7 @@ function renderToolsSection(toolNames: readonly string[] | undefined): string | 
   return parts.length > 0 ? `## Tools\n\n${parts.join("\n\n")}` : null;
 }
 
-async function collectProjectContext(cwd: string): Promise<string[]> {
+export async function collectProjectContext(cwd: string): Promise<string[]> {
   const contextParts: string[] = [];
   let dir = cwd;
   const visited = new Set<string>();

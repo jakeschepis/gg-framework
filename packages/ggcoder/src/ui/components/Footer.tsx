@@ -45,7 +45,7 @@ const MODEL_SHORT_NAMES: Record<string, string> = {
   "claude-fable-5": "Fable",
   "claude-mythos-5": "Mythos",
   "claude-opus-4-8": "Opus",
-  "claude-sonnet-4-6": "Sonnet",
+  "claude-sonnet-5": "Sonnet",
   "claude-haiku-4-5": "Haiku",
   "claude-haiku-4-5-20251001": "Haiku",
   "gpt-5.5": "GPT-5.5",

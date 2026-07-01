@@ -84,7 +84,7 @@ describe("plan mode", () => {
         },
       ],
       provider: "anthropic",
-      model: "claude-sonnet-4-6",
+      model: "claude-sonnet-5",
     });
 
     const context = toolContext();

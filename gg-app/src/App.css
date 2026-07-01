@@ -26,6 +26,11 @@
   --user-text: #818cf8;
   --user-bg: #313a49;
 
+  /* Ken Kai (mentor agent) — soft cyan/green. Single source of truth with
+     theme.ken in theme.ts; both MUST match or the inline-styled @Ken input
+     drifts from the CSS-styled chat bubbles. Marks every Ken element. */
+  --ken: #5ad1e6;
+
   /* Shape system (Linear capsule-vs-card + Warp three radii). */
   --radius-button: 6px;
   --radius-card: 10px;
@@ -1693,6 +1698,18 @@ body {
   white-space: pre-wrap;
   word-break: break-word;
 }
+/* `@Ken` prompt bubble: tinted in Ken's color (matching his replies + the input
+   highlight) so the transcript shows this message went to the mentor, not GG
+   Coder. A faint Ken-tinted fill keeps it readable on the right edge. */
+.user-msg.user-ken {
+  color: var(--ken);
+  background: color-mix(in srgb, var(--ken) 12%, var(--user-bg));
+}
+/* "Sent to GG Coder" bubble (from a Ken prompt-block button): same faint Ken
+   tint as a @Ken bubble, with the shimmer label carrying Ken's color. */
+.user-msg.user-ken-sent {
+  background: color-mix(in srgb, var(--ken) 12%, var(--user-bg));
+}
 
 /* ── Queued steering message: still waiting to be injected mid-run. Dim it
    and pulse a soft "queued" pill so it reads as not-yet-sent vs a live send. ── */
@@ -1960,6 +1977,85 @@ body {
   color: var(--text);
   border-color: var(--border-strong);
   background: var(--surface-2);
+}
+/* Ken Kai (mentor agent): the whole reply is tinted in Ken's color — that tint
+   IS the only signal it's Ken, not GG Coder. No border line, no badge. Color the
+   markdown text and its inline elements (headings, list markers, bold, links),
+   but leave the runnable-prompt block to its own styling below. */
+.ken-msg .assistant-text,
+.ken-msg .assistant-text .markdown,
+.ken-msg .assistant-text .markdown :is(p, li, h1, h2, h3, h4, strong, em, blockquote, code) {
+  color: var(--ken);
+}
+.ken-msg .assistant-text .markdown a {
+  color: var(--ken);
+  text-decoration-color: color-mix(in srgb, var(--ken) 50%, transparent);
+}
+/* Ken's activity bar reuses the GG Coder ActivityBar's running statusrow as-is
+   (same top border, padding, spinner, layout, meta readout) so it's the same
+   control aligned to what we have, just tinted to Ken. Only the spinner glow is
+   re-tinted from brand-blue to Ken's color. */
+.ken-spinner {
+  text-shadow: 0 0 8px color-mix(in srgb, var(--ken) 55%, transparent);
+}
+
+/* Ken's runnable-prompt block: Ken-tinted, with a Send-to-GG-Coder button. */
+.markdown .ken-prompt-block {
+  margin: 0.6em 0;
+  /* Neutral card (no pink): a subtle raised surface with the standard border,
+     so the prompt reads as an actionable block without the heavy magenta tint. */
+  border: 1px solid var(--border);
+  border-radius: var(--radius-card);
+  background: var(--surface-1);
+  overflow: hidden;
+}
+.markdown .ken-prompt-body {
+  margin: 0;
+  padding: 12px 14px;
+  background: transparent;
+  border: none;
+  border-radius: 0;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 0.92em;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  user-select: text;
+  -webkit-user-select: text;
+}
+/* Send button: neutral surface, standard border, with the Ken color reserved
+   for the text + icon only (the accent, not the whole button). No pink fill. */
+.markdown .ken-prompt-send {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  margin: 0 14px 12px;
+  padding: 5px 11px;
+  font-family: var(--sans);
+  font-size: 12px;
+  font-weight: 600;
+  line-height: 1;
+  color: var(--ken);
+  background: var(--surface-2);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-button);
+  cursor: pointer;
+  transition:
+    color var(--t-fast),
+    border-color var(--t-fast),
+    background var(--t-fast);
+}
+.markdown .ken-prompt-send:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: var(--surface-1);
+}
+/* Sent: settles to a quiet confirmed state in success green, no longer the
+   call-to-action Ken accent. */
+.markdown .ken-prompt-send.sent {
+  color: var(--success);
+  cursor: default;
+  opacity: 0.85;
 }
 .markdown table {
   border-collapse: collapse;
@@ -2318,6 +2414,58 @@ body {
   position: relative;
   z-index: 1;
   background: transparent;
+}
+
+/* `@Ken` active: the textarea text goes transparent (caret stays via caret-color)
+   so only the aligned highlight overlay shows, with the leading `@Ken` shimmering
+   in Ken's color. This is the signal the message is addressed to the mentor. */
+.input-stack .input.input-ken {
+  color: transparent;
+  caret-color: var(--ken);
+}
+.input-stack .input.input-ken::placeholder {
+  color: var(--text-dim);
+}
+.ken-input-highlight {
+  position: absolute;
+  inset: 0;
+  z-index: 0;
+  pointer-events: none;
+  /* Match .input metrics EXACTLY so the overlay text lands under the textarea's
+     own glyphs and caret 1:1. */
+  font-family: var(--mono);
+  font-size: 14px;
+  line-height: 1.5;
+  padding: 0;
+  margin: 0;
+  /* Identical text metrics to .input above (see note there) so glyph advance
+     matches the textarea 1:1 and the caret tracks the visible text exactly. */
+  letter-spacing: 0;
+  word-spacing: 0;
+  font-kerning: none;
+  font-variant-ligatures: none;
+  /* Wrap EXACTLY like the textarea (soft-wrap: break at spaces, don't break
+     words). The textarea uses the CSS default overflow-wrap: normal, so the
+     overlay must too, or it wraps at a different point and the caret drifts from
+     the visible text on wrapped lines. */
+  white-space: pre-wrap;
+  overflow-wrap: normal;
+  word-break: normal;
+  overflow: hidden;
+  max-height: 40vh;
+  color: var(--user-text);
+}
+/* The `@Ken` token is a shimmer span, which otherwise renders at font-weight 600.
+   In the input it MUST match the textarea's exact glyph metrics (normal weight,
+   inherited mono) or its advance width drifts from the real text and the caret
+   lands away from the visible end. Force it to inherit the input's metrics. */
+.ken-input-highlight .shimmer-text {
+  font: inherit;
+  font-weight: inherit;
+  letter-spacing: inherit;
+  word-spacing: inherit;
+  font-kerning: inherit;
+  font-variant-ligatures: inherit;
 }
 
 /* Dissolve→skeleton→decode animation layer. While it plays it becomes the input
@@ -2878,6 +3026,15 @@ body {
   color: var(--user-text);
   font-family: var(--mono);
   font-size: 14px;
+  /* Pin every text-metric property explicitly so the @Ken highlight overlay (a
+     <div>) and this <textarea> compute IDENTICAL glyph advance. Browsers apply
+     different UA defaults for kerning/ligatures/spacing to form controls vs
+     divs, which otherwise drifts the caret from the visible overlay text by a
+     growing amount as you type. */
+  letter-spacing: 0;
+  word-spacing: 0;
+  font-kerning: none;
+  font-variant-ligatures: none;
   /* Auto-growing multi-line input: JS sets height to fit content; cap growth
      here and scroll past the cap. No manual resize handle, wrap long lines. */
   resize: none;

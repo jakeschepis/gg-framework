@@ -21,11 +21,18 @@ import { SettingsManager } from "./settings-manager.js";
 import { AuthStorage } from "./auth-storage.js";
 import { getClaudeCliUserAgent } from "./claude-code-version.js";
 import { kimiCodingHeaders, isKimiCodingEndpoint } from "./oauth/kimi.js";
-import { SessionManager, type MessageEntry, type BranchInfo } from "./session-manager.js";
+import {
+  SessionManager,
+  KEN_TURN_CUSTOM_KIND,
+  type MessageEntry,
+  type BranchInfo,
+  type CustomEntry,
+  type KenTurnPayload,
+} from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
 import { shouldCompact, compact } from "./compaction/compactor.js";
-import { getContextWindow, getModel, MODELS } from "./model-registry.js";
+import { getAuthStorageKeys, getContextWindow, getModel, MODELS } from "./model-registry.js";
 import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
 import { buildSystemPrompt } from "../system-prompt.js";
@@ -120,6 +127,25 @@ export interface AgentSessionOptions {
    */
   onEnterPlan?: (reason?: string) => void | Promise<void>;
   onExitPlan?: (planPath: string) => Promise<string>;
+  /**
+   * If provided, the session's tool set is filtered to ONLY these tool names
+   * after `createTools()` runs, and the system prompt's Tools section lists only
+   * them. Used by read-only advisory sessions (e.g. the Ken mentor agent) to
+   * register a safe subset — excluded mutating tools (write/edit/bash/…) are
+   * never registered, so a hallucinated call can't change the repo. Default
+   * (undefined) = all tools, preserving every existing caller's behavior.
+   */
+  allowedTools?: string[];
+  /**
+   * MCP server names whose tools are allowed in an allow-listed session. Only
+   * meaningful alongside `allowedTools`. With it set, the session connects ONLY
+   * these named MCP servers (not the full configured set) and every tool they
+   * expose (`mcp__<server>__*`) passes the allow-list. The Ken mentor agent uses
+   * this to get `kencode-search` for real-code research while still being barred
+   * from every mutating tool. Empty/undefined → an allow-listed session skips
+   * MCP entirely (its dynamic tool names could never match a fixed allow-list).
+   */
+  allowedMcpServers?: string[];
 }
 
 // ── State ──────────────────────────────────────────────────
@@ -146,6 +172,12 @@ export class AgentSession {
   private extensionLoader = new ExtensionLoader();
 
   private messages: Message[] = [];
+  // Ken Kai (mentor agent) turns recorded against this build session. Advisory
+  // only — NEVER part of `messages` (GG Coder must not see them), but persisted
+  // alongside the session and reloaded on resume so they reappear in the
+  // transcript. Each carries the non-system message count at record time so the
+  // webview can interleave them chronologically.
+  private kenTurns: KenTurnPayload[] = [];
   private tools: AgentTool[] = [];
   /** Rebuilds the read tool for a new model (video byte cap is baked in at
    *  creation). Called from switchModel so video-capable models get the
@@ -294,7 +326,11 @@ export class AgentSession {
           }
         : {}),
     });
-    this.tools = tools;
+    // Apply the optional tool allow-list (read-only advisory sessions). Filtering
+    // here means the excluded tools are never registered with the agent loop, so
+    // a hallucinated call can't mutate the repo — and buildSystemPrompt below is
+    // fed the same filtered names so the Tools section matches exactly.
+    this.tools = this.opts.allowedTools ? tools.filter((t) => this.isToolAllowed(t.name)) : tools;
     this.rebuildReadTool = rebuildReadTool;
     this.processManager = processManager;
     this.lspManager = lspManager;
@@ -401,6 +437,26 @@ export class AgentSession {
   }
 
   /**
+   * Whether a tool name is permitted for this session. With no `allowedTools`
+   * everything passes (default behavior). Otherwise a tool is allowed when its
+   * name is in `allowedTools`, OR it's an MCP tool (`mcp__<server>__<tool>`)
+   * whose `<server>` is in `allowedMcpServers`. The MCP-prefix rule lets a
+   * whitelisted research server (e.g. kencode-search) expose all its tools
+   * without hard-coding each one, while every other tool stays blocked.
+   */
+  private isToolAllowed(name: string): boolean {
+    const allowed = this.opts.allowedTools;
+    if (!allowed) return true;
+    if (allowed.includes(name)) return true;
+    const mcpWhitelist = this.opts.allowedMcpServers;
+    if (mcpWhitelist && name.startsWith("mcp__")) {
+      const server = name.slice("mcp__".length).split("__")[0];
+      return mcpWhitelist.includes(server);
+    }
+    return false;
+  }
+
+  /**
    * Connect all configured MCP servers and append their tools to `this.tools`.
    * Resolves the GLM api key first (Z.AI's bundled servers need it). Never
    * throws — a failed connect is logged and skipped — so it is safe to either
@@ -411,6 +467,14 @@ export class AgentSession {
    */
   private async connectMcpServers(): Promise<void> {
     if (!this.mcpManager) return;
+    // Allow-listed (read-only advisory) sessions enforce a fixed tool set by
+    // name. An MCP server is only connected when its name is explicitly
+    // whitelisted via `allowedMcpServers` (the Ken mentor agent does this for
+    // `kencode-search` so it can research real code). With no whitelist, skip
+    // MCP entirely — dynamic `mcp__server__tool` names could never match a fixed
+    // allow-list, and connecting would waste resources spawning stdio servers.
+    const mcpWhitelist = this.opts.allowedMcpServers;
+    if (this.opts.allowedTools && (!mcpWhitelist || mcpWhitelist.length === 0)) return;
     try {
       let apiKey: string | undefined;
       if (this.provider === "glm") {
@@ -421,9 +485,20 @@ export class AgentSession {
           // GLM not configured — skip Z.AI MCP servers
         }
       }
-      const mcpTools = await this.mcpManager.connectAll(
-        await getAllMcpServers(this.provider, apiKey, this.cwd),
-      );
+      let servers = await getAllMcpServers(this.provider, apiKey, this.cwd);
+      // Whitelisted allow-listed session: connect ONLY the named servers, never
+      // the user's full configured set (which could include mutating tools). The
+      // whitelist only restricts in allow-list mode (the documented contract) so
+      // a normal session is never affected by a stray allowedMcpServers.
+      if (this.opts.allowedTools && mcpWhitelist) {
+        servers = servers.filter((s) => mcpWhitelist.includes(s.name));
+      }
+      const connected = await this.mcpManager.connectAll(servers);
+      // Defense-in-depth: even from a whitelisted server, only push tools that
+      // pass the allow-list (no-op when there's no allow-list).
+      const mcpTools = this.opts.allowedTools
+        ? connected.filter((t) => this.isToolAllowed(t.name))
+        : connected;
       this.tools.push(...mcpTools);
       // Background connect resolves AFTER initialize() has already built the
       // system prompt (the default path awaits this before buildSystemPrompt,
@@ -735,7 +810,9 @@ export class AgentSession {
     // Resolve OAuth credentials and run agent loop.
     // On 401, force-refresh the token and retry once — the provider may have
     // revoked the token server-side before the stored expiry (e.g. after a restart).
-    let creds = await this.authStorage.resolveCredentials(this.provider);
+    let creds = await this.authStorage.resolveCredentials(this.provider, {
+      storageKeys: this.currentAuthStorageKeys(),
+    });
 
     // Auto-compact if needed. This must happen after credential resolution so
     // OpenAI OAuth/Codex sessions use the Codex product context window instead
@@ -821,12 +898,24 @@ export class AgentSession {
         // (active for `moonshot` when present) is refreshable, so it falls
         // through to the force-refresh path below.
         if (await this.authStorage.isStaticApiKey(this.provider)) {
-          log("WARN", "auth", `Got 401 for ${this.provider} — API key is invalid or revoked`);
-          await this.authStorage.clearCredentials(this.provider);
+          // Clear whichever key actually resolved (the request may have used
+          // a fallback key, not the model's first preference).
+          const badKey =
+            (await this.authStorage.pickStorageKey(this.currentAuthStorageKeys())) ??
+            this.currentAuthStorageKeys()[0]!;
+          log(
+            "WARN",
+            "auth",
+            `Got 401 for ${this.provider} (${badKey}) — API key is invalid or revoked`,
+          );
+          await this.authStorage.clearCredentials(badKey);
           throw err;
         }
         log("INFO", "auth", "Got 401, force-refreshing token and retrying");
-        creds = await this.authStorage.resolveCredentials(this.provider, { forceRefresh: true });
+        creds = await this.authStorage.resolveCredentials(this.provider, {
+          forceRefresh: true,
+          storageKeys: this.currentAuthStorageKeys(),
+        });
         await runAgentLoop(creds.accessToken, creds.accountId, creds.projectId);
       } else {
         throw err;
@@ -926,7 +1015,11 @@ export class AgentSession {
     projectId?: string;
     baseUrl?: string;
   }): Promise<void> {
-    const creds = existingCredentials ?? (await this.authStorage.resolveCredentials(this.provider));
+    const creds =
+      existingCredentials ??
+      (await this.authStorage.resolveCredentials(this.provider, {
+        storageKeys: this.currentAuthStorageKeys(),
+      }));
     const contextWindow = getContextWindow(this.model, {
       provider: this.provider,
       accountId: creds.accountId,
@@ -958,6 +1051,8 @@ export class AgentSession {
       await this.persistMessage(msg);
     }
     this.lastPersistedIndex = this.messages.length;
+    // Carry Ken's advisory turns into the new file so they survive compaction.
+    await this.rePersistKenTurns();
 
     this.eventBus.emit("compaction_end", {
       originalCount: result.result.originalCount,
@@ -1137,6 +1232,58 @@ export class AgentSession {
     return this.messages;
   }
 
+  /** Ken Kai (mentor) turns recorded against this session, in record order. Used
+   *  by the host to interleave Ken's advisory exchanges back into the transcript
+   *  on resume. Never part of the LLM message history. */
+  getKenTurns(): KenTurnPayload[] {
+    return this.kenTurns;
+  }
+
+  /**
+   * Record one Ken Kai (mentor agent) turn against this build session: the
+   * user's question + Ken's reply. Kept in memory for the live transcript and
+   * persisted as a `custom` entry (parentId null, so it's never on the message
+   * DAG and never seen by the LLM, and can't race the build session's leaf while
+   * Ken runs concurrently). `afterMessageCount` anchors it among the messages so
+   * the host can interleave it chronologically. No-op persistence for transient
+   * sessions (kept in memory only). Best-effort: a write failure is swallowed by
+   * appendEntry's own handling.
+   */
+  async persistKenTurn(question: string, reply: string): Promise<void> {
+    const afterMessageCount = this.messages.filter((m) => m.role !== "system").length;
+    const payload: KenTurnPayload = { version: 1, question, reply, afterMessageCount };
+    this.kenTurns.push(payload);
+    if (!this.sessionPath) return;
+    const entry: CustomEntry = {
+      type: "custom",
+      kind: KEN_TURN_CUSTOM_KIND,
+      id: crypto.randomUUID(),
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      data: payload,
+    };
+    await this.sessionManager.appendEntry(this.sessionPath, entry);
+  }
+
+  /** Re-append the in-memory Ken turns to the current session file. Called after
+   *  a continuation/compaction file is created so Ken's advisory history isn't
+   *  lost when the session is rewritten (those rewrites only re-persist
+   *  messages). Each turn keeps its original `afterMessageCount` anchor. */
+  private async rePersistKenTurns(): Promise<void> {
+    if (!this.sessionPath) return;
+    for (const payload of this.kenTurns) {
+      const entry: CustomEntry = {
+        type: "custom",
+        kind: KEN_TURN_CUSTOM_KIND,
+        id: crypto.randomUUID(),
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        data: payload,
+      };
+      await this.sessionManager.appendEntry(this.sessionPath, entry);
+    }
+  }
+
   /**
    * Generate a short LLM session title from the conversation so far (first user
    * message + first assistant reply). Best-effort; returns null on failure or
@@ -1156,7 +1303,9 @@ export class AgentSession {
     const userText = userMsg ? extractText(userMsg.content) : "";
     if (!userText.trim()) return null;
     try {
-      const creds = await this.authStorage.resolveCredentials(this.provider);
+      const creds = await this.authStorage.resolveCredentials(this.provider, {
+        storageKeys: this.currentAuthStorageKeys(),
+      });
       const title = await generateSessionTitle({
         provider: this.provider,
         userMessage: userText,
@@ -1180,7 +1329,9 @@ export class AgentSession {
    */
   async enhancePrompt(text: string): Promise<EnhanceResult> {
     if (!text.trim()) return { enhanced: text, segments: [{ kind: "text", text }] };
-    const creds = await this.authStorage.resolveCredentials(this.provider);
+    const creds = await this.authStorage.resolveCredentials(this.provider, {
+      storageKeys: this.currentAuthStorageKeys(),
+    });
     // Cheap, best-effort stack detection from the project root so terminology is
     // idiomatic to the user's stack. Never throws (returns "" on any failure).
     let stack = "";
@@ -1220,6 +1371,17 @@ export class AgentSession {
   /** True when speedProfile is "optimized" (1-h cache TTL + pre-warm). */
   private isSpeedOptimized(): boolean {
     return this.settingsManager?.get("speedProfile") === "optimized";
+  }
+
+  /**
+   * Ordered auth-storage keys the current (provider, model) pair tries, first
+   * match wins. Almost always just the provider id; Xiaomi models can prefer
+   * one endpoint and fall back to another the user configured instead (e.g.
+   * `mimo-v2.5-pro` prefers the Token Plan, falls back to API Credits; the
+   * API-only `mimo-v2.5-pro-ultraspeed` has no fallback).
+   */
+  private currentAuthStorageKeys(): string[] {
+    return getAuthStorageKeys(this.provider, this.model);
   }
 
   /** Fire a cache pre-warm request for Anthropic so the first real turn is a
@@ -1294,6 +1456,9 @@ export class AgentSession {
     const loaded = await this.sessionManager.load(sessionPath);
     // Use the leaf from the header to walk the correct branch
     const loadedMessages = this.sessionManager.getMessages(loaded.entries, loaded.header.leafId);
+    // Restore Ken's advisory turns (custom entries, not on the message branch) so
+    // they reappear in the transcript and survive into the continuation file.
+    this.kenTurns = this.sessionManager.getKenTurns(loaded.entries);
 
     // Track the current leaf for subsequent entries
     this.currentLeafId = loaded.header.leafId;
@@ -1304,7 +1469,9 @@ export class AgentSession {
 
     // Auto-compact on load if the restored session exceeds the context window.
     // Without this, huge sessions (1M+ tokens) get loaded into memory and OOM.
-    const creds = await this.authStorage.resolveCredentials(this.provider);
+    const creds = await this.authStorage.resolveCredentials(this.provider, {
+      storageKeys: this.currentAuthStorageKeys(),
+    });
     const contextWindow = getContextWindow(this.model, {
       provider: this.provider,
       accountId: creds.accountId,
@@ -1339,6 +1506,8 @@ export class AgentSession {
       await this.persistMessage(msg);
     }
     this.lastPersistedIndex = this.messages.length;
+    // Carry Ken's restored turns into the continuation file.
+    await this.rePersistKenTurns();
   }
 
   private async prepareDynamicContext(_latestUserPrompt?: string): Promise<Message[]> {
