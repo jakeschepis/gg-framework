@@ -92,6 +92,19 @@ export interface AgentDoneEvent {
   totalUsage: Usage;
 }
 
+/**
+ * Terminal signal emitted when the loop stops because it exhausted its turn
+ * budget (`maxTurns`) mid-task — i.e. the model still wanted to run tools but
+ * ran out of turns. Distinguishes a hard cut-off from a clean completion so
+ * callers (e.g. the subagent spawner) can tell the parent the output may be
+ * incomplete. Yielded immediately before the final `agent_done`.
+ */
+export interface AgentMaxTurnsEvent {
+  type: "max_turns";
+  totalTurns: number;
+  maxTurns: number;
+}
+
 export interface AgentRetryEvent {
   type: "retry";
   reason:
@@ -100,7 +113,8 @@ export interface AgentRetryEvent {
     | "provider_error"
     | "empty_response"
     | "stream_stall"
-    | "overflow_compact";
+    | "overflow_compact"
+    | "tool_argument_glitch";
   attempt: number;
   maxAttempts: number;
   delayMs: number;
@@ -160,6 +174,7 @@ export type AgentEvent =
   | AgentRetryEvent
   | AgentTurnEndEvent
   | AgentDoneEvent
+  | AgentMaxTurnsEvent
   | AgentErrorEvent;
 
 // ── Agent Options ───────────────────────────────────────────

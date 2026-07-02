@@ -6,7 +6,13 @@ import type {
   StreamResponse,
   ToolCall,
 } from "../types.js";
-import { ProviderError, readHeader, isHardBillingMessage } from "../errors.js";
+import {
+  ProviderError,
+  readHeader,
+  isHardBillingMessage,
+  isRawJsonErrorEcho,
+  emptyProviderErrorMessage,
+} from "../errors.js";
 import { StreamResult } from "../utils/event-stream.js";
 import {
   downgradeUnsupportedImages,
@@ -495,7 +501,12 @@ function toError(err: unknown, provider: string = "openai"): ProviderError {
     const bodyMessage =
       typeof body?.message === "string" && body.message.trim() ? body.message.trim() : undefined;
     const modelName = typeof body?.model === "string" ? body.model : "";
-    const cleanMessage = bodyMessage ?? err.message;
+    // When the body has no usable message, the SDK's err.message is a raw
+    // JSON echo of the (often near-empty) error body — swap in a clean fallback
+    // rather than showing that to the user (see isRawJsonErrorEcho).
+    const cleanMessage =
+      bodyMessage ??
+      (isRawJsonErrorEcho(err.message) ? emptyProviderErrorMessage(err.status) : err.message);
 
     let hint: string | undefined;
     if (modelName === "codex-mini-latest" || cleanMessage.includes("codex-mini-latest")) {

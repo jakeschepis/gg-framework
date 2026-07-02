@@ -22,6 +22,74 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.12.1",
+    date: "2026-07-02",
+    items: [
+      "Squashed a bug in the brand new KEN IS ON banner: in a scrolled-down session it was flashing up above your chat instead of right over it. I pinned it to what you are actually looking at, every time, no matter how deep you have scrolled.",
+      "Also polished off a hairline sliver of chat text that could peek through the top edge of the banner. Full coverage now, clean every time.",
+    ],
+  },
+  {
+    version: "0.12.0",
+    date: "2026-07-02",
+    items: [
+      'Autopilot got sharper. I now know the difference between real work and a quick hello. Small talk, a plain answer, or a routine commit and push no longer get a pointless "all clear" from me, I just stay quiet and let you keep moving.',
+      "Flipping Autopilot mid-run is off the table now, and that is a good thing. The switch locks while I am working or reviewing so you never yank the rug out from under your own build.",
+      "You'll know exactly when I'm watching. A bold KEN IS ON banner flashes across the chat the moment you flip Autopilot on, and KEN IS OFF when you pull me back, so there is never any doubt whose eyes are on the work.",
+    ],
+  },
+  {
+    version: "0.11.1",
+    date: "2026-07-02",
+    items: [
+      "Fixed a spot where your sub-agents would refuse to launch. If you called on bee, owl, researcher, or worker they could hit a wall and fail outright. I tracked it down and cleared the path, so they run clean every time now.",
+      "Cleaned up the model picker. Opening it while you had a longer message typed used to let the chat box paint right over the dropdown. Now it always sits on top where you can actually read it.",
+    ],
+  },
+  {
+    version: "0.11.0",
+    date: "2026-07-02",
+    items: [
+      "Meet Autopilot. Flip it on and I stay in the room after every job, reviewing what GG Coder just built the moment it finishes. If something is broken or half-done I send it right back in with a sharp fix, if it nailed it I call it clear, and if it is a real judgment call I tap you on the shoulder. You get a second set of eyes on every single turn without lifting a finger.",
+      "You can watch me work now too. While I review, a little Ken line lights up in the status bar, and my verdict lands right in the chat like I am talking straight to you. No mystery, no black box.",
+      "Your workspace tidies itself. The second a task is done it slips out of your Tasks list on its own, so all you ever see is what still needs doing. No more hunting for the checkbox.",
+      "Un-minimizing one window now brings the whole crew back. Click a single GG Coder window back up and its siblings rise with it, so you are never left digging through the dock for the rest.",
+    ],
+  },
+  {
+    version: "0.10.3",
+    date: "2026-07-02",
+    items: [
+      "Your helper agents just got a lot more capable. I gave them room to run five times longer, so instead of quitting halfway through a real job they now see it all the way to the finish. And if one ever does run out of road, it tells you straight up instead of handing back a mysterious blank.",
+      "Read-only agents are now genuinely read-only. When I send a scout out to explore your code, it physically cannot touch or change a thing. Peace of mind baked right in.",
+      "The tips GG Coder gives you now actually match the app. No more being told to press some terminal shortcut that does not exist here. It points you at the real buttons you can see and click.",
+    ],
+  },
+  {
+    version: "0.10.2",
+    date: "2026-07-01",
+    items: [
+      "Anthropic occasionally drops a tool call mid-stream with nothing in it, and it used to make GG Coder throw up its hands and blame itself. I taught it to recognize that exact glitch and just quietly pick the work back up, so a rare hiccup doesn't kill your session anymore.",
+      "When something really does go wrong, I fixed the message so it points at the actual culprit instead of guessing it's a GG Coder bug. Clearer errors, less confusion about who to blame.",
+    ],
+  },
+  {
+    version: "0.10.1",
+    date: "2026-07-01",
+    items: [
+      "Big sessions on GPT-5.5 just got sturdier. I fixed a bug where long chats could blow past the real context limit right after a compaction and choke with a context-window error. Now I always leave enough headroom, so those marathon sessions keep running instead of stalling out.",
+      "The context meter in the footer is honest now too. It reads the real window for however you're connected, so the percentage you see actually means something.",
+    ],
+  },
+  {
+    version: "0.10.0",
+    date: "2026-07-01",
+    items: [
+      "Claude Fable 5 is back on the menu. I flipped it back on in the model picker so you can jump straight to it again, no workarounds needed.",
+      "Error messages just got a whole lot friendlier. When a provider hiccups, I stopped showing you scary raw error dumps and started telling you exactly what happened, whether it's on their end or mine, and when things reset if you hit a usage limit.",
+    ],
+  },
+  {
     version: "0.9.0",
     date: "2026-07-01",
     items: [

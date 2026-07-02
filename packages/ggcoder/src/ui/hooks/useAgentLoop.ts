@@ -138,7 +138,8 @@ export interface RetryInfo {
     | "provider_error"
     | "empty_response"
     | "stream_stall"
-    | "overflow_compact";
+    | "overflow_compact"
+    | "tool_argument_glitch";
   attempt: number;
   maxAttempts: number;
   delayMs: number;

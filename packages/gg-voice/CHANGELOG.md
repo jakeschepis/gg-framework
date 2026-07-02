@@ -1,5 +1,54 @@
 # @kenkaiiii/gg-voice
 
+## 4.3.245
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.6.0
+- @kenkaiiii/gg-agent@5.6.0
+
+## 4.3.244
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.5.1
+- @kenkaiiii/gg-agent@5.5.1
+
+## 4.3.243
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.5.0
+- @kenkaiiii/gg-agent@5.5.0
+
+## 4.3.242
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.4.3
+- @kenkaiiii/gg-agent@5.4.3
+
+## 4.3.241
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.4.2
+- @kenkaiiii/gg-agent@5.4.2
+
+## 4.3.240
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.4.1
+- @kenkaiiii/gg-agent@5.4.1
+
+## 4.3.239
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.4.0
+- @kenkaiiii/gg-agent@5.4.0
+
 ## 4.3.238
 
 ### Patch Changes

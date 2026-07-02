@@ -120,6 +120,8 @@ describe("AgentSession worker auto-compaction", () => {
       expect.arrayContaining([{ role: "user", content: "Do worker task" }]),
       expect.any(Number),
       0.1,
+      undefined,
+      expect.any(Number),
     );
     expect(compactMock).toHaveBeenCalledWith(
       expect.arrayContaining([{ role: "user", content: "Do worker task" }]),

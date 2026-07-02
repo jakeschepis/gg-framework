@@ -110,6 +110,33 @@ function renderMessage(msg: Message): string | null {
 }
 
 /**
+ * Fixed instruction fed into the digest's `question` slot in autopilot mode.
+ * Autopilot Ken doesn't answer a user — he reviews the just-finished GG Coder
+ * turn against the user's original ask and replies with a verdict only. The
+ * verdict format itself is taught by his system prompt; this just points him at
+ * the transcript and demands the machine-parseable answer.
+ */
+export const AUTOPILOT_REVIEW_INSTRUCTION =
+  "GG Coder just finished a turn. Review its work against the user's original " +
+  "request in the transcript above. Reply with your verdict ONLY — the first " +
+  "line must be exactly PROMPT, ALL_CLEAR, IGNORE, or HUMAN, with the payload " +
+  "after. No greetings, no mentorship prose.";
+
+/** Inputs the sidecar gathers for an autopilot review digest (everything
+ *  `buildKenDigest` needs except the fixed review instruction, which this helper
+ *  supplies as the `question`). */
+export type KenAutopilotContextInput = Omit<KenDigestInput, "question">;
+
+/**
+ * Build the autopilot-review digest: identical to a normal Ken digest but with
+ * the fixed {@link AUTOPILOT_REVIEW_INSTRUCTION} as the trailing question, so
+ * Ken reviews the transcript instead of answering a user. Pure — no I/O.
+ */
+export function buildKenAutopilotContext(input: KenAutopilotContextInput): string {
+  return buildKenDigest({ ...input, question: AUTOPILOT_REVIEW_INSTRUCTION });
+}
+
+/**
  * Build Ken's full context digest string. Pure — no I/O. The sidecar gathers the
  * inputs (project context, git, messages) and calls this.
  */

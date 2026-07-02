@@ -75,7 +75,7 @@ describe("useKenMentor", () => {
     expect(hook.result.current.kenTokens).toBe(15);
   });
 
-  it("ken_error pushes a kind:'error' item and stops running", () => {
+  it("ken_error with only a message (legacy shape) falls back to a flat text item", () => {
     const { hook, getItems } = setup();
     act(() => {
       hook.result.current.handleKenEvent(ev("ken_run_start"));
@@ -87,6 +87,31 @@ describe("useKenMentor", () => {
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({ kind: "error" });
     expect((items[0] as { text: string }).text).toContain("boom");
+    expect(hook.result.current.kenRunning).toBe(false);
+  });
+
+  it("ken_error with a structured payload (headline/message/guidance) prefixes the headline with Ken", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleKenEvent(ev("ken_run_start"));
+    });
+    act(() => {
+      hook.result.current.handleKenEvent(
+        ev("ken_error", {
+          headline: "Anthropic usage limit reached.",
+          message: "Your Anthropic usage is finished. It resets at 12:50 PM.",
+          guidance: "Try again once it's back. Your conversation is preserved.",
+        }),
+      );
+    });
+    const items = getItems();
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "error",
+      headline: "Ken: Anthropic usage limit reached.",
+      message: "Your Anthropic usage is finished. It resets at 12:50 PM.",
+      guidance: "Try again once it's back. Your conversation is preserved.",
+    });
     expect(hook.result.current.kenRunning).toBe(false);
   });
 

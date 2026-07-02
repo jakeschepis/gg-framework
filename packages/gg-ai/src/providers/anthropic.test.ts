@@ -215,6 +215,50 @@ describe("streamAnthropic error normalization", () => {
     } satisfies Partial<ProviderError>);
   });
 
+  it("replaces an empty-body error's raw JSON echo with a clean message", async () => {
+    const { default: Anthropic } = await import("@anthropic-ai/sdk");
+    const AnthropicMock = Anthropic as unknown as {
+      APIError: new (
+        status: number | undefined,
+        error: unknown,
+        message: string,
+        requestID?: string | null,
+        type?: string | null,
+      ) => Error;
+      nextError: Error | null;
+      nextEvents: unknown[] | null;
+    };
+    AnthropicMock.nextEvents = null;
+    // Anthropic-shaped body (mirrors the first test above) but every field is an
+    // EMPTY STRING rather than absent — e.g. a provider on the Anthropic
+    // transport (MiniMax) returning `{ error: { type: "", message: "" } }`. Both
+    // the empty-string guard (bodyMessage/bodyType must be non-blank to count as
+    // "usable") and the raw-JSON-echo fallback are exercised here: without the
+    // guard, the blank `message: ""` would win and the user would see nothing
+    // at all instead of the clean fallback.
+    AnthropicMock.nextError = new AnthropicMock.APIError(
+      400,
+      { type: "error", error: { type: "", message: "" } },
+      '400 {"type":"error","error":{"type":"","message":""}}',
+      null,
+      null,
+    );
+
+    const result = streamAnthropic({
+      provider: "anthropic",
+      model: "claude-test",
+      messages: [{ role: "user", content: "hi" }],
+      apiKey: "sk-ant-test",
+    });
+
+    await expect(result.response).rejects.toMatchObject({
+      provider: "anthropic",
+      statusCode: 400,
+    } satisfies Partial<ProviderError>);
+    await expect(result.response).rejects.toThrow(/HTTP 400/);
+    await expect(result.response).rejects.not.toThrow(/"message"/);
+  });
+
   it("maps an OAuth usage-window 429 to a usage-limit error with reset time", async () => {
     const { default: Anthropic } = await import("@anthropic-ai/sdk");
     const AnthropicMock = Anthropic as unknown as {

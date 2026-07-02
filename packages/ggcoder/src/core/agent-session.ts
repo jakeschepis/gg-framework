@@ -31,7 +31,7 @@ import {
 } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
-import { shouldCompact, compact } from "./compaction/compactor.js";
+import { shouldCompact, compact, getCompactionReserveTokens } from "./compaction/compactor.js";
 import { getAuthStorageKeys, getContextWindow, getModel, MODELS } from "./model-registry.js";
 import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
@@ -158,6 +158,10 @@ export interface AgentSessionState {
   sessionPath: string;
   messageCount: number;
   planMode: boolean;
+  /** accountId from the most recently resolved credentials, if any — lets
+   *  callers compute the transport-specific context window (e.g. OpenAI Codex
+   *  OAuth) without re-resolving credentials. */
+  accountId?: string;
 }
 
 // ── Agent Session ──────────────────────────────────────────
@@ -223,6 +227,11 @@ export class AgentSession {
   private provider: Provider;
   private model: string;
   private cwd: string;
+  /** accountId from the most recently resolved credentials — cached so sync
+   *  callers (e.g. the app-sidecar's context-window footer stat) can reflect
+   *  transport-specific windows (e.g. OpenAI Codex OAuth's smaller window)
+   *  without re-resolving credentials on every poll. */
+  private lastAccountId?: string;
   private baseUrl?: string;
   private maxTokens: number;
   private thinkingLevel?: ThinkingLevel;
@@ -813,6 +822,9 @@ export class AgentSession {
     let creds = await this.authStorage.resolveCredentials(this.provider, {
       storageKeys: this.currentAuthStorageKeys(),
     });
+    // Cache for sync callers (see field doc) — kept in step with `creds`
+    // through the 401 force-refresh retry below.
+    this.lastAccountId = creds.accountId;
 
     // Auto-compact if needed. This must happen after credential resolution so
     // OpenAI OAuth/Codex sessions use the Codex product context window instead
@@ -823,7 +835,14 @@ export class AgentSession {
         accountId: creds.accountId,
       });
       const threshold = this.settingsManager.get("compactThreshold");
-      if (shouldCompact(this.messages, contextWindow, threshold)) {
+      // Reserve headroom for this model's real output budget (e.g. GPT-5.5 over
+      // Codex OAuth: 272K window but up to 128K max output) — without this the
+      // default 16K reserve lets compaction skip until input alone is near the
+      // window, then `input + max_tokens` exceeds it and the provider rejects
+      // the turn outright with "exceeds the context window". Mirrors the TUI's
+      // useContextCompaction hook.
+      const reserveTokens = getCompactionReserveTokens(this.maxTokens);
+      if (shouldCompact(this.messages, contextWindow, threshold, undefined, reserveTokens)) {
         await this.compact(creds);
         // Re-grounding hook keys off this — the context was just summarized.
         this.compactionOccurred = true;
@@ -916,6 +935,7 @@ export class AgentSession {
           forceRefresh: true,
           storageKeys: this.currentAuthStorageKeys(),
         });
+        this.lastAccountId = creds.accountId;
         await runAgentLoop(creds.accessToken, creds.accountId, creds.projectId);
       } else {
         throw err;
@@ -1144,6 +1164,7 @@ export class AgentSession {
       sessionPath: this.sessionPath,
       messageCount: this.messages.length,
       planMode: this.planModeRef.current,
+      accountId: this.lastAccountId,
     };
   }
 
@@ -1472,11 +1493,23 @@ export class AgentSession {
     const creds = await this.authStorage.resolveCredentials(this.provider, {
       storageKeys: this.currentAuthStorageKeys(),
     });
+    // Cache for sync callers (see field doc) so the app-sidecar's footer shows
+    // the right context window immediately on resume, before any prompt runs
+    // runLoop() and would otherwise be the first to set this.
+    this.lastAccountId = creds.accountId;
     const contextWindow = getContextWindow(this.model, {
       provider: this.provider,
       accountId: creds.accountId,
     });
-    if (shouldCompact(this.messages, contextWindow, 0.8)) {
+    if (
+      shouldCompact(
+        this.messages,
+        contextWindow,
+        0.8,
+        undefined,
+        getCompactionReserveTokens(this.maxTokens),
+      )
+    ) {
       log("INFO", "session", `Restored session exceeds context — auto-compacting`);
       const compacted = await compact(this.messages, {
         provider: this.provider,

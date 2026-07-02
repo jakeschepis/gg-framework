@@ -9,7 +9,7 @@ import { log } from "../core/logger.js";
 import { truncateTail } from "./truncate.js";
 import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 
-const SUB_AGENT_MAX_TURNS = 10;
+const SUB_AGENT_MAX_TURNS = 50;
 const SUB_AGENT_MAX_OUTPUT_CHARS = 100_000; // ~25k tokens, matches other tool limits
 const SUB_AGENT_MAX_OUTPUT_LINES = 500;
 const SUB_AGENT_MAX_STDERR_CHARS = 10_000; // Cap stderr to prevent unbounded growth
@@ -116,6 +116,15 @@ export function createSubAgentTool(
       if (agentDef?.systemPrompt) {
         cliArgs.push("--system-prompt", agentDef.systemPrompt);
       }
+
+      // Forward the agent's declared tool allow-list to the child so its tool
+      // set is filtered to exactly these names (see AgentSession.allowedTools).
+      // Empty/unset → the child keeps the full toolset (backward compatible),
+      // so agents with no `tools:` frontmatter behave exactly as before.
+      if (agentDef?.tools && agentDef.tools.length > 0) {
+        cliArgs.push("--tools", agentDef.tools.join(","));
+      }
+
       cliArgs.push(args.task);
 
       // Spawn the ggcoder CLI as a child process. We must run the CLI entry
@@ -138,6 +147,12 @@ export function createSubAgentTool(
       let turnCount = 0;
       let currentActivity: string | undefined;
       let textOutput = "";
+      // Set when the child emits the terminal `max_turns` signal — the sub-agent
+      // hit its turn budget mid-task, so its final answer may be incomplete. We
+      // prepend a notice to the returned content so the parent doesn't treat a
+      // cut-off run as a finished one.
+      let hitMaxTurns = false;
+      let maxTurnsLimit = 0;
 
       // Mirror the child sub-agent's cache key into the parent log so
       // `grep cacheRead ~/.gg/debug.log` shows whether sub-agents are
@@ -203,6 +218,10 @@ export function createSubAgentTool(
                 });
                 break;
               case "tool_call_end":
+                break;
+              case "max_turns":
+                hitMaxTurns = true;
+                maxTurnsLimit = Number(event.maxTurns) || SUB_AGENT_MAX_TURNS;
                 break;
               case "turn_end": {
                 const usage = event.usage as
@@ -291,10 +310,15 @@ export function createSubAgentTool(
           // Truncate output to prevent blowing up parent's context
           const raw = textOutput || "(no output)";
           const result = truncateTail(raw, SUB_AGENT_MAX_OUTPUT_LINES, SUB_AGENT_MAX_OUTPUT_CHARS);
-          const content = result.truncated
+          const body = result.truncated
             ? `[Sub-agent output truncated: ${result.totalLines} total lines, showing last ${result.keptLines}]\n\n` +
               result.content
             : result.content;
+          // Prepend the cut-off notice so the parent knows this run stopped
+          // mid-task and shouldn't be trusted as a completed result.
+          const content = hitMaxTurns
+            ? `[Sub-agent reached its ${maxTurnsLimit}-turn limit — it stopped mid-task and this output may be incomplete.]\n\n${body}`
+            : body;
 
           resolve({ content, details });
         });

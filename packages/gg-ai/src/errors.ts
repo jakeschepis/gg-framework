@@ -224,6 +224,38 @@ function isMythosAccessError(message: string): boolean {
   );
 }
 
+/**
+ * The OpenAI and Anthropic SDKs both build `err.message` by JSON-stringifying
+ * the raw error body whenever it has no usable string `message` field (e.g.
+ * `{"code":"400","message":"","param":"","type":""}` from a provider that
+ * returned an empty/malformed error) — producing an unreadable blob like
+ * `400 {"code":"400","message":"","param":"","type":""}`. Detect that shape so
+ * provider wrappers can swap in a clean, honest fallback instead of echoing raw
+ * JSON at the user. The original is never lost — it survives on `err.cause` for
+ * anyone who needs to inspect the raw provider response.
+ */
+export function isRawJsonErrorEcho(message: string): boolean {
+  const trimmed = message.trim();
+  const jsonStart = trimmed.indexOf("{");
+  if (jsonStart === -1) return false;
+  // The SDKs only ever prefix the JSON with "<status> " or nothing at all.
+  const prefix = trimmed.slice(0, jsonStart).trim();
+  if (prefix && !/^\d+$/.test(prefix)) return false;
+  try {
+    const parsed: unknown = JSON.parse(trimmed.slice(jsonStart));
+    return typeof parsed === "object" && parsed !== null;
+  } catch {
+    return false;
+  }
+}
+
+/** Clean fallback message when a provider's error body carried no usable text. */
+export function emptyProviderErrorMessage(statusCode: number | undefined): string {
+  return statusCode
+    ? `The provider returned an empty error response (HTTP ${statusCode}), with no further detail.`
+    : "The provider returned an empty error response, with no further detail.";
+}
+
 export function formatError(err: unknown): FormattedError {
   if (err instanceof ProviderError) {
     const name = providerDisplayName(err.provider);

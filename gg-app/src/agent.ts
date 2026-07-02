@@ -60,6 +60,9 @@ export interface AgentState {
   isGitRepo?: boolean;
   /** True when the active model can accept native video input. */
   supportsVideo?: boolean;
+  /** Autopilot (auto-review) toggle for this window's project. Per-window,
+   *  persisted server-side; absent on frames from older sidecars. */
+  autopilot?: boolean;
   /** Live background tasks (footer indicator). */
   tasks?: BackgroundTask[];
 }
@@ -231,6 +234,19 @@ export async function cancel(): Promise<void> {
 //   ken_turn_end { … }            — a turn finished
 //   ken_run_end { cancelled? }     — Ken finished (or was cancelled)
 //   ken_error { message }          — Ken failed
+//
+// Autopilot Ken (auto-reviewer) is a SEPARATE, non-chatty mode of the same Ken.
+// When autopilot is on, after each GG Coder run the sidecar silently drives a
+// review→prompt→review loop and emits the `autopilot_*` family (no chat bubble,
+// no new IPC — cancel reuses agent_cancel). All ride the same generic
+// `agent-event` SSE channel:
+//   autopilot_review_start {}       — Ken started an auto-review (spinner)
+//   autopilot_prompted { round }    — Ken fed GG Coder another prompt (marker)
+//   autopilot_done {}               — Ken gave the all-clear, loop stops
+//   autopilot_ignored {}            — nothing worth reviewing, loop stops SILENTLY (no marker)
+//   autopilot_human { reason }      — Ken needs a human decision, loop stops
+//   autopilot_capped { rounds }     — round cap hit, loop paused
+//   autopilot_error { headline, … } — a review failed (structured, like error)
 
 /** Ask Ken Kai. Fires the read-only mentor run; reply arrives via `ken_*`
  *  SSE events. Lazily boots Ken's session on first use. */
@@ -252,6 +268,19 @@ export async function cancelKen(): Promise<void> {
     await invoke("agent_ken_cancel");
   } catch (e) {
     await logError(`agent_ken_cancel failed: ${String(e)}`);
+  }
+}
+
+/** Toggle autopilot (auto-review) for this window's project. Persisted
+ *  server-side (~/.gg/gg-app.json, keyed by cwd). Returns the new value. */
+export async function setAutopilot(enabled: boolean): Promise<boolean> {
+  try {
+    await waitForReady();
+    const res = await invoke<{ autopilot?: boolean }>("agent_autopilot_set", { enabled });
+    return res.autopilot ?? enabled;
+  } catch (e) {
+    await logError(`agent_autopilot_set failed: ${String(e)}`);
+    return enabled;
   }
 }
 

@@ -30,6 +30,7 @@ export interface BusEventMap {
       cacheWrite?: number;
     };
   };
+  max_turns: { totalTurns: number; maxTurns: number };
   error: { error: Error };
 
   // Server tool events
@@ -140,6 +141,12 @@ export class EventBus {
         this.emit("agent_done", {
           totalTurns: event.totalTurns,
           totalUsage: event.totalUsage,
+        });
+        break;
+      case "max_turns":
+        this.emit("max_turns", {
+          totalTurns: event.totalTurns,
+          maxTurns: event.maxTurns,
         });
         break;
       case "server_tool_call":

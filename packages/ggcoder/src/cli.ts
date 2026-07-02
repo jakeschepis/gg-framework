@@ -277,6 +277,7 @@ function main(): void {
       model: { type: "string" },
       "max-turns": { type: "string" },
       "system-prompt": { type: "string" },
+      tools: { type: "string" },
       "prompt-cache-key": { type: "string" },
       thinking: { type: "string" },
       resume: { type: "string" },
@@ -304,6 +305,17 @@ function main(): void {
     const systemPrompt = values["system-prompt"];
     const promptCacheKey = values["prompt-cache-key"];
     const thinkingLevel = parseThinkingLevel(values.thinking);
+    // Optional tool allow-list forwarded by the subagent spawner from an agent
+    // definition's `tools:` frontmatter. Comma-separated; empty → full toolset.
+    // An all-empty value collapses to undefined (full toolset) rather than an
+    // empty array, which AgentSession would treat as "block every tool".
+    const parsedTools = values.tools
+      ? values.tools
+          .split(",")
+          .map((t) => t.trim())
+          .filter(Boolean)
+      : [];
+    const allowedTools = parsedTools.length > 0 ? parsedTools : undefined;
     const cwd = process.cwd();
     runJsonMode({
       message,
@@ -312,6 +324,7 @@ function main(): void {
       cwd,
       systemPrompt,
       maxTurns,
+      allowedTools,
       promptCacheKey,
       thinkingLevel,
     }).catch((err: unknown) => {

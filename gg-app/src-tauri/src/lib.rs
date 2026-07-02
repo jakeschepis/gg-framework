@@ -75,6 +75,63 @@ struct FocusedWindow(Mutex<Option<String>>);
 #[derive(Default)]
 struct MoveDebounce(Mutex<Option<std::time::Instant>>);
 
+/// Windows-only: per-window last-known minimized state. Used to detect the
+/// minimized→restored edge in `Resized` events (on Windows, minimize fires
+/// `Resized(0,0)` / `is_minimized()==true`, restore fires `Resized(real)` /
+/// `is_minimized()==false`) so that restoring ONE window brings all its
+/// siblings back too — matching the macOS dock-reopen behavior. On macOS the
+/// OS already restores every window from a single dock click, so the whole
+/// `Resized` arm is compiled out there and this state is never populated.
+#[cfg(target_os = "windows")]
+#[derive(Default)]
+struct MinimizeState(Mutex<HashMap<String, bool>>);
+
+/// Windows-only: on the minimized→restored edge of one window, un-minimize
+/// every sibling so a single taskbar click brings the whole workspace back
+/// (like macOS). Ordinary resizes/drags are ignored — only a true
+/// minimized→restored transition triggers the cascade. We pre-mark every
+/// window as restored before calling `unminimize()`, so the `Resized` events
+/// those calls generate don't re-cascade. No `set_focus()` — un-minimizing
+/// siblings must not steal focus from the window the user actually clicked.
+#[cfg(target_os = "windows")]
+fn restore_sibling_windows(window: &tauri::Window) {
+    let app = window.app_handle();
+    let label = window.label().to_string();
+    let cur = window.is_minimized().unwrap_or(false);
+    let state: State<MinimizeState> = app.state();
+    // Act only on an actual minimized (prev) → restored (cur == false) edge.
+    let cascade = {
+        let mut map = state.0.lock().unwrap();
+        let prev = map.get(&label).copied().unwrap_or(false);
+        map.insert(label.clone(), cur);
+        prev && !cur
+    };
+    if !cascade {
+        return;
+    }
+    // Collect siblings AND pre-mark every window restored, holding the lock only
+    // briefly — never across a window call. `unminimize()` on Windows can
+    // synchronously re-enter this handler (ShowWindow dispatches WM_SIZE), so a
+    // lock held across it would deadlock the (non-reentrant) mutex. Pre-marking
+    // makes any such re-entrant call read prev == false and skip the cascade.
+    let siblings: Vec<WebviewWindow> = {
+        let mut map = state.0.lock().unwrap();
+        let mut out = Vec::new();
+        for (sib_label, win) in app.webview_windows() {
+            map.insert(sib_label.clone(), false);
+            if sib_label != label {
+                out.push(win);
+            }
+        }
+        out
+    };
+    for win in siblings {
+        if win.is_minimized().unwrap_or(false) {
+            let _ = win.unminimize();
+        }
+    }
+}
+
 fn sidecar_base(port: u16) -> String {
     format!("http://127.0.0.1:{port}")
 }
@@ -801,6 +858,26 @@ async fn agent_ken_cancel(
     Ok(())
 }
 
+/// Proxy: toggle autopilot (auto-review) for THIS window's project. Persisted
+/// server-side in ~/.gg/gg-app.json keyed by cwd; returns `{ autopilot }`.
+#[tauri::command]
+async fn agent_autopilot_set(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    enabled: bool,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!("{}/autopilot", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .json(&serde_json::json!({ "enabled": enabled }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+}
+
 /// Proxy: list workflow (prompt-template) slash commands.
 #[tauri::command]
 async fn agent_commands(
@@ -1252,7 +1329,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "anthropic",
         label: "Anthropic",
-        description: "Claude Opus 4.8, Sonnet 4.6, Haiku 4.5",
+        description: "Claude Opus 4.8, Fable 5, Sonnet 4.6, Haiku 4.5",
         methods: &["oauth"],
         api_key_label: None,
         api_key_base_url: None,
@@ -2926,6 +3003,7 @@ pub fn run() {
             agent_cancel,
             agent_ken_prompt,
             agent_ken_cancel,
+            agent_autopilot_set,
             agent_accept_plan,
             agent_new_session,
             agent_history,
@@ -2975,6 +3053,10 @@ pub fn run() {
             window_restore_target
         ])
         .setup(|app| {
+            // Windows-only: track per-window minimized state so restoring one
+            // window can restore its siblings (macOS does this natively).
+            #[cfg(target_os = "windows")]
+            app.manage(MinimizeState::default());
             // Sweep orphaned sidecars from previous (crashed/force-quit) app
             // instances BEFORE spawning any new sidecars — they'd otherwise
             // accumulate forever across launches. Best-effort + logged.
@@ -3026,6 +3108,13 @@ pub fn run() {
                     *state.0.lock().unwrap() = Some(window.label().to_string());
                 }
                 broadcast_window_order(&app);
+            }
+            // Windows-only: a single taskbar click un-minimizes just the picked
+            // window. Cascade the restore to its siblings so the whole workspace
+            // reopens together, like macOS. Compiled out on macOS (falls to `_`).
+            #[cfg(target_os = "windows")]
+            tauri::WindowEvent::Resized(_) => {
+                restore_sibling_windows(window);
             }
             // Debounced: native drag fires Moved per pixel. Only the last move's
             // deferred task fires (its captured Instant still matches), so peers

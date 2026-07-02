@@ -3,8 +3,10 @@ import {
   GGAIError,
   ProviderError,
   VideoUnsupportedError,
+  emptyProviderErrorMessage,
   formatError,
   formatErrorForDisplay,
+  isRawJsonErrorEcho,
   isUsageLimitError,
   readHeader,
 } from "./errors.js";
@@ -175,6 +177,35 @@ describe("formatErrorForDisplay", () => {
         "  \u2192 This looks like a ggcoder bug \u2014 please report it to the developer (see /help).",
       ].join("\n"),
     );
+  });
+});
+
+describe("isRawJsonErrorEcho", () => {
+  it("detects the OpenAI/Anthropic SDK's raw JSON echo for an empty error body", () => {
+    // Exact shape a Xiaomi MiMo 400 with an empty body produces.
+    expect(isRawJsonErrorEcho('400 {"code":"400","message":"","param":"","type":""}')).toBe(true);
+  });
+
+  it("detects a bare JSON echo with no leading status code", () => {
+    expect(isRawJsonErrorEcho('{"error":"weird"}')).toBe(true);
+  });
+
+  it("does not flag a normal human-readable provider message", () => {
+    expect(isRawJsonErrorEcho("Rate limit exceeded, please try again later.")).toBe(false);
+  });
+
+  it("does not flag a message with a non-numeric prefix before a brace", () => {
+    expect(isRawJsonErrorEcho("See docs at https://example.com/{id}")).toBe(false);
+  });
+});
+
+describe("emptyProviderErrorMessage", () => {
+  it("includes the HTTP status code when known", () => {
+    expect(emptyProviderErrorMessage(400)).toContain("HTTP 400");
+  });
+
+  it("omits the status clause when unknown", () => {
+    expect(emptyProviderErrorMessage(undefined)).not.toContain("HTTP");
   });
 });
 

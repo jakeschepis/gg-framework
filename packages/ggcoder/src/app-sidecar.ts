@@ -17,13 +17,14 @@ import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
 import { parseArgs } from "node:util";
-import type { ToolResultContent } from "@kenkaiiii/gg-ai";
+import { formatError, type ToolResultContent } from "@kenkaiiii/gg-ai";
 import type { AddressInfo } from "node:net";
 import { runJsonMode } from "./modes/json-mode.js";
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { AgentSession } from "./core/agent-session.js";
-import { buildKenSystemPrompt } from "./core/ken-prompt.js";
-import { buildKenDigest } from "./core/ken-context.js";
+import { buildKenSystemPrompt, buildKenAutopilotSystemPrompt } from "./core/ken-prompt.js";
+import { buildKenDigest, buildKenAutopilotContext } from "./core/ken-context.js";
+import { parseAutopilotVerdict, type AutopilotVerdict } from "./core/autopilot-verdict.js";
 import { collectProjectContext } from "./system-prompt.js";
 import type { KenTurnPayload } from "./core/session-manager.js";
 import { AuthStorage } from "./core/auth-storage.js";
@@ -50,6 +51,7 @@ import { discoverProjects, listRecentSessions } from "./core/project-discovery.j
 import {
   loadTasksSync,
   saveTasksSync,
+  pruneDoneTasksSync,
   getNextPendingTask,
   markTaskInProgress,
 } from "./core/tasks-store.js";
@@ -104,6 +106,9 @@ interface AppSettings {
   /** Model + thinking prefs keyed by normalized project cwd. A window restores
    *  its own entry on boot; absent → global settings.json → provider default. */
   projectModels?: Record<string, ProjectModelPrefs>;
+  /** Autopilot (auto-review) on/off keyed by normalized project cwd. Per-window
+   *  (one window = one cwd); absent/false → off. Restored on boot. */
+  autopilot?: Record<string, boolean>;
 }
 
 function appSettingsFile(): string {
@@ -132,6 +137,7 @@ async function loadAppSettings(): Promise<AppSettings> {
       // model/thinking handlers below).
       projectModels:
         raw.projectModels && typeof raw.projectModels === "object" ? raw.projectModels : undefined,
+      autopilot: raw.autopilot && typeof raw.autopilot === "object" ? raw.autopilot : undefined,
     };
   } catch {
     return { projectsRoot: defaultProjectsRoot() };
@@ -155,6 +161,21 @@ async function saveProjectModelPrefs(cwd: string, prefs: ProjectModelPrefs): Pro
   const s = await loadAppSettings();
   const key = projectModelKey(cwd);
   s.projectModels = { ...(s.projectModels ?? {}), [key]: prefs };
+  await saveAppSettings(s);
+}
+
+/** Read this project's persisted autopilot flag (default off). */
+async function loadAutopilot(cwd: string): Promise<boolean> {
+  const s = await loadAppSettings();
+  return s.autopilot?.[projectModelKey(cwd)] ?? false;
+}
+
+/** Persist this project's autopilot flag via read-modify-write so the rest of
+ *  the settings file (projectsRoot, model map, other projects) is preserved. */
+async function saveAutopilot(cwd: string, enabled: boolean): Promise<void> {
+  const s = await loadAppSettings();
+  const key = projectModelKey(cwd);
+  s.autopilot = { ...(s.autopilot ?? {}), [key]: enabled };
   await saveAppSettings(s);
 }
 
@@ -498,12 +519,23 @@ async function runJsonModeIfRequested(): Promise<boolean> {
       model: { type: "string" },
       "max-turns": { type: "string" },
       "system-prompt": { type: "string" },
+      tools: { type: "string" },
       "prompt-cache-key": { type: "string" },
     },
     allowPositionals: true,
     strict: true,
   });
   const maxTurnsRaw = values["max-turns"];
+  // Optional tool allow-list forwarded by the subagent spawner from an agent
+  // definition's `tools:` frontmatter. Mirrors the identical parsing in
+  // cli.ts's `values.json` branch — keep both in sync (see subagent.ts).
+  const parsedTools = values.tools
+    ? values.tools
+        .split(",")
+        .map((t) => t.trim())
+        .filter(Boolean)
+    : [];
+  const allowedTools = parsedTools.length > 0 ? parsedTools : undefined;
   await runJsonMode({
     message: positionals[0] ?? "",
     provider: (values.provider ?? "anthropic") as Provider,
@@ -511,6 +543,7 @@ async function runJsonModeIfRequested(): Promise<boolean> {
     cwd: process.cwd(),
     systemPrompt: values["system-prompt"],
     maxTurns: maxTurnsRaw ? parseInt(maxTurnsRaw, 10) : undefined,
+    allowedTools,
     promptCacheKey: values["prompt-cache-key"],
   }).catch((err: unknown) => {
     process.stderr.write((err instanceof Error ? err.message : String(err)) + "\n");
@@ -818,6 +851,36 @@ async function createSession(
     for (const c of clients) c.res.write(frame);
   }
 
+  // Turn any thrown value into the same clear headline/message/guidance shape
+  // the TUI shows (see gg-ai's formatError) instead of a bare `err.message`, log
+  // the full detail, and broadcast it under `type` ("error" or "ken_error").
+  // Without this the webview only ever saw a raw provider string like
+  // `400 {"code":"400",...}` with no "is this me or them / when does it reset"
+  // context that the CLI has always given.
+  function broadcastError(
+    type: "error" | "ken_error" | "autopilot_error",
+    logLabel: string,
+    err: unknown,
+  ): void {
+    const f = formatError(err);
+    log("ERROR", "app-sidecar", logLabel, {
+      headline: f.headline,
+      source: f.source,
+      ...(f.message ? { message: f.message } : {}),
+      ...(f.provider ? { provider: f.provider } : {}),
+      ...(f.statusCode != null ? { statusCode: String(f.statusCode) } : {}),
+      ...(f.requestId ? { requestId: f.requestId } : {}),
+    });
+    broadcast(type, {
+      headline: f.headline,
+      ...(f.message ? { message: f.message } : {}),
+      guidance: f.guidance,
+      ...(f.provider ? { provider: f.provider } : {}),
+      ...(f.statusCode != null ? { statusCode: f.statusCode } : {}),
+      ...(f.resetsAt != null ? { resetsAt: f.resetsAt } : {}),
+    });
+  }
+
   // The session file path to resume (passed by the daemon's POST /session);
   // empty/unset starts a fresh session.
   const resumeSessionPath = opts.sessionPath;
@@ -867,7 +930,7 @@ async function createSession(
   let gitIsRepo: boolean = await isGitRepo(cwd).catch(() => false);
   function currentContextWindow(): number {
     const st = session.getState();
-    return getContextWindow(st.model, { provider: st.provider });
+    return getContextWindow(st.model, { provider: st.provider, accountId: st.accountId });
   }
   // Shared shape merged into /state + the SSE `ready` frame so the footer can
   // render context %, branch, and tasks immediately on connect.
@@ -919,9 +982,7 @@ async function createSession(
   session.eventBus.on("turn_end", (d) => broadcast("turn_end", d));
   session.eventBus.on("agent_done", (d) => broadcast("agent_done", d));
   session.eventBus.on("error", (d) => {
-    const message = d.error instanceof Error ? d.error.message : String(d.error);
-    log("ERROR", "app-sidecar", "agent error", { message });
-    broadcast("error", { message });
+    broadcastError("error", "agent error", d.error);
   });
   session.eventBus.on("model_change", (d) => broadcast("model_change", d));
   session.eventBus.on("hook", (d) => broadcast("hook", d));
@@ -930,6 +991,24 @@ async function createSession(
 
   let running = false;
   let titleGenerated = false;
+  // Autopilot (auto-review) toggle for THIS window's project. Loaded from
+  // gg-app.json on boot; flipped via POST /autopilot. When on, POST /prompt runs
+  // runAutopilotCycle after the user's turn settles — Ken auto-reviews the work
+  // and drives the review→prompt→review loop.
+  let autopilot = await loadAutopilot(cwd);
+  // True while an autopilot review is in flight (used to defer kenAuto model
+  // switches, like kenRunning does for chat Ken, and to drive the spinner).
+  let autopilotReviewing = false;
+  // True for the WHOLE autopilot cycle (reviews + injected runs). The build
+  // `running` flag is false during the review windows between injected runs, so
+  // this is the extra guard that makes a user /prompt queue as steering instead
+  // of starting a run that would collide with an injected one on the same
+  // session (AgentSession.prompt has no concurrency guard).
+  let autopilotActive = false;
+  // Set by /cancel to break out of an in-flight autopilot cycle between steps.
+  let autopilotCancelled = false;
+  // Hard cap on review→prompt→review rounds per user turn (loop safety).
+  const MAX_AUTOPILOT_ROUNDS = 3;
 
   // ── Telegram serve (remote control via Telegram) ───────────
   // A single embedded serve session lives in this sidecar process. Only the main
@@ -993,12 +1072,57 @@ async function createSession(
     ken.eventBus.on("server_tool_call", (d) => broadcast("ken_server_tool_call", d));
     ken.eventBus.on("turn_end", (d) => broadcast("ken_turn_end", d));
     ken.eventBus.on("error", (d) => {
-      const message = d.error instanceof Error ? d.error.message : String(d.error);
-      log("ERROR", "app-sidecar", "ken error", { message });
-      broadcast("ken_error", { message });
+      broadcastError("ken_error", "ken error", d.error);
     });
     kenSession = ken;
     log("INFO", "app-sidecar", "ken session ready", { provider: st.provider, model: st.model });
+    return ken;
+  }
+
+  // ── Autopilot Ken (auto-reviewer) ──────────────────────────
+  // A THIRD read-only AgentSession, separate from chat Ken. In autopilot mode
+  // Ken silently reviews each finished GG Coder turn and returns a verdict
+  // (PROMPT / ALL_CLEAR / HUMAN). Its bus is intentionally NOT bridged to the
+  // ken_* chat bubbles — the review is silent; we read its final assistant text
+  // and parse it. Uses the lean autopilot system prompt + the same read-only
+  // tools. Created lazily on the first autopilot cycle.
+  let kenAutoSession: AgentSession | null = null;
+  let kenAutoAbort = new AbortController();
+  let pendingKenAutoModel: { provider: Provider; model: string } | null = null;
+
+  async function syncKenAutoModel(provider: Provider, model: string): Promise<void> {
+    if (autopilotReviewing) {
+      pendingKenAutoModel = { provider, model };
+      return;
+    }
+    if (!kenAutoSession) return;
+    const st = kenAutoSession.getState();
+    if (st.provider === provider && st.model === model) return;
+    await kenAutoSession.switchModel(provider, model);
+    log("INFO", "app-sidecar", "ken autopilot session model synced", { provider, model });
+  }
+
+  async function ensureKenAutoSession(): Promise<AgentSession> {
+    if (kenAutoSession) return kenAutoSession;
+    const st = session.getState();
+    const ken = new AgentSession({
+      provider: st.provider,
+      model: st.model,
+      cwd,
+      systemPrompt: buildKenAutopilotSystemPrompt(),
+      allowedTools: KEN_ALLOWED_TOOLS,
+      allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
+      transient: true,
+      signal: kenAutoAbort.signal,
+    });
+    await ken.initialize();
+    // Deliberately no bus bridge: the review is silent. Errors surface via the
+    // runAutopilotReview try/catch as autopilot_error frames.
+    kenAutoSession = ken;
+    log("INFO", "app-sidecar", "ken autopilot session ready", {
+      provider: st.provider,
+      model: st.model,
+    });
     return ken;
   }
 
@@ -1026,9 +1150,7 @@ async function createSession(
     try {
       await run();
     } catch (err) {
-      const message = err instanceof Error ? err.message : String(err);
-      broadcast("error", { message });
-      log("ERROR", "app-sidecar", "run failed", { message });
+      broadcastError("error", "run failed", err);
     } finally {
       running = false;
       // A run may have switched branches (git checkout) or spawned/finished
@@ -1036,6 +1158,14 @@ async function createSession(
       gitBranch = await getGitBranch(cwd).catch(() => gitBranch);
       gitIsRepo = await isGitRepo(cwd).catch(() => gitIsRepo);
       broadcast("run_end", {});
+      // Autopilot's review loop is driven explicitly from POST /prompt (see
+      // runAutopilotCycle), NOT from this shared finally — that keeps the
+      // injected GG Coder runs this cycle triggers from recursively re-entering
+      // the loop through the same bracket.
+      // The agent may have marked project tasks done during the run — prune the
+      // completed ones so they drop out of the Tasks modal automatically (users
+      // never have to delete finished tasks by hand).
+      broadcast("tasks_list", { tasks: pruneDoneTasksSync(cwd) });
       // Queue drains into the run as steering, so it's empty by run_end —
       // sync the webview indicator.
       broadcast("queued", { count: session.getQueuedCount() });
@@ -1048,6 +1178,79 @@ async function createSession(
           if (title) broadcast("session_title", { title });
         });
       }
+    }
+  }
+
+  // ── Autopilot orchestration ─────────────────────────────────
+  // One review = prompt the kenAuto session with the review digest, read its
+  // final assistant text, parse a verdict. Returns null on failure (surfaced as
+  // an autopilot_error frame) so the cycle stops rather than looping blind.
+  async function runAutopilotReview(): Promise<AutopilotVerdict | null> {
+    autopilotReviewing = true;
+    broadcast("autopilot_review_start", {});
+    try {
+      const ken = await ensureKenAutoSession();
+      const projectContext = await collectProjectContext(cwd).catch(() => [] as string[]);
+      const digest = buildKenAutopilotContext({
+        projectContext,
+        cwd,
+        gitBranch,
+        messages: session.getMessages(),
+      });
+      await ken.prompt(digest);
+      return parseAutopilotVerdict(lastAssistantText(ken.getMessages()));
+    } catch (err) {
+      broadcastError("autopilot_error", "autopilot review failed", err);
+      return null;
+    } finally {
+      autopilotReviewing = false;
+      // Apply any model switch that landed mid-review.
+      const pending = pendingKenAutoModel;
+      pendingKenAutoModel = null;
+      if (pending) await syncKenAutoModel(pending.provider, pending.model);
+    }
+  }
+
+  // Drive the review→prompt→review loop for one finished user turn. Only ever
+  // called from POST /prompt after the user's own run resolves — never from the
+  // task runner, resume, /ken, or error paths, so there's no recursion and no
+  // guard tangle. Bounded by MAX_AUTOPILOT_ROUNDS and cancellable between steps.
+  async function runAutopilotCycle(): Promise<void> {
+    if (!autopilot || autopilotCancelled) return;
+    autopilotActive = true;
+    try {
+      // Lean context per user turn: wipe prior review history so each new turn
+      // starts cheap, while within this cycle the few review messages persist so
+      // Ken remembers what he already asked GG Coder to fix.
+      await kenAutoSession?.newSession().catch(() => {});
+      for (let round = 1; round <= MAX_AUTOPILOT_ROUNDS; round++) {
+        if (autopilotCancelled) return;
+        const verdict = await runAutopilotReview();
+        if (!verdict || autopilotCancelled) return;
+        if (verdict.kind === "all_clear") {
+          broadcast("autopilot_done", {});
+          return;
+        }
+        if (verdict.kind === "ignore") {
+          // Nothing worth reviewing (small talk, a mechanical git op, etc.) —
+          // stop the cycle silently, no marker at all.
+          broadcast("autopilot_ignored", {});
+          return;
+        }
+        if (verdict.kind === "human") {
+          broadcast("autopilot_human", { reason: verdict.reason });
+          return;
+        }
+        // prompt → show a compact Ken-tinted marker (not the prompt body), then
+        // feed GG Coder. Bracketed by runAgent so the run streams normally; the
+        // shared finally no longer re-triggers autopilot, so this can't recurse.
+        broadcast("autopilot_prompted", { round, body: verdict.body });
+        await runAgent(verdict.body, () => session.prompt(verdict.body));
+        if (autopilotCancelled) return;
+      }
+      broadcast("autopilot_capped", { rounds: MAX_AUTOPILOT_ROUNDS });
+    } finally {
+      autopilotActive = false;
     }
   }
 
@@ -1073,8 +1276,8 @@ async function createSession(
       `tasks({ action: "done", id: "${shortId}" })`;
     await runAgent(task.title, () => session.prompt(task.prompt + completionHint));
     // The agent typically marks the task done via the tasks tool during the run;
-    // push the refreshed list so the webview's task modal reflects it.
-    broadcast("tasks_list", { tasks: loadTasksSync(cwd) });
+    // prune completed tasks and push the refreshed list so the modal drops them.
+    broadcast("tasks_list", { tasks: pruneDoneTasksSync(cwd) });
     return true;
   }
 
@@ -1184,6 +1387,7 @@ async function createSession(
         thinkingLevel: session.getThinkingLevel() ?? null,
         supportedThinkingLevels: getSupportedThinkingLevels(st.provider, st.model),
         supportsVideo: getModel(st.model)?.supportsVideo ?? false,
+        autopilot,
         ...footerExtras(),
       });
       return;
@@ -1209,6 +1413,7 @@ async function createSession(
             thinkingLevel: session.getThinkingLevel() ?? null,
             supportedThinkingLevels: getSupportedThinkingLevels(st.provider, st.model),
             supportsVideo: getModel(st.model)?.supportsVideo ?? false,
+            autopilot,
             ...footerExtras(),
           },
         })}\n\n`,
@@ -1562,10 +1767,13 @@ async function createSession(
           json(res, 400, { error: "empty prompt" });
           return;
         }
-        if (running) {
-          // Queue prompts as mid-run steering (mirrors the CLI). Attachments are
-          // persisted to .gg/uploads first so the queued media rides the same
-          // native-block path as a non-queued attachment prompt when it drains.
+        if (running || autopilotActive) {
+          // Queue prompts as mid-run steering (mirrors the CLI). Also queue while
+          // an autopilot cycle is active but between injected runs (build idle,
+          // Ken reviewing) so the message never starts a run that collides with
+          // an injected one on the same session. Attachments are persisted to
+          // .gg/uploads first so the queued media rides the same native-block
+          // path as a non-queued attachment prompt when it drains.
           const prepared = attachments.length > 0 ? await prepareAttachments(cwd, attachments) : [];
           const count = session.queueMessage(text, prepared);
           broadcast("queued", { count });
@@ -1573,6 +1781,9 @@ async function createSession(
           return;
         }
         json(res, 202, { accepted: true });
+        // Fresh user turn: clear any cancel flag left from a prior cycle so this
+        // turn's autopilot review can run.
+        autopilotCancelled = false;
         await runAgent(text, async () => {
           if (attachments.length > 0) {
             // Persist each attachment under .gg/uploads so files are inspectable
@@ -1587,6 +1798,10 @@ async function createSession(
             await session.prompt(text);
           }
         });
+        // After the user's run settles, kick off Ken's auto-review loop. This is
+        // the ONLY entry point into the cycle — it drives any follow-up GG Coder
+        // runs itself, so the shared runAgent finally never recurses.
+        if (autopilot && !autopilotCancelled) await runAutopilotCycle();
       });
       return;
     }
@@ -1625,9 +1840,7 @@ async function createSession(
           const reply = lastAssistantText(ken.getMessages());
           if (reply.trim()) await session.persistKenTurn(text, reply);
         } catch (err) {
-          const message = err instanceof Error ? err.message : String(err);
-          log("ERROR", "app-sidecar", "ken run failed", { message });
-          broadcast("ken_error", { message });
+          broadcastError("ken_error", "ken run failed", err);
         } finally {
           kenRunning = false;
           broadcast("ken_run_end", {});
@@ -1646,6 +1859,24 @@ async function createSession(
       kenRunning = false;
       broadcast("ken_run_end", { cancelled: true });
       json(res, 200, { cancelled: true });
+      return;
+    }
+
+    if (method === "POST" && url === "/autopilot") {
+      void readBody(req).then(async (raw) => {
+        let enabled: boolean;
+        try {
+          enabled = Boolean((JSON.parse(raw) as { enabled?: boolean }).enabled);
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        autopilot = enabled;
+        await saveAutopilot(cwd, enabled);
+        log("INFO", "app-sidecar", "autopilot toggled", { enabled: String(enabled) });
+        broadcast("autopilot", { autopilot: enabled });
+        json(res, 200, { autopilot: enabled });
+      });
       return;
     }
 
@@ -1677,7 +1908,7 @@ async function createSession(
     }
 
     if (method === "GET" && url === "/tasks") {
-      json(res, 200, { tasks: loadTasksSync(cwd) });
+      json(res, 200, { tasks: pruneDoneTasksSync(cwd) });
       return;
     }
 
@@ -1798,6 +2029,7 @@ async function createSession(
         }
         await session.switchModel(target.provider, target.id);
         await syncKenModel(target.provider, target.id);
+        await syncKenAutoModel(target.provider, target.id);
         // Clamp the reasoning level to what the new model supports (mirrors the
         // CLI): keep thinking on at the first supported tier if it was on but
         // the prior level is unsupported here; leave it off if it was off.
@@ -1881,6 +2113,13 @@ async function createSession(
       running = false;
       // Stop a run-all sweep so the next pending task isn't auto-started.
       taskRunAll = false;
+      // Stop any in-flight autopilot cycle: flag it so the loop bails between
+      // steps, and abort a review that's mid-prompt on the kenAuto session.
+      autopilotCancelled = true;
+      kenAutoAbort.abort();
+      kenAutoAbort = new AbortController();
+      kenAutoSession?.setSignal(kenAutoAbort.signal);
+      autopilotReviewing = false;
       // Drop any queued steering and return it so the webview can restore it to
       // the composer.
       const drained = session.drainQueue();
@@ -2370,7 +2609,9 @@ async function createSession(
     if (serveController) await serveController.stop().catch(() => {});
     for (const c of clients) c.res.end();
     kenAbort.abort();
+    kenAutoAbort.abort();
     await kenSession?.dispose().catch(() => {});
+    await kenAutoSession?.dispose().catch(() => {});
     await session.dispose().catch(() => {});
   }
 

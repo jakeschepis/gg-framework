@@ -29,7 +29,11 @@ let _primary = DEFAULT_PRIMARY;
 let _accent = DEFAULT_ACCENT;
 
 const PROVIDERS: { label: string; value: Provider; description: string }[] = [
-  { label: "Anthropic", value: "anthropic", description: "Claude Opus 4.8, Sonnet 5, Haiku 4.5" },
+  {
+    label: "Anthropic",
+    value: "anthropic",
+    description: "Claude Opus 4.8, Fable 5, Sonnet 5, Haiku 4.5",
+  },
   { label: "OpenAI", value: "openai", description: "GPT-5.5, GPT-5.5 Pro, GPT-5.4, GPT-5.3 Codex" },
   { label: "Gemini", value: "gemini", description: "Gemini 3.1 Flash Lite Preview" },
   { label: "Moonshot", value: "moonshot", description: "Kimi K2.7 · OAuth or API key" },

@@ -1,5 +1,77 @@
 # @kenkaiiii/ggcoder
 
+## 5.6.0
+
+### Minor Changes
+
+- Autopilot Ken now has an IGNORE verdict for turns that were never real work (small talk, answered questions, mechanical git ops like commit/push), so trivial turns no longer produce a pointless "all clear" in the transcript.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.6.0
+- @kenkaiiii/gg-agent@5.6.0
+- @kenkaiiii/gg-core@5.6.0
+
+## 5.5.1
+
+### Patch Changes
+
+- Fix subagent tool allow-list crashing in the desktop app: the JSON-mode arg parser in `app-sidecar.ts` was missing the `--tools` flag, so any named agent with a `tools:` allow-list (bee, owl, researcher, worker) failed to spawn with "Unknown option '--tools'".
+  - @kenkaiiii/gg-ai@5.5.1
+  - @kenkaiiii/gg-agent@5.5.1
+  - @kenkaiiii/gg-core@5.5.1
+
+## 5.5.0
+
+### Minor Changes
+
+- Add autopilot Ken auto-review loop: after each turn a separate read-only Ken reviewer judges the work and either sends GG Coder back in with a fresh prompt, calls it all-clear, or flags for a human. Also auto-prune completed tasks from the sidecar task list.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.5.0
+- @kenkaiiii/gg-agent@5.5.0
+- @kenkaiiii/gg-core@5.5.0
+
+## 5.4.3
+
+### Patch Changes
+
+- Enforce subagent `tools:` frontmatter as an allowlist, raise the subagent turn cap to 50 with a clear cut-off signal when it's hit, and phrase `/init` and task-handoff notices for the gg-app UI instead of CLI keybinds.
+  - @kenkaiiii/gg-ai@5.4.3
+  - @kenkaiiii/gg-agent@5.4.3
+  - @kenkaiiii/gg-core@5.4.3
+
+## 5.4.2
+
+### Patch Changes
+
+- Auto-continue once when a tool call fails 3x with completely empty arguments (a provider stream glitch, not a model schema mistake), and correctly attribute the resulting error to the provider instead of mislabeling it a ggcoder bug.
+  - @kenkaiiii/gg-ai@5.4.2
+  - @kenkaiiii/gg-agent@5.4.2
+  - @kenkaiiii/gg-core@5.4.2
+
+## 5.4.1
+
+### Patch Changes
+
+- Fix gg-app auto-compaction not reserving headroom for a model's real output budget (e.g. GPT-5.5 over Codex OAuth: 272K window, up to 128K output), which let context grow until the provider rejected the turn with "exceeds the context window"; also fix the app's context-window footer to use the correct transport-specific window (Codex OAuth vs public API).
+  - @kenkaiiii/gg-ai@5.4.1
+  - @kenkaiiii/gg-agent@5.4.1
+  - @kenkaiiii/gg-core@5.4.1
+
+## 5.4.0
+
+### Minor Changes
+
+- Re-enable Claude Fable 5 in the model selector, and show clean, provider-attributed error messages (headline + guidance + reset time for usage limits) instead of raw JSON error blobs from providers like Xiaomi MiMo.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.4.0
+- @kenkaiiii/gg-agent@5.4.0
+- @kenkaiiii/gg-core@5.4.0
+
 ## 5.3.0
 
 ### Minor Changes

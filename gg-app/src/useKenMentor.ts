@@ -158,16 +158,28 @@ export function useKenMentor(opts: {
           finalizeKenThinking();
           setKenRunStartTs(null);
           return true;
-        case "ken_error":
+        case "ken_error": {
           setKenRunning(false);
           endKenStreaming();
           setKenIsThinking(false);
           setKenRunStartTs(null);
+          // Structured payload from the sidecar's broadcastError; "Ken: " prefix on
+          // the headline keeps it distinguishable from a GG Coder build error.
+          const headline = typeof d.headline === "string" ? d.headline : undefined;
           setItems((prev) => [
             ...prev,
-            { kind: "error", id: nextId(), text: `Ken: ${String(d.message ?? "unknown")}` },
+            headline
+              ? {
+                  kind: "error",
+                  id: nextId(),
+                  headline: `Ken: ${headline}`,
+                  message: typeof d.message === "string" ? d.message : undefined,
+                  guidance: typeof d.guidance === "string" ? d.guidance : undefined,
+                }
+              : { kind: "error", id: nextId(), text: `Ken: ${String(d.message ?? "unknown")}` },
           ]);
           return true;
+        }
         // ken_tool_call_update / ken_tool_call_end carry Ken's read-only tool
         // activity; the activity bar (kenRunning) is the indicator, so they need
         // no transcript row. (ken_tool_call_start IS handled above to break the

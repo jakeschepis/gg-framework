@@ -322,4 +322,28 @@ describe("streamOpenAI hard/transient limit classification", () => {
       },
     );
   });
+
+  it("replaces an empty-body error's raw JSON echo with a clean message", async () => {
+    // Mirrors the exact shape Xiaomi's MiMo endpoint returns on a bare 400: every
+    // field empty, so the real SDK's err.message becomes a stringified JSON blob
+    // (`APIError.makeMessage` JSON.stringifies the body when it has no usable
+    // string `message`). The mock constructs `message` directly rather than
+    // reimplementing that logic, so pass the blob it would have produced.
+    const err = await makeApiError({
+      status: 400,
+      error: { code: "400", message: "", param: "", type: "" },
+      message: '400 {"code":"400","message":"","param":"","type":""}',
+    });
+    const result = streamWithError("xiaomi", err);
+    await result.response.then(
+      () => {
+        throw new Error("expected rejection");
+      },
+      (caught: unknown) => {
+        const e = caught as Error;
+        expect(e.message).not.toContain('"code"');
+        expect(e.message).toContain("HTTP 400");
+      },
+    );
+  });
 });

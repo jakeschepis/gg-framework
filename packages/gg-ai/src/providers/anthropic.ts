@@ -8,7 +8,13 @@ import type {
   StreamResponse,
   ToolCall,
 } from "../types.js";
-import { ProviderError, readHeader, isHardBillingMessage } from "../errors.js";
+import {
+  ProviderError,
+  readHeader,
+  isHardBillingMessage,
+  isRawJsonErrorEcho,
+  emptyProviderErrorMessage,
+} from "../errors.js";
 import { StreamResult } from "../utils/event-stream.js";
 import {
   downgradeUnsupportedImages,
@@ -744,11 +750,14 @@ function toError(err: unknown): ProviderError {
       (typeof errorBody?.request_id === "string" ? errorBody.request_id : undefined) ??
       (typeof nestedError?.request_id === "string" ? nestedError.request_id : undefined) ??
       undefined;
+    // Guard against an empty-string message (e.g. MiniMax's Anthropic-transport
+    // path returning `{ message: "" }`) counting as "usable" — that would win
+    // over the raw-JSON-echo fallback below and surface a blank error instead.
     const bodyMessage =
-      typeof nestedError?.message === "string"
-        ? nestedError.message
-        : typeof errorBody?.message === "string"
-          ? errorBody.message
+      typeof nestedError?.message === "string" && nestedError.message.trim()
+        ? nestedError.message.trim()
+        : typeof errorBody?.message === "string" && errorBody.message.trim()
+          ? errorBody.message.trim()
           : undefined;
     const bodyType =
       typeof nestedError?.type === "string"
@@ -758,8 +767,15 @@ function toError(err: unknown): ProviderError {
           : typeof (err as unknown as { type?: unknown }).type === "string"
             ? ((err as unknown as { type: string }).type as string)
             : undefined;
+    // When neither the nested nor top-level body carries a usable message, the
+    // SDK's err.message is a raw JSON echo of the (often near-empty) error body
+    // — swap in a clean fallback rather than showing that to the user (see
+    // isRawJsonErrorEcho).
+    const fallbackMessage = isRawJsonErrorEcho(err.message)
+      ? emptyProviderErrorMessage(err.status)
+      : err.message;
     const message =
-      bodyType && bodyMessage ? `${bodyType}: ${bodyMessage}` : (bodyMessage ?? err.message);
+      bodyType && bodyMessage ? `${bodyType}: ${bodyMessage}` : (bodyMessage ?? fallbackMessage);
 
     // Subscription (OAuth) usage-window exhaustion. Anthropic returns 429 with
     // the unified rate-limit headers; a "rejected" status — or a reset stamp

@@ -43,6 +43,7 @@ function setup(handleKenEvent: (e: SidecarEvent) => boolean = () => false) {
     setItems: setItems as AgentEventsDeps["setItems"],
     nextId,
     handleKenEvent,
+    handleAutopilotEvent: () => false,
     setState: noop as unknown as AgentEventsDeps["setState"],
     setTasks: noop as unknown as AgentEventsDeps["setTasks"],
     setProjectTasks: noop as unknown as AgentEventsDeps["setProjectTasks"],
@@ -101,6 +102,38 @@ describe("useAgentEvents", () => {
     items = getItems();
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({ kind: "assistant", text: "Hello world" });
+  });
+
+  it("error with a structured payload (headline/message/guidance) pushes a structured error item", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleEvent(
+        ev("error", {
+          headline: "Anthropic usage limit reached.",
+          message: "Your Anthropic usage is finished. It resets at 12:50 PM.",
+          guidance: "Try again once it's back. Your conversation is preserved.",
+        }),
+      );
+    });
+    const items = getItems();
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({
+      kind: "error",
+      headline: "Anthropic usage limit reached.",
+      message: "Your Anthropic usage is finished. It resets at 12:50 PM.",
+      guidance: "Try again once it's back. Your conversation is preserved.",
+    });
+  });
+
+  it("error with only a message (legacy shape) falls back to a flat text item", () => {
+    const { hook, getItems } = setup();
+    act(() => {
+      hook.result.current.handleEvent(ev("error", { message: "boom" }));
+    });
+    const items = getItems();
+    expect(items).toHaveLength(1);
+    expect(items[0]).toMatchObject({ kind: "error" });
+    expect((items[0] as { text: string }).text).toContain("boom");
   });
 
   it("tool_call_start then tool_call_end drive the live tool feed", () => {

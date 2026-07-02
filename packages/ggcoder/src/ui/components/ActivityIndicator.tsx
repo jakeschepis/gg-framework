@@ -286,6 +286,7 @@ const RETRY_REASON_LABELS: Record<RetryInfo["reason"], string> = {
   empty_response: "Empty response",
   stream_stall: "Provider stream stalled",
   overflow_compact: "Context overflow — compacting",
+  tool_argument_glitch: "Provider dropped tool call args — auto-continuing",
 };
 
 export function ActivityIndicator({

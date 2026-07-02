@@ -6,6 +6,7 @@ import {
   sendPrompt,
   sendKenPrompt,
   cancelKen,
+  setAutopilot,
   cancel,
   newSession,
   cycleThinking,
@@ -40,7 +41,9 @@ import {
 } from "./agent";
 import { ActivityBar } from "./ActivityBar";
 import { KenActivityBar } from "./KenActivityBar";
+import { AutopilotReviewBar } from "./AutopilotReviewBar";
 import { useKenMentor } from "./useKenMentor";
+import { useAutopilot } from "./useAutopilot";
 import { useAgentEvents, HOOK_PRESENTATION, type HookKind } from "./useAgentEvents";
 import { LiveToolPanel, type LiveToolEntry } from "./LiveToolPanel";
 import { SubAgentFeed, type SubAgentLine } from "./SubAgentFeed";
@@ -58,6 +61,7 @@ import { WakeScreen } from "./WakeScreen";
 import { ConfirmModal } from "./ConfirmModal";
 import { InitGitModal } from "./InitGitModal";
 import { PlanModeLogo } from "./PlanModeLogo";
+import { KenPowerBanner } from "./KenPowerBanner";
 import { PlanReviewModal } from "./PlanReviewModal";
 import { WindowLayoutButton } from "./WindowLayoutButton";
 // Experimental gaze focus — disabled for now (see main.tsx).
@@ -65,6 +69,7 @@ import { WindowLayoutButton } from "./WindowLayoutButton";
 import { RadioButton } from "./RadioButton";
 import { ProjectPicker } from "./ProjectPicker";
 import { BackButton } from "./BackButton";
+import { AutopilotToggle } from "./AutopilotToggle";
 import { HomeScreen } from "./HomeScreen";
 import { Toaster } from "./Toaster";
 import { LoginScreen } from "./LoginScreen";
@@ -150,7 +155,18 @@ export type Item =
   // streamed from the ken_* SSE events. Never mistaken for GG Coder.
   | { kind: "ken"; id: number; text: string }
   | { kind: "info"; id: number; text: string }
-  | { kind: "error"; id: number; text: string }
+  // Structured error (see gg-ai's formatError): headline always answers "is this
+  // me or them", message is the raw detail (omitted when redundant with the
+  // headline), guidance is the action line (retry / switch model / log in /
+  // wait until a reset time). `text` is a legacy fallback for older items.
+  | {
+      kind: "error";
+      id: number;
+      text?: string;
+      headline?: string;
+      message?: string;
+      guidance?: string;
+    }
   // Agent self-correction hook notice (ideal review / loop-break / re-grounding),
   // rendered like the TUI: a shimmering tone-colored one-liner.
   | { kind: "hook"; id: number; hook: HookKind }
@@ -173,6 +189,17 @@ export type Item =
       status: "running" | "done";
       originalCount?: number;
       newCount?: number;
+    }
+  // Autopilot Ken verdict — emitted by the auto-review loop and rendered like a
+  // normal @Ken reply bubble (Ken dot + text), not a separate marker style.
+  // `phase` selects the message: he prompted GG Coder (with the `body` he sent),
+  // gave the all-clear, needs a human (with `reason`), or hit the round cap.
+  | {
+      kind: "autopilot";
+      id: number;
+      phase: "prompted" | "done" | "human" | "capped";
+      reason?: string;
+      body?: string;
     };
 
 export interface TranscriptImage {
@@ -235,6 +262,10 @@ function App(): React.ReactElement {
     kenThinkingAccumMs,
     handleKenEvent,
   } = useKenMentor({ setItems, nextId });
+  // Autopilot Ken (auto-reviewer): consumes the `autopilot_*` event family into
+  // compact transcript markers + a "Ken reviewing…" flag. Separate hook, same
+  // shared setItems/nextId pattern as useKenMentor.
+  const { autopilotReviewing, handleAutopilotEvent } = useAutopilot({ setItems, nextId });
   const [input, setInput] = useState("");
   const [placeholderIndex, setPlaceholderIndex] = useState(0);
   const [displayPlaceholder, setDisplayPlaceholder] = useState(DEFAULT_INPUT_PLACEHOLDER);
@@ -275,6 +306,10 @@ function App(): React.ReactElement {
   // Number of messages queued mid-run (injected as steering by the sidecar).
   const [queuedCount, setQueuedCount] = useState(0);
   const [state, setState] = useState<AgentState | null>(null);
+  // Transient "KEN IS ON"/"KEN IS OFF" takeover banner shown when Autopilot
+  // is toggled. Null = not showing; the banner clears itself via `onDone`
+  // once its slide-out animation finishes.
+  const [kenPowerBanner, setKenPowerBanner] = useState<"on" | "off" | null>(null);
   const [running, setRunning] = useState(false);
   const [status, setStatus] = useState("connecting to agent\u2026");
   const [liveToolFeed, setLiveToolFeed] = useState<LiveToolEntry[]>([]);
@@ -700,6 +735,7 @@ function App(): React.ReactElement {
     setItems,
     nextId,
     handleKenEvent,
+    handleAutopilotEvent,
     setState,
     setTasks,
     setProjectTasks,
@@ -1616,6 +1652,15 @@ function App(): React.ReactElement {
               onClick={() => setShowPicker(true)}
             />
             <span className="picker-head-actions">
+              <AutopilotToggle
+                checked={state?.autopilot ?? false}
+                disabled={running || autopilotReviewing}
+                onChange={(next) => {
+                  setState((s) => (s ? { ...s, autopilot: next } : s));
+                  void setAutopilot(next);
+                  setKenPowerBanner(next ? "on" : "off");
+                }}
+              />
               <button
                 className="btn btn-primary btn-sm"
                 disabled={running}
@@ -1679,29 +1724,42 @@ function App(): React.ReactElement {
         )}
       </div>
 
-      <div className="transcript" ref={scrollRef} onScroll={onTranscriptScroll}>
-        {!hydrated && items.length === 0 ? (
-          <TranscriptSkeleton />
-        ) : (
-          <>
-            {items.length === 0 &&
-              (status === "ready" ? (
-                <WakeScreen />
-              ) : (
-                <div className="line transcript-reveal" style={{ color: theme.textDim }}>
-                  {`\u273b ${status}`}
-                </div>
-              ))}
-            <PromptSendProvider value={sendKenRecommendedPrompt}>
-              {items.map((it) => (
-                <TranscriptRow key={it.id} item={it} onImageLoad={maybeScrollToBottom} />
-              ))}
-            </PromptSendProvider>
-          </>
+      {/* Non-scrolling frame the same size as the chat viewport. The banner
+          lives HERE, not inside `.transcript` — `.transcript` scrolls, and an
+          absolutely positioned child of a scrolling container is pinned to the
+          top of the scrolled CONTENT, not the visible viewport, so in an
+          existing session scrolled down it rendered far above what's on
+          screen. Anchoring to this non-scrolling sibling keeps it pinned to
+          what the user is actually looking at, at any scroll position. */}
+      <div className="transcript-frame">
+        {kenPowerBanner && (
+          <KenPowerBanner mode={kenPowerBanner} onDone={() => setKenPowerBanner(null)} />
         )}
+        <div className="transcript" ref={scrollRef} onScroll={onTranscriptScroll}>
+          {!hydrated && items.length === 0 ? (
+            <TranscriptSkeleton />
+          ) : (
+            <>
+              {items.length === 0 &&
+                (status === "ready" ? (
+                  <WakeScreen />
+                ) : (
+                  <div className="line transcript-reveal" style={{ color: theme.textDim }}>
+                    {`\u273b ${status}`}
+                  </div>
+                ))}
+              <PromptSendProvider value={sendKenRecommendedPrompt}>
+                {items.map((it) => (
+                  <TranscriptRow key={it.id} item={it} onImageLoad={maybeScrollToBottom} />
+                ))}
+              </PromptSendProvider>
+            </>
+          )}
+        </div>
       </div>
 
       <div className="liveregion">
+        {autopilotReviewing && <AutopilotReviewBar onCancel={() => void cancel()} />}
         {kenRunning && (
           <KenActivityBar
             runStartTs={kenRunStartTs}
@@ -1713,10 +1771,10 @@ function App(): React.ReactElement {
           />
         )}
         {!toolsHidden && <LiveToolPanel entries={liveToolFeed} />}
-        {/* Ken's bar REPLACES the main bar while Ken runs and the build is idle —
-            otherwise the idle "Ready for work" line stacks under Ken's spinner.
-            When the build is also running, both bars show (Ken on top). */}
-        {(running || !kenRunning) && (
+        {/* Ken's bar (chat OR autopilot review) REPLACES the main bar while the
+            build is idle — otherwise the idle "Ready for work" line stacks under
+            Ken's spinner. When the build is also running, both bars show. */}
+        {(running || (!kenRunning && !autopilotReviewing)) && (
           <ActivityBar
             running={running}
             tokens={tokens}
@@ -2185,18 +2243,51 @@ const TranscriptRow = memo(function TranscriptRow({
           </div>
         </div>
       );
+    case "autopilot": {
+      // Autopilot Ken's verdict, rendered like a normal @Ken reply (Ken-tinted
+      // dot + text) rather than its own marker style. The text is his verdict as
+      // prose: for a PROMPT he shows what he sent GG Coder back to do; the
+      // terminal verdicts read as short Ken one-liners.
+      const copy: Record<Extract<Item, { kind: "autopilot" }>["phase"], string> = {
+        prompted: item.body?.trim()
+          ? `Sending GG Coder back in:\n\n${item.body.trim()}`
+          : "Sending GG Coder back in for another pass.",
+        done: "All clear. Looks good to me.",
+        human: item.reason?.trim() ? item.reason.trim() : "Need you to weigh in on this one.",
+        capped: "Paused autopilot after 3 rounds. Take a look before I keep going.",
+      };
+      return (
+        <div className="assistant-msg ken-msg">
+          <span className="assistant-dot" style={{ color: theme.ken }}>
+            {DOT}
+          </span>
+          <div className="assistant-text">
+            <Markdown>{copy[item.phase]}</Markdown>
+          </div>
+        </div>
+      );
+    }
     case "info":
       return (
         <div className="line info" style={{ color: theme.textDim }}>
           {item.text}
         </div>
       );
-    case "error":
+    case "error": {
+      // Structured errors (see gg-ai's formatError) always answer "is this me or
+      // them" and, for usage-limit stops, when it resets — mirrors the CLI's
+      // ErrorRow instead of dumping the raw provider string. `text` is the
+      // legacy fallback for items that only ever carried a flat string.
+      const headline = item.headline ?? item.text ?? "";
+      const showMessage = item.message && item.message !== headline;
       return (
-        <div className="line error" style={{ color: theme.error }}>
-          {item.text}
+        <div className="line error">
+          <div style={{ color: theme.error, fontWeight: 600 }}>{headline}</div>
+          {showMessage && <div style={{ color: theme.textDim }}>{item.message}</div>}
+          {item.guidance && <div style={{ color: theme.textDim }}>{item.guidance}</div>}
         </div>
       );
+    }
     case "hook": {
       // Mirrors the TUI IdealHookMessage: assistant-style dot + a shimmering
       // tone-colored one-liner so the self-correction is obvious.

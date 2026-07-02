@@ -1,6 +1,11 @@
 import { describe, it, expect } from "vitest";
 import os from "node:os";
-import { buildKenDigest, KEN_RECENT_MESSAGE_LIMIT } from "./ken-context.js";
+import {
+  buildKenDigest,
+  buildKenAutopilotContext,
+  AUTOPILOT_REVIEW_INSTRUCTION,
+  KEN_RECENT_MESSAGE_LIMIT,
+} from "./ken-context.js";
 import { createTools } from "../tools/index.js";
 import type { Message } from "@kenkaiiii/gg-ai";
 
@@ -107,6 +112,29 @@ describe("buildKenDigest", () => {
     const digest = buildKenDigest({ ...base, messages });
     expect(digest).toContain("look at this");
     expect(digest).not.toContain("AAAABBBBCCCC");
+  });
+
+  it("buildKenAutopilotContext injects the fixed review instruction as the question", () => {
+    const messages: Message[] = [
+      { role: "user", content: "add a login form" },
+      { role: "assistant", content: "Added the form." },
+    ];
+    const digest = buildKenAutopilotContext({
+      projectContext: base.projectContext,
+      cwd: base.cwd,
+      gitBranch: base.gitBranch,
+      platform: base.platform,
+      messages,
+    });
+    // The transcript is still inlined (Ken reviews it) ...
+    expect(digest).toContain("add a login form");
+    expect(digest).toContain("Added the form.");
+    // ... and the trailing question is the fixed autopilot instruction, not a
+    // user-typed one.
+    expect(digest).toContain(AUTOPILOT_REVIEW_INSTRUCTION);
+    expect(digest).toContain("PROMPT");
+    expect(digest).toContain("ALL_CLEAR");
+    expect(digest).toContain("HUMAN");
   });
 
   it("uses the latest compaction summary as the story-so-far base", () => {

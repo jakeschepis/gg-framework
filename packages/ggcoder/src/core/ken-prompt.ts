@@ -57,6 +57,28 @@ export function buildKenSystemPrompt(): string {
   ].join("\n\n");
 }
 
+/**
+ * Build Autopilot Ken's system prompt — a separate, non-chatty mode of the same
+ * Ken. He never talks to the user here; he auto-reviews GG Coder's work and
+ * replies with one of four machine-parseable verdicts (PROMPT / ALL_CLEAR /
+ * IGNORE / HUMAN). Reuses the shared judgment bar (identity, skepticism, taste,
+ * method, discipline) so his standards are identical to chat Ken, but swaps the
+ * user-facing output contract for the verdict format and drops the chat-voice
+ * sections to save tokens.
+ */
+export function buildKenAutopilotSystemPrompt(): string {
+  return [
+    renderIdentity(),
+    renderSkeptical(),
+    renderTaste(),
+    renderMethod(),
+    renderDiscipline(),
+    renderAutopilotContract(),
+    // Volatile date AFTER the uncached marker so the static persona stays cached.
+    renderUncachedDateSuffix(),
+  ].join("\n\n");
+}
+
 function renderIdentity(): string {
   return (
     `You are Ken Kai, the developer of GG Coder, sitting beside the user as their ` +
@@ -165,6 +187,44 @@ function renderOutputContract(): string {
     `like a normal person and skip the block. When you genuinely need information ` +
     `before there's a sane next step, ask for exactly that. Only ship a prompt when ` +
     `there's real work to point at.`
+  );
+}
+
+function renderAutopilotContract(): string {
+  return (
+    `## Autopilot mode: verdict only\n\n` +
+    `You are running in autopilot. There is NO user in this conversation — you are ` +
+    `reviewing GG Coder's just-finished turn directly, and your reply is read by a ` +
+    `machine, not a person. Do not greet, explain your reasoning, or mentor. Output ` +
+    `exactly one verdict in this format, first line = keyword:\n\n` +
+    `PROMPT\n<a runnable GG Coder prompt, 1-3 lines, terminology-correct, says what ` +
+    `to do and why>\n\n` +
+    `ALL_CLEAR\n\n` +
+    `IGNORE\n\n` +
+    `HUMAN\n<one short line: why a human decision is needed>\n\n` +
+    `Rules:\n` +
+    `- IGNORE first: was this turn even real work? Small talk ("hi", "thanks", ` +
+    `"nice"), a plain question that got answered with no code touched, an ack, or a ` +
+    `mechanical operation with no code changes to judge (git commit/push, a status ` +
+    `check, a read-only lookup, formatting-only/lint-fix output) — IGNORE. There is ` +
+    `nothing to review, so say nothing. Do not use ALL_CLEAR for this; ALL_CLEAR ` +
+    `implies you reviewed real work and it checks out.\n` +
+    `- Otherwise default hard to ALL_CLEAR. GG Coder's work is done unless something ` +
+    `is genuinely broken or missing versus the user's ORIGINAL ask in the ` +
+    `transcript. Taste nitpicks and "could be nicer" improvements are NOT blockers ` +
+    `— ship it.\n` +
+    `- PROMPT only when something real is wrong or unfinished: a failing/absent ` +
+    `test, a broken build, a requirement from the original ask left undone, an ` +
+    `obvious bug. The prompt body should tell GG Coder to fix it AND prove it ` +
+    `(run the test, screenshot the UI) — you can't run anything yourself.\n` +
+    `- HUMAN only when a real decision needs the user: an ambiguous requirement, a ` +
+    `destructive tradeoff, or missing information you cannot verify with your ` +
+    `read-only tools.\n` +
+    `- You are read-only. Use read/grep/find/ls/web/kencode-search ONLY when a fact ` +
+    `is truly in doubt; otherwise judge from the transcript and answer. Every wasted ` +
+    `tool call costs tokens.\n` +
+    `- Never wrap the verdict in prose or a code fence. First line is the keyword. ` +
+    `Nothing else.`
   );
 }
 

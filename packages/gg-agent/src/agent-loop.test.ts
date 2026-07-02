@@ -896,11 +896,14 @@ describe("agentLoop", () => {
     expect(calls).toEqual(["mutate:start", "mutate:end", "read_after"]);
   });
 
-  it("stops after repeated invalid tool arguments", async () => {
+  it("stops after repeated invalid tool arguments with non-empty args", async () => {
+    // Non-empty (but wrong-typed) args mean the model actually attempted a
+    // value -- not a provider stream glitch -- so this stays non-recoverable
+    // and stops immediately after 3 identical failures, as before.
     const toolResponse = (id: string) => ({
       message: {
         role: "assistant" as const,
-        content: [{ type: "tool_call" as const, id, name: "bash", args: {} }],
+        content: [{ type: "tool_call" as const, id, name: "bash", args: { command: 123 } }],
       },
       stopReason: "tool_use",
       usage: { inputTokens: 50, outputTokens: 25 },
@@ -954,7 +957,71 @@ describe("agentLoop", () => {
         }),
       }),
     );
+    // Non-recoverable fatal — no auto-continue retry event.
+    expect(events.filter((e) => e.type === "retry")).toHaveLength(0);
     expect(result.totalTurns).toBe(3);
+  });
+
+  it("auto-continues once after repeated EMPTY tool arguments, then stops if it recurs", async () => {
+    // Empty args (`{}`) is the signature of a provider stream that closed the
+    // tool_use block before ever sending argument tokens -- recoverable, so
+    // the loop gets exactly one bounded auto-continue before treating a
+    // repeat as fatal.
+    const emptyArgsResponse = (id: string) => ({
+      message: {
+        role: "assistant" as const,
+        content: [{ type: "tool_call" as const, id, name: "bash", args: {} }],
+      },
+      stopReason: "tool_use",
+      usage: { inputTokens: 50, outputTokens: 25 },
+    });
+
+    for (const id of ["t1", "t2", "t3", "t4", "t5", "t6"]) {
+      mockStream.mockReturnValueOnce({
+        [Symbol.asyncIterator]: async function* () {
+          yield* [];
+        },
+        response: Promise.resolve(emptyArgsResponse(id)),
+      } as unknown as ReturnType<typeof stream>);
+    }
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+
+    const { events, result } = await collectLoop(messages, {
+      provider: "anthropic",
+      model: "test",
+      tools: [
+        {
+          name: "bash",
+          description: "test",
+          parameters: z.object({ command: z.string() }),
+          execute: () => "should not execute",
+        },
+      ],
+    });
+
+    // 3 failures trip the recoverable path and auto-continue (no stop yet);
+    // 3 more failures after the fresh budget trip the fatal path for real.
+    expect(mockStream).toHaveBeenCalledTimes(6);
+    expect(events.filter((e) => e.type === "tool_call_end" && e.isError)).toHaveLength(6);
+    expect(events).toContainEqual(
+      expect.objectContaining({ type: "retry", reason: "tool_argument_glitch" }),
+    );
+    expect(
+      events.filter((e) => e.type === "retry" && e.reason === "tool_argument_glitch"),
+    ).toHaveLength(1);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        error: expect.objectContaining({
+          message: expect.stringContaining("repeatedly issued invalid arguments"),
+        }),
+      }),
+    );
+    expect(result.totalTurns).toBe(6);
   });
 
   it("respects maxTurns", async () => {
@@ -996,5 +1063,70 @@ describe("agentLoop", () => {
     });
 
     expect(result.totalTurns).toBe(2);
+  });
+
+  it("emits a terminal max_turns signal when the turn budget is exhausted mid-task", async () => {
+    // Model never stops calling tools, so the loop can only end by hitting the cap.
+    const toolResponse = {
+      message: {
+        role: "assistant" as const,
+        content: [{ type: "tool_call" as const, id: "t1", name: "test_tool", args: {} }],
+      },
+      stopReason: "tool_use",
+      usage: { inputTokens: 50, outputTokens: 25 },
+    };
+    mockStream.mockReturnValue({
+      [Symbol.asyncIterator]: async function* () {
+        // no text events
+      },
+      response: Promise.resolve(toolResponse),
+    } as unknown as ReturnType<typeof stream>);
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+
+    const { events } = await collectLoop(messages, {
+      provider: "anthropic",
+      model: "test",
+      maxTurns: 3,
+      tools: [
+        {
+          name: "test_tool",
+          description: "test",
+          parameters: { parse: () => ({}) } as never,
+          execute: () => "result",
+        },
+      ],
+    });
+
+    const maxTurnsEvents = events.filter((e) => e.type === "max_turns");
+    expect(maxTurnsEvents).toHaveLength(1);
+    expect(maxTurnsEvents[0]).toMatchObject({ type: "max_turns", totalTurns: 3, maxTurns: 3 });
+
+    // It must be terminal: the final agent_done comes AFTER the max_turns signal.
+    const maxTurnsIndex = events.findIndex((e) => e.type === "max_turns");
+    const doneIndex = events.findIndex((e) => e.type === "agent_done");
+    expect(maxTurnsIndex).toBeGreaterThanOrEqual(0);
+    expect(doneIndex).toBeGreaterThan(maxTurnsIndex);
+  });
+
+  it("does NOT emit max_turns when the agent finishes cleanly under budget", async () => {
+    mockStream.mockReturnValue(mockOkResult("done") as unknown as ReturnType<typeof stream>);
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "test" },
+    ];
+
+    const { events } = await collectLoop(messages, {
+      provider: "anthropic",
+      model: "test",
+      maxTurns: 5,
+    });
+
+    expect(events.some((e) => e.type === "max_turns")).toBe(false);
+    expect(events.some((e) => e.type === "agent_done")).toBe(true);
   });
 });

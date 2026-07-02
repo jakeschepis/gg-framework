@@ -64,22 +64,21 @@ export interface ModelInfo {
 // /model selector and login selector sort models identically.
 export const MODELS: ModelInfo[] = [
   // ── Anthropic ──────────────────────────────────────────
-  // NOTE: Claude Fable 5 (`claude-fable-5`) and Claude Mythos 5
-  // (`claude-mythos-5`) are temporarily unavailable, so they're commented out
-  // here to keep them out of the /model selector and avoid user confusion.
-  // Re-enable once they're generally available again.
-  // {
-  //   id: "claude-fable-5",
-  //   name: "Claude Fable 5",
-  //   provider: "anthropic",
-  //   contextWindow: 1_000_000,
-  //   maxOutputTokens: 128_000,
-  //   supportsThinking: true,
-  //   supportsImages: true,
-  //   supportsVideo: false,
-  //   costTier: "high",
-  //   maxThinkingLevel: "max",
-  // },
+  // NOTE: Claude Mythos 5 (`claude-mythos-5`) is kept commented out — it's a
+  // Project Glasswing (limited, invitation-only) model unavailable to most
+  // users. Re-enable once it's generally available.
+  {
+    id: "claude-fable-5",
+    name: "Claude Fable 5",
+    provider: "anthropic",
+    contextWindow: 1_000_000,
+    maxOutputTokens: 128_000,
+    supportsThinking: true,
+    supportsImages: true,
+    supportsVideo: false,
+    costTier: "high",
+    maxThinkingLevel: "max",
+  },
   // {
   //   // Mythos-class model offered through Project Glasswing (limited
   //   // availability, invitation-only). Same underlying model as Fable 5 with

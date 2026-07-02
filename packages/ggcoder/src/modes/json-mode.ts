@@ -14,6 +14,13 @@ export interface JsonModeOptions {
   thinkingLevel?: ThinkingLevel;
   maxTurns?: number;
   /**
+   * Tool allow-list forwarded from an agent definition's `tools:` frontmatter.
+   * When set, the sub-agent session registers ONLY these tool names, so a
+   * read-only agent (e.g. `tools: read, grep`) physically cannot call
+   * write/edit/bash. Empty/undefined → full toolset (backward compatible).
+   */
+  allowedTools?: string[];
+  /**
    * Stable prompt-cache routing key inherited from the parent ggcoder
    * process. Without this, each sub-agent session generates a unique
    * sessionId-derived cache key and starts with a cold cache on providers
@@ -42,6 +49,7 @@ export async function runJsonMode(options: JsonModeOptions): Promise<void> {
     cwd: options.cwd,
     thinkingLevel: options.thinkingLevel,
     maxTurns: options.maxTurns,
+    allowedTools: options.allowedTools,
     signal: ac.signal,
     // Subagent runs are one-shot, NDJSON-streamed to the parent over stdout,
     // and have no resumable identity. Skip writing a `.jsonl` so the spawn
@@ -77,6 +85,9 @@ export async function runJsonMode(options: JsonModeOptions): Promise<void> {
   });
   session.eventBus.on("agent_done", (payload) => {
     emitJson({ type: "agent_done", ...payload });
+  });
+  session.eventBus.on("max_turns", (payload) => {
+    emitJson({ type: "max_turns", ...payload });
   });
   session.eventBus.on("server_tool_call", (payload) => {
     emitJson({ type: "server_tool_call", ...payload });
