@@ -6,8 +6,21 @@ import warningUrl from "./assets/ui-warning.mp3";
 import hoverUrl from "./assets/ui-hover.mp3";
 import doneUrl from "./assets/ui-done.mp3";
 import fuguUrl from "./assets/fugu.mp3";
+import kenAutopilotOnUrl from "./assets/ken-autopilot-on.mp3";
+import kenAutopilotOffUrl from "./assets/ken-autopilot-off.mp3";
+import levelUpUrl from "./assets/levelup.mp3";
+import expUrl from "./assets/exp-new.mp3";
 
-export type UiSound = "click" | "warning" | "hover" | "done" | "fugu";
+export type UiSound =
+  | "click"
+  | "warning"
+  | "hover"
+  | "done"
+  | "fugu"
+  | "autopilotOn"
+  | "autopilotOff"
+  | "levelUp"
+  | "xp";
 
 const SOURCES: Record<UiSound, string> = {
   click: clickUrl,
@@ -15,6 +28,10 @@ const SOURCES: Record<UiSound, string> = {
   hover: hoverUrl,
   done: doneUrl,
   fugu: fuguUrl,
+  autopilotOn: kenAutopilotOnUrl,
+  autopilotOff: kenAutopilotOffUrl,
+  levelUp: levelUpUrl,
+  xp: expUrl,
 };
 
 // Per-sound master volume — clicks are frequent so they sit quieter than the
@@ -25,6 +42,10 @@ const VOLUME: Record<UiSound, number> = {
   hover: 0.45,
   done: 0.5,
   fugu: 0.6,
+  autopilotOn: 0.55,
+  autopilotOff: 0.55,
+  levelUp: 0.6,
+  xp: 0.42,
 };
 
 // Preloaded base elements (one per sound) cloned on each play.

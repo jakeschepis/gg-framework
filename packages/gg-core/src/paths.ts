@@ -14,6 +14,8 @@ export interface AppPaths {
   skillsDir: string;
   extensionsDir: string;
   agentsDir: string;
+  progressFile: string;
+  progressBackupFile: string;
 }
 
 export function getAppPaths(): AppPaths {
@@ -31,5 +33,7 @@ export function getAppPaths(): AppPaths {
     skillsDir: path.join(agentDir, "skills"),
     extensionsDir: path.join(agentDir, "extensions"),
     agentsDir: path.join(agentDir, "agents"),
+    progressFile: path.join(agentDir, "progress.json"),
+    progressBackupFile: path.join(agentDir, "progress.backup.json"),
   };
 }

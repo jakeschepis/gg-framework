@@ -22,6 +22,60 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.14.1",
+    date: "2026-07-03",
+    items: [
+      "XP feels punchier now. I swapped in a fresher sound for those little progress hits, so every step forward lands with more snap.",
+    ],
+  },
+  {
+    version: "0.14.0",
+    date: "2026-07-03",
+    items: [
+      "Autopilot can handle plans on its own now. When GG Coder drafts a solid plan, I review it, approve it, and kick off the build without making you babysit the button.",
+      "Bad plans get bounced back cleanly. I send GG Coder the exact revision it needs, then review the new plan again until it is ready to ship.",
+      "Plan popups stay out of your way when Autopilot is on. You still get the normal review screen when you are driving manually, but when I am on watch I keep the flow moving.",
+      "I got better at spotting fake blockers. If GG Coder asks permission for safe work that is already implied by your request, I tell it to keep going instead of dragging you back in.",
+    ],
+  },
+  {
+    version: "0.13.0",
+    date: "2026-07-03",
+    items: [
+      "Coding just became a game. I now award you XP for every bit of real work you ship, and you climb through ranks as you go. Check your shiny new rank badge right on the home screen.",
+      "Open your Scorecard to see your level, your progress bar, and how close you are to the next rank. Your grind finally has a scoreboard.",
+      "Level ups come with a proper celebration: sound, confetti, the works. You earned it, so I make sure it feels like it.",
+      "Your XP is built from your actual git history, so the progress you already made counts from day one. No starting from zero.",
+    ],
+  },
+  {
+    version: "0.12.4",
+    date: "2026-07-02",
+    items: [
+      "Your sessions list is clean now. Reopening a project used to clone the whole conversation into a duplicate every single time, I fixed the leak so resuming just picks up right where you left off.",
+    ],
+  },
+  {
+    version: "0.12.3",
+    date: "2026-07-02",
+    items: [
+      "I got a lot faster and cheaper to talk to. Your context now stays warm in my memory for a full hour instead of dropping every five minutes, so long sessions cost less and I answer quicker.",
+      "Drag a folder straight onto the window and I will drop its path right into your message, no more typing paths by hand.",
+      "Autopilot now skips reviewing pure busywork, like commits, pushes, and status checks, so I only chime in when there is real work worth judging.",
+      "Added a Grant Permissions button in Settings for macOS so you can hand me full disk access in one click instead of clicking through a maze of prompts.",
+    ],
+  },
+  {
+    version: "0.12.2",
+    date: "2026-07-02",
+    items: [
+      "Autopilot is calmer and harder to fool now. I judge GG Coder against your original request, not my own follow-up nudges, so I stop inventing extra work after the job is already done.",
+      "When GG Coder asks you a question or puts a plan in front of you, I keep my hands off the wheel. I will call for you instead of answering on your behalf.",
+      "Ken gets his own model switch. Pin me to a different brain or let me follow GG Coder, right from the footer.",
+      "Queued messages land cleaner now. If you send one while I am reviewing and there is no live run to steer, I treat it as a fresh turn instead of mixing it into the next unrelated job.",
+    ],
+  },
+  {
     version: "0.12.1",
     date: "2026-07-02",
     items: [

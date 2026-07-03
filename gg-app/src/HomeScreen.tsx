@@ -17,7 +17,11 @@ import {
   startServe,
   stopServe,
   openWhatsNewWindow,
+  getProgress,
+  type ProgressSnapshot,
 } from "./agent";
+import { RankBadge } from "./RankBadge";
+import { ScorecardModal } from "./ScorecardModal";
 import { useAppUpdate } from "./update";
 import { toast } from "./toast";
 
@@ -42,11 +46,17 @@ export function HomeScreen({ onProjects, onLogin }: Props): React.ReactElement {
   const [telegramConfigured, setTelegramConfigured] = useState(false);
   const [serveBusy, setServeBusy] = useState(false);
   const [version, setVersion] = useState<string | null>(null);
+  const [progress, setProgress] = useState<ProgressSnapshot | null>(null);
+  const [showScorecard, setShowScorecard] = useState(false);
   const appUpdate = useAppUpdate();
 
   useEffect(() => {
     void getVersion()
       .then(setVersion)
+      .catch(() => {});
+    void waitForReady()
+      .then(() => getProgress())
+      .then(setProgress)
       .catch(() => {});
   }, []);
 
@@ -143,6 +153,11 @@ export function HomeScreen({ onProjects, onLogin }: Props): React.ReactElement {
         version && (
           <div className="home-version-row">
             <span className="home-version">{`v${version}`}</span>
+            <RankBadge
+              snapshot={progress}
+              onClick={() => setShowScorecard(true)}
+              className="home-rank-badge"
+            />
             <button
               className="home-whatsnew"
               type="button"
@@ -245,6 +260,9 @@ export function HomeScreen({ onProjects, onLogin }: Props): React.ReactElement {
         />
       )}
       {showMcp && <McpModal onClose={() => setShowMcp(false)} />}
+      {showScorecard && progress && (
+        <ScorecardModal snapshot={progress} onClose={() => setShowScorecard(false)} />
+      )}
     </div>
   );
 }

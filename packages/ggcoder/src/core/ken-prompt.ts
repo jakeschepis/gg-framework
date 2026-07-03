@@ -8,9 +8,14 @@
  * runnable prompts the user can fire into GG Coder, plus blunt, casual
  * mentorship. Ken never writes code; he recommends, GG Coder executes.
  *
- * This module owns ONLY Ken's identity + method. The "what they're building"
- * context is built fresh each turn by `buildKenContext()` in the sidecar.
+ * This module owns Ken's identity + method, PLUS the static project-context
+ * files (CLAUDE.md/AGENTS.md up the tree) — they rarely change turn to turn,
+ * so they're read once per session creation and folded into the cached system
+ * prompt instead of being re-sent uncached in every digest (see
+ * `buildKenDigest()` in ken-context.ts, which only carries what's genuinely
+ * dynamic: cwd/platform/git branch/recent activity/original request).
  */
+import { collectProjectContext } from "../system-prompt.js";
 
 /** The fenced-block language Ken wraps every recommended GG Coder prompt in.
  *  The webview special-cases ```prompt blocks into a "Send to GG Coder" button. */
@@ -39,7 +44,7 @@ function renderUncachedDateSuffix(): string {
  * are listed by the session's own Tools section; this prompt teaches him how to
  * think and how to format what he hands back.
  */
-export function buildKenSystemPrompt(): string {
+export async function buildKenSystemPrompt(cwd: string): Promise<string> {
   return [
     renderIdentity(),
     renderEdge(),
@@ -51,10 +56,13 @@ export function buildKenSystemPrompt(): string {
     renderDiscipline(),
     renderVoice(),
     renderContextNote(),
+    await renderProjectContext(cwd),
     // Volatile date AFTER the uncached marker, so the static persona above stays
     // in the provider prompt cache and only this line changes day to day.
     renderUncachedDateSuffix(),
-  ].join("\n\n");
+  ]
+    .filter(Boolean)
+    .join("\n\n");
 }
 
 /**
@@ -66,7 +74,7 @@ export function buildKenSystemPrompt(): string {
  * user-facing output contract for the verdict format and drops the chat-voice
  * sections to save tokens.
  */
-export function buildKenAutopilotSystemPrompt(): string {
+export async function buildKenAutopilotSystemPrompt(cwd: string): Promise<string> {
   return [
     renderIdentity(),
     renderSkeptical(),
@@ -74,9 +82,22 @@ export function buildKenAutopilotSystemPrompt(): string {
     renderMethod(),
     renderDiscipline(),
     renderAutopilotContract(),
+    await renderProjectContext(cwd),
     // Volatile date AFTER the uncached marker so the static persona stays cached.
     renderUncachedDateSuffix(),
-  ].join("\n\n");
+  ]
+    .filter(Boolean)
+    .join("\n\n");
+}
+
+/** Static project-context files (CLAUDE.md/AGENTS.md up the tree from cwd),
+ *  folded into the cached system prompt. Read once per session creation
+ *  instead of per-turn in the digest — rarely changes mid-session, and even
+ *  when it does, a stale read is harmless (Ken's tools can always re-check). */
+async function renderProjectContext(cwd: string): Promise<string> {
+  const parts = await collectProjectContext(cwd).catch(() => [] as string[]);
+  if (parts.length === 0) return "";
+  return `## Project context\n\n${parts.join("\n\n")}`;
 }
 
 function renderIdentity(): string {
@@ -195,8 +216,13 @@ function renderAutopilotContract(): string {
     `## Autopilot mode: verdict only\n\n` +
     `You are running in autopilot. There is NO user in this conversation — you are ` +
     `reviewing GG Coder's just-finished turn directly, and your reply is read by a ` +
-    `machine, not a person. Do not greet, explain your reasoning, or mentor. Output ` +
-    `exactly one verdict in this format, first line = keyword:\n\n` +
+    `machine, not a person. Do not greet, explain your reasoning, mentor, or summarize ` +
+    `what changed. The parser only reads the FIRST line of your reply — anything you ` +
+    `put before the keyword (a recap, an opinion, "Looks good.") is treated as ` +
+    `garbage and the whole turn silently falls back to a HUMAN stop, which is worse ` +
+    `than saying nothing. The very first character of your reply must be the ` +
+    `keyword. Output exactly one verdict in this format, first line = keyword, ` +
+    `nothing before it:\n\n` +
     `PROMPT\n<a runnable GG Coder prompt, 1-3 lines, terminology-correct, says what ` +
     `to do and why>\n\n` +
     `ALL_CLEAR\n\n` +
@@ -210,21 +236,38 @@ function renderAutopilotContract(): string {
     `nothing to review, so say nothing. Do not use ALL_CLEAR for this; ALL_CLEAR ` +
     `implies you reviewed real work and it checks out.\n` +
     `- Otherwise default hard to ALL_CLEAR. GG Coder's work is done unless something ` +
-    `is genuinely broken or missing versus the user's ORIGINAL ask in the ` +
-    `transcript. Taste nitpicks and "could be nicer" improvements are NOT blockers ` +
-    `— ship it.\n` +
+    `is genuinely broken or missing versus the user's ORIGINAL ask (the 'Original ` +
+    `user request' section of your context — never a later injected prompt). Taste ` +
+    `nitpicks and "could be nicer" improvements are NOT blockers — ship it.\n` +
     `- PROMPT only when something real is wrong or unfinished: a failing/absent ` +
     `test, a broken build, a requirement from the original ask left undone, an ` +
     `obvious bug. The prompt body should tell GG Coder to fix it AND prove it ` +
     `(run the test, screenshot the UI) — you can't run anything yourself.\n` +
     `- HUMAN only when a real decision needs the user: an ambiguous requirement, a ` +
-    `destructive tradeoff, or missing information you cannot verify with your ` +
-    `read-only tools.\n` +
+    `destructive tradeoff, missing information you cannot verify with your ` +
+    `read-only tools, credentials/secrets, external access, budget/cost, or a ` +
+    `product/taste choice the user must own. GG Coder asking the user a ` +
+    `question or presenting options is HUMAN only when answering it requires ` +
+    `one of those user-level decisions. If GG Coder merely asks permission to ` +
+    `continue work that is mechanically implied by the user's original ask and ` +
+    `safe to do without new information, do NOT block on the human. Use PROMPT ` +
+    `with the concrete next step.\n` +
+    `- Plans are YOURS to review. When your context contains a 'Plan under ` +
+    `review' section, you are the plan reviewer: ALL_CLEAR approves it and ` +
+    `implementation starts immediately, PROMPT sends revision feedback, HUMAN ` +
+    `only for a genuine user-level decision (destructive/ambiguous product ` +
+    `choice). Default to approving a sound plan — taste nitpicks are not ` +
+    `blockers. Never IGNORE a plan.\n` +
+    `- Transcript lines labeled "Ken autopilot (injected)" are YOUR own earlier ` +
+    `fix prompts, not user asks. Judge only against the original user request.\n` +
     `- You are read-only. Use read/grep/find/ls/web/kencode-search ONLY when a fact ` +
     `is truly in doubt; otherwise judge from the transcript and answer. Every wasted ` +
     `tool call costs tokens.\n` +
-    `- Never wrap the verdict in prose or a code fence. First line is the keyword. ` +
-    `Nothing else.`
+    `- Never wrap the verdict in prose or a code fence, and never add commentary ` +
+    `before OR after the keyword line (no recap of what you found, no "Looks good", ` +
+    `no explanation of the verdict). The keyword line is your entire reply for ` +
+    `ALL_CLEAR and IGNORE; PROMPT and HUMAN take only the payload described above, ` +
+    `nothing more.`
   );
 }
 

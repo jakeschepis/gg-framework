@@ -8,6 +8,7 @@ use std::sync::Mutex;
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use base64::Engine as _;
 use futures_util::StreamExt;
 use tauri::{Emitter, EventTarget, Manager, RunEvent, State, WebviewUrl, WebviewWindow, WebviewWindowBuilder};
 use tauri_plugin_opener::OpenerExt;
@@ -55,6 +56,26 @@ struct RestoreEntry {
     cwd: String,
     #[serde(rename = "sessionPath")]
     session_path: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct DroppedPathInfo {
+    path: String,
+    #[serde(rename = "isDir")]
+    is_dir: bool,
+}
+
+/// OS-level permission status shown in the Settings modal's "Grant
+/// Permissions" row. Only macOS has anything to grant today (Full Disk
+/// Access — needed because the subagent tool spawns a fresh `ggnode` process
+/// per call, which re-triggers macOS's per-folder privacy prompts under
+/// Desktop/Documents/Downloads/iCloud). Windows/Linux report
+/// `applicable: false` so the webview hides the row entirely instead of
+/// showing a badge for a permission that doesn't exist there.
+#[derive(serde::Serialize)]
+struct PermissionsStatus {
+    applicable: bool,
+    granted: bool,
 }
 
 /// Pending per-window restore targets, consumed once by the webview on mount.
@@ -443,6 +464,78 @@ fn sidecar_port(webview: WebviewWindow) -> Option<u16> {
     port_for(&webview)
 }
 
+#[tauri::command]
+fn dropped_path_info(paths: Vec<String>) -> Vec<DroppedPathInfo> {
+    paths
+        .into_iter()
+        .map(|path| {
+            let is_dir = std::fs::metadata(&path).map(|m| m.is_dir()).unwrap_or(false);
+            DroppedPathInfo { path, is_dir }
+        })
+        .collect()
+}
+
+/// Cap on a single dropped file's size for base64 attachment — large drops
+/// (e.g. multi-GB video) would blow up the base64 payload and the IPC/agent
+/// prompt pipeline; point the user at the file path instead via the error.
+const MAX_DROPPED_FILE_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Guess a media type from the file extension. Covers the kinds the chat
+/// input already accepts (image/video via the attach button, everything else
+/// falls back to a generic binary type like a browser's File.type would for
+/// an unrecognized extension).
+fn guess_media_type(path: &Path) -> String {
+    let ext = path
+        .extension()
+        .and_then(|e| e.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    match ext.as_str() {
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "gif" => "image/gif",
+        "webp" => "image/webp",
+        "bmp" => "image/bmp",
+        "svg" => "image/svg+xml",
+        "mp4" => "video/mp4",
+        "mov" => "video/quicktime",
+        "webm" => "video/webm",
+        "avi" => "video/x-msvideo",
+        "mkv" => "video/x-matroska",
+        "pdf" => "application/pdf",
+        "txt" | "md" => "text/plain",
+        _ => "application/octet-stream",
+    }
+    .to_string()
+}
+
+/// A native drag-drop only gives us absolute paths (no browser File object),
+/// so a regular file dropped on the window (as opposed to a folder, handled
+/// separately by inserting its path into the draft) is read here and handed
+/// back as base64 — the same shape `fileToPending` builds for a pasted/picked
+/// file — so it attaches identically regardless of how it entered the input.
+#[tauri::command]
+fn read_dropped_file_attachment(path: String) -> Result<serde_json::Value, String> {
+    let p = Path::new(&path);
+    let metadata = std::fs::metadata(p).map_err(|e| e.to_string())?;
+    if metadata.len() > MAX_DROPPED_FILE_BYTES {
+        return Err(format!(
+            "{} is too large to attach ({} MB, limit {} MB)",
+            path,
+            metadata.len() / (1024 * 1024),
+            MAX_DROPPED_FILE_BYTES / (1024 * 1024)
+        ));
+    }
+    let bytes = std::fs::read(p).map_err(|e| e.to_string())?;
+    let data = base64::engine::general_purpose::STANDARD.encode(bytes);
+    let name = p
+        .file_name()
+        .map(|n| n.to_string_lossy().to_string())
+        .unwrap_or_else(|| path.clone());
+    let media_type = guess_media_type(p);
+    Ok(serde_json::json!({ "name": name, "mediaType": media_type, "data": data }))
+}
+
 fn strip_file_location_suffix(path: &str) -> &str {
     let mut end = path.len();
     for _ in 0..2 {
@@ -512,6 +605,21 @@ async fn agent_state(
     let res = client
         .get(format!("{}/state", sidecar_base(port)))
         .header("x-gg-session", &gg_sid)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+}
+
+/// Proxy: current XP/rank progress snapshot (Ranks system).
+#[tauri::command]
+async fn agent_progress(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let res = client
+        .get(format!("{}/progress", sidecar_base(port)))
         .send()
         .await
         .map_err(|e| e.to_string())?;
@@ -923,6 +1031,27 @@ async fn agent_switch_model(
     let gg_sid = session_for(&webview).ok_or("session not ready")?;
     let res = client
         .post(format!("{}/model", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .json(&serde_json::json!({ "model": model }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
+}
+
+/// Proxy: pin Ken (mentor + autopilot) to a model, or clear the pin so he
+/// follows GG Coder's model again. `model: None` clears. Returns
+/// `{ kenProvider, kenModel, kenModelOverride }`.
+#[tauri::command]
+async fn agent_switch_ken_model(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    model: Option<String>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!("{}/ken/model", sidecar_base(port)))
         .header("x-gg-session", &gg_sid)
         .json(&serde_json::json!({ "model": model }))
         .send()
@@ -2056,10 +2185,13 @@ fn build_app_window(app: &tauri::AppHandle, label: &str) -> Result<WebviewWindow
         .title("GG Coder")
         .inner_size(1024.0, 720.0)
         .min_inner_size(480.0, 360.0)
-        .background_color(APP_BG)
-        // Let the webview's HTML drop handler receive files (Tauri's native
-        // drag-drop would otherwise intercept them).
-        .disable_drag_drop_handler();
+        .background_color(APP_BG);
+    // Windows needs HTML5 drop enabled for the existing browser attachment path.
+    // macOS keeps Tauri's native handler so folder drops include absolute paths.
+    #[cfg(target_os = "windows")]
+    {
+        builder = builder.disable_drag_drop_handler();
+    }
     if matches!(window_chrome(), WindowChrome::MacOverlay) {
         builder = apply_mac_overlay(builder);
     }
@@ -2678,6 +2810,56 @@ fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("/"))
 }
 
+/// Whether this process can read inside a macOS TCC-protected folder (probed
+/// via the user's Documents directory, present on every account). Full Disk
+/// Access grants blanket read access to all of them at once; a narrower grant
+/// (e.g. only Desktop) would still fail this Documents probe, which is the
+/// intentionally strict behavior — the Settings badge should read "not
+/// granted" until Full Disk Access covers everything the subagent process
+/// might need. Returns `true` immediately on non-macOS (no probe needed).
+#[cfg(target_os = "macos")]
+fn full_disk_access_granted() -> bool {
+    let probe = home_dir().join("Documents");
+    std::fs::read_dir(&probe).is_ok()
+}
+
+#[cfg(not(target_os = "macos"))]
+fn full_disk_access_granted() -> bool {
+    true
+}
+
+/// Report whether there's an OS permission to grant on this platform, and
+/// whether it's currently granted. Windows/Linux have nothing to grant (the
+/// subagent-respawn TCC issue is macOS-only), so `applicable` is false and the
+/// Settings modal hides the row entirely.
+#[tauri::command]
+fn permissions_status() -> PermissionsStatus {
+    PermissionsStatus {
+        applicable: cfg!(target_os = "macos"),
+        granted: full_disk_access_granted(),
+    }
+}
+
+/// Open System Settings' Full Disk Access pane directly (macOS only — the
+/// frontend only shows the button when `permissions_status().applicable` is
+/// true). `x-apple.systempreferences` deep-links straight past the generic
+/// Privacy & Security landing page.
+#[tauri::command]
+fn open_permissions_settings() -> Result<(), String> {
+    #[cfg(target_os = "macos")]
+    {
+        Command::new("open")
+            .arg("x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles")
+            .spawn()
+            .map_err(|e| e.to_string())?;
+        Ok(())
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        Err("not applicable on this platform".into())
+    }
+}
+
 /// Pure cwd decision (testable without touching env/filesystem).
 /// - `env_override` (GG_APP_CWD) always wins.
 /// - dev build → the workspace root (`CARGO_MANIFEST_DIR/../..`).
@@ -2997,8 +3179,13 @@ pub fn run() {
         .manage(reqwest::Client::new())
         .invoke_handler(tauri::generate_handler![
             sidecar_port,
+            dropped_path_info,
+            permissions_status,
+            open_permissions_settings,
+            read_dropped_file_attachment,
             open_project_path,
             agent_state,
+            agent_progress,
             agent_prompt,
             agent_cancel,
             agent_ken_prompt,
@@ -3020,6 +3207,7 @@ pub fn run() {
             agent_cycle_thinking,
             agent_models,
             agent_switch_model,
+            agent_switch_ken_model,
             agent_enhance_prompt,
             agent_commands,
             setup_windows,

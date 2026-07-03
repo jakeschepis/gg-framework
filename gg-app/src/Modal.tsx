@@ -11,7 +11,7 @@ export function Modal({
   onClose,
   className,
 }: {
-  title: string;
+  title: React.ReactNode;
   children: React.ReactNode;
   onClose: () => void;
   /** Extra class on the `.modal` box (e.g. width overrides). */

@@ -13,7 +13,7 @@ import { formatTokenCount } from "./ActivityBar";
 import { type LiveToolEntry, LIVE_TOOL_PANEL_ROWS } from "./LiveToolPanel";
 import { type SubAgentLine } from "./SubAgentFeed";
 import { playSound } from "./sounds";
-import { findCompletedSteps } from "./plan-steps";
+import { findCompletedSteps, countPlanSteps } from "./plan-steps";
 import type { PendingAttachment } from "./attachments";
 import type { Item } from "./App";
 
@@ -210,6 +210,11 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   // them for render. Finalizing a span happens outside setState updaters.
   const thinkingStartRef = useRef<number | null>(null);
   const thinkingAccumRef = useRef<number>(0);
+  // Content of the plan currently in the review modal, mirrored from plan_exit.
+  // autopilot_plan_accepted reads it SYNCHRONOUSLY to seed the plan-progress
+  // widget — the planReview state value may not have flushed yet when the
+  // accepted + session_reset frames arrive back-to-back over SSE.
+  const planReviewContentRef = useRef<string | null>(null);
 
   // Streaming deltas arrive faster than React can usefully render each one.
   // We buffer chunks in a ref and flush once per animation frame (~16ms),
@@ -662,6 +667,12 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
         case "model_change":
           setState((s) => (s ? { ...s, ...(d as Partial<AgentState>) } : s));
           break;
+        // Ken's effective model changed — either his pin was set/cleared or he
+        // followed a GG Coder switch. Payload keys (kenProvider/kenModel/
+        // kenModelOverride) match AgentState, so a spread is enough.
+        case "ken_model_change":
+          setState((s) => (s ? { ...s, ...(d as Partial<AgentState>) } : s));
+          break;
         case "thinking_change":
           setState((s) =>
             s
@@ -677,12 +688,48 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           setState((s) => (s ? { ...s, planMode: true } : s));
           pushItem({ kind: "plan", id: nextId(), reason: String(d.reason ?? "") });
           break;
-        case "plan_exit":
+        case "plan_exit": {
           setState((s) => (s ? { ...s, planMode: false } : s));
-          // Open the review modal (Accept / Feedback / Reject) with the plan, and
-          // stash its path so accept can bake it into the system prompt.
+          // Always stash the submitted plan: autopilot needs the content to
+          // seed the plan-progress widget if Ken approves it, and manual accept
+          // needs the path when autopilot is off.
           planReviewPathRef.current = typeof d.planPath === "string" ? d.planPath : null;
-          setPlanReview(String(d.content ?? ""));
+          const content = String(d.content ?? "");
+          planReviewContentRef.current = content;
+          // Autopilot owns plan review when enabled. Showing the human overlay
+          // during the few seconds before Ken accepts/rejects is just visual
+          // noise, and users generally cannot act in time anyway. Non-autopilot
+          // stays unchanged: the modal opens for manual Accept/Feedback/Reject.
+          if (stateRef.current?.autopilot) {
+            setPlanReview(null);
+          } else {
+            setPlanReview(content);
+          }
+          break;
+        }
+        case "autopilot_plan_accepted":
+          // Autopilot Ken approved the submitted plan (no user in the loop).
+          // Mirrors the manual-accept path: seed the plan-progress widget from
+          // the modal's plan BEFORE the imminent session_reset consumes the
+          // ref, close the modal, and drop the approved marker in the
+          // transcript.
+          pendingPlanTotalRef.current = planReviewContentRef.current
+            ? countPlanSteps(planReviewContentRef.current)
+            : 0;
+          planReviewContentRef.current = null;
+          setPlanReview(null);
+          endStreamingText();
+          pushItem({ kind: "autopilot", id: nextId(), phase: "plan_approved" });
+          break;
+        case "autopilot_prompted":
+          // Autopilot-only plan revision path: Ken rejected/refined the plan and
+          // the sidecar injected a revision prompt into GG Coder. Close the
+          // stale human review modal so autopilot visibly continues. In
+          // non-autopilot mode this frame never exists, so the normal modal +
+          // manual Accept/Feedback/Reject flow stays unchanged.
+          planReviewContentRef.current = null;
+          planReviewPathRef.current = null;
+          setPlanReview(null);
           break;
         case "tasks":
           setTasks((d.tasks as BackgroundTask[] | undefined) ?? []);
@@ -720,6 +767,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           setContextTokens(0);
           setSessionTitle(null);
           setPlanReview(null);
+          planReviewContentRef.current = null;
           {
             // On an accept-driven reset, restore the approved plan's step count
             // instead of zeroing it (the widget tracks the implementation run).

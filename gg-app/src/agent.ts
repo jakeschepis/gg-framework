@@ -63,6 +63,13 @@ export interface AgentState {
   /** Autopilot (auto-review) toggle for this window's project. Per-window,
    *  persisted server-side; absent on frames from older sidecars. */
   autopilot?: boolean;
+  /** Provider of the model Ken (mentor + autopilot) uses next turn. */
+  kenProvider?: string;
+  /** The model Ken uses next turn — his pin when set, else GG Coder's model.
+   *  Absent on frames from older sidecars (footer falls back to `model`). */
+  kenModel?: string;
+  /** True when Ken is pinned to his own model (not following GG Coder). */
+  kenModelOverride?: boolean;
   /** Live background tasks (footer indicator). */
   tasks?: BackgroundTask[];
 }
@@ -147,8 +154,63 @@ export interface SwitchModelResult extends ThinkingState {
   model: string;
 }
 
+/** Result of pinning/clearing Ken's model — his effective model afterward. */
+export interface SwitchKenModelResult {
+  kenProvider: string;
+  kenModel: string;
+  kenModelOverride: boolean;
+}
+
 export async function getState(): Promise<AgentState> {
   return invoke<AgentState>("agent_state");
+}
+
+// ── Progress (Ranks) ─────────────────────────────────────────────────────
+
+/** One rung of the 50-rank ladder, as computed by the sidecar. */
+export interface RankLadderEntry {
+  level: number;
+  name: string;
+  tier: number;
+  tierName: string;
+  effectId: string;
+  xpRequired: number;
+}
+
+export interface LevelUpEvent {
+  from: number;
+  to: number;
+  rankName: string;
+}
+
+/** XP/rank snapshot — fully computed sidecar-side; the webview renders it verbatim. */
+export interface ProgressSnapshot {
+  level: number;
+  rankName: string;
+  tier: number;
+  tierName: string;
+  tierGlyph: string;
+  effectId: string;
+  xp: number;
+  xpIntoLevel: number;
+  xpForLevel: number;
+  percent: number;
+  streak: { current: number; best: number };
+  totals: { prompts: number; commits: number; linesShipped: number; projects: number };
+  xpBySource: { prompts: number; commits: number; streakBonus: number };
+  memberSince: string;
+  ladder: RankLadderEntry[];
+  levelUp: LevelUpEvent | null;
+  eventNonce: string | null;
+  /** True only on the frame sent to the window whose run earned the XP —
+   *  gates window-local feedback (sounds, XP chips). Absent on GET /progress. */
+  origin?: boolean;
+}
+
+/** Fetch the current XP/rank snapshot (initial paint; live updates ride `progress` frames). */
+export async function getProgress(): Promise<ProgressSnapshot> {
+  await waitForReady();
+  return invoke<ProgressSnapshot>("agent_progress");
 }
 
 /**
@@ -192,6 +254,21 @@ export async function openProjectPath(path: string): Promise<void> {
   }
 }
 
+export interface DroppedPathInfo {
+  path: string;
+  isDir: boolean;
+}
+
+export async function getDroppedPathInfo(paths: string[]): Promise<DroppedPathInfo[]> {
+  if (paths.length === 0) return [];
+  try {
+    return await invoke<DroppedPathInfo[]>("dropped_path_info", { paths });
+  } catch (e) {
+    await logError(`dropped_path_info failed: ${String(e)}`);
+    return paths.map((path) => ({ path, isDir: false }));
+  }
+}
+
 /** A chat-input attachment (image / video / other file) sent with a prompt. */
 export interface Attachment {
   kind: "image" | "video" | "file";
@@ -199,6 +276,28 @@ export interface Attachment {
   mediaType: string;
   /** base64 with NO data: prefix. */
   data: string;
+}
+
+/** Read a natively-dropped (non-directory) file's bytes as base64, since a
+ *  native drag-drop only gives us a path — no browser File object. Returns
+ *  null (logging) on failure (e.g. permission denied, file too large) so one
+ *  bad file in a multi-file drop doesn't block the rest. */
+export async function readDroppedFileAttachment(path: string): Promise<Attachment | null> {
+  try {
+    const res = await invoke<{ name: string; mediaType: string; data: string }>(
+      "read_dropped_file_attachment",
+      { path },
+    );
+    const kind: Attachment["kind"] = res.mediaType.startsWith("image/")
+      ? "image"
+      : res.mediaType.startsWith("video/")
+        ? "video"
+        : "file";
+    return { kind, name: res.name, mediaType: res.mediaType, data: res.data };
+  } catch (e) {
+    await logError(`read_dropped_file_attachment failed for ${path}: ${String(e)}`);
+    return null;
+  }
 }
 
 export async function sendPrompt(text: string, attachments: Attachment[] = []): Promise<void> {
@@ -246,6 +345,10 @@ export async function cancel(): Promise<void> {
 //   autopilot_ignored {}            — nothing worth reviewing, loop stops SILENTLY (no marker)
 //   autopilot_human { reason }      — Ken needs a human decision, loop stops
 //   autopilot_capped { rounds }     — round cap hit, loop paused
+//   autopilot_plan_accepted {}      — Ken approved a submitted plan; broadcast
+//                                     BEFORE the session_reset that follows so
+//                                     the webview can seed the plan-progress
+//                                     widget from the still-open plan modal
 //   autopilot_error { headline, … } — a review failed (structured, like error)
 
 /** Ask Ken Kai. Fires the read-only mentor run; reply arrives via `ken_*`
@@ -317,6 +420,14 @@ export interface HistoryEntry {
    *  the `@Ken` question, an `assistant` row is Ken's reply. Rendered in Ken's
    *  color (user bubble tinted, assistant as a Ken bubble) on resume. */
   ken?: boolean;
+  /** Present when this entry is a persisted autopilot verdict marker. Rendered
+   *  identically to the live `autopilot` item (Ken-tinted bubble), never as
+   *  the raw verdict keyword the model replied with (e.g. `ALL_CLEAR`). */
+  autopilot?: {
+    phase: "prompted" | "done" | "human" | "capped" | "plan_approved";
+    reason?: string;
+    body?: string;
+  };
   /** Tool-produced images rendered inline (same as live `images` items),
    *  reconstructed from ImageContent blocks in persisted tool results. */
   toolImages?: Array<{ src: string; path?: string }>;
@@ -520,6 +631,17 @@ export async function switchModel(model: string): Promise<SwitchModelResult | nu
   }
 }
 
+/** Pin Ken (mentor + autopilot) to a model, or pass null to clear the pin so
+ *  he follows GG Coder's model again. Returns his effective model. */
+export async function switchKenModel(model: string | null): Promise<SwitchKenModelResult | null> {
+  try {
+    return await invoke<SwitchKenModelResult>("agent_switch_ken_model", { model });
+  } catch (e) {
+    await logError(`agent_switch_ken_model failed: ${String(e)}`);
+    return null;
+  }
+}
+
 /** App settings. `configured` is true only when the user explicitly set a
  * projects root (not the default fallback). */
 export interface AppSettings {
@@ -550,6 +672,41 @@ export async function getSettings(): Promise<AppSettings | null> {
  */
 export async function saveSettings(projectsRoot: string): Promise<void> {
   await invoke("app_settings_save", { projectsRoot });
+}
+
+export interface PermissionsStatus {
+  /** False on platforms with nothing to grant (Windows/Linux today) — the
+   *  caller should hide the permissions row entirely rather than show a
+   *  badge for a permission that doesn't exist. */
+  applicable: boolean;
+  granted: boolean;
+}
+
+/**
+ * OS permission needed for sub-agents to run without repeat "Allow" prompts:
+ * each subagent call spawns a fresh `ggnode` process, and macOS re-triggers
+ * its per-folder privacy prompt (Desktop/Documents/Downloads/iCloud) for every
+ * newly-spawned binary unless Full Disk Access is granted. Handled NATIVELY in
+ * Rust so it works even before the sidecar is up. Falls back to "not
+ * applicable" on any failure so the row degrades to hidden, never stuck open.
+ */
+export async function getPermissionsStatus(): Promise<PermissionsStatus> {
+  try {
+    return await invoke<PermissionsStatus>("permissions_status");
+  } catch (e) {
+    await logError(`permissions_status failed: ${String(e)}`);
+    return { applicable: false, granted: false };
+  }
+}
+
+/** Open the OS's permission-grant screen (macOS: System Settings → Privacy &
+ *  Security → Full Disk Access). No-op on platforms where it's not applicable. */
+export async function openPermissionsSettings(): Promise<void> {
+  try {
+    await invoke("open_permissions_settings");
+  } catch (e) {
+    await logError(`open_permissions_settings failed: ${String(e)}`);
+  }
 }
 
 /**

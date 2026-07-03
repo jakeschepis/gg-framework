@@ -24,10 +24,12 @@ import { kimiCodingHeaders, isKimiCodingEndpoint } from "./oauth/kimi.js";
 import {
   SessionManager,
   KEN_TURN_CUSTOM_KIND,
+  AUTOPILOT_MARKER_CUSTOM_KIND,
   type MessageEntry,
   type BranchInfo,
   type CustomEntry,
   type KenTurnPayload,
+  type AutopilotMarkerPayload,
 } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
@@ -146,6 +148,16 @@ export interface AgentSessionOptions {
    * MCP entirely (its dynamic tool names could never match a fixed allow-list).
    */
   allowedMcpServers?: string[];
+  /**
+   * Force 1-h prompt-cache TTL + pre-warm regardless of the user's global
+   * `speedProfile` setting. Bursty read-only advisory sessions (the Ken
+   * mentor + autopilot reviewer) call the same static system prompt on a
+   * schedule that routinely exceeds the default 5-min cache window — a
+   * dropped cache there resends the whole cached prefix at full price right
+   * when it matters most, independent of whatever the user picked for the
+   * main build session. Default (undefined) = follow `speedProfile`.
+   */
+  forceLongCacheRetention?: boolean;
 }
 
 // ── State ──────────────────────────────────────────────────
@@ -182,6 +194,12 @@ export class AgentSession {
   // transcript. Each carries the non-system message count at record time so the
   // webview can interleave them chronologically.
   private kenTurns: KenTurnPayload[] = [];
+  // Autopilot Ken (auto-reviewer) markers recorded against this build session:
+  // the review verdict shown in the transcript (prompted / done / human /
+  // capped). Same not-on-the-DAG treatment as kenTurns — advisory only,
+  // persisted + reloaded so a resumed session shows the identical Ken bubble
+  // the live run showed instead of dropping it or replaying a raw verdict.
+  private autopilotMarkers: AutopilotMarkerPayload[] = [];
   private tools: AgentTool[] = [];
   /** Rebuilds the read tool for a new model (video byte cap is baked in at
    *  creation). Called from switchModel so video-capable models get the
@@ -1073,6 +1091,7 @@ export class AgentSession {
     this.lastPersistedIndex = this.messages.length;
     // Carry Ken's advisory turns into the new file so they survive compaction.
     await this.rePersistKenTurns();
+    await this.rePersistAutopilotMarkers();
 
     this.eventBus.emit("compaction_end", {
       originalCount: result.result.originalCount,
@@ -1185,6 +1204,14 @@ export class AgentSession {
     return this.userQueue.length;
   }
 
+  /** Remove and return the oldest queued message (text + attachments), or null.
+   *  Used by the sidecar to run a message that queued while autopilot was
+   *  reviewing (no run in flight to steer it into) — unlike {@link drainQueue},
+   *  attachments survive so queued media isn't silently dropped. */
+  takeNextQueuedMessage(): { text: string; attachments: SessionAttachment[] } | null {
+    return this.userQueue.shift() ?? null;
+  }
+
   /** Clear the queue, returning the combined text (to restore to the composer).
    *  Queued attachments are dropped on cancel — the composer only restores text. */
   drainQueue(): string {
@@ -1260,6 +1287,13 @@ export class AgentSession {
     return this.kenTurns;
   }
 
+  /** Autopilot verdict markers recorded against this session, in record order.
+   *  Used by the host to interleave the auto-review loop's markers back into
+   *  the transcript on resume, mirroring `getKenTurns`. */
+  getAutopilotMarkers(): AutopilotMarkerPayload[] {
+    return this.autopilotMarkers;
+  }
+
   /**
    * Record one Ken Kai (mentor agent) turn against this build session: the
    * user's question + Ken's reply. Kept in memory for the live transcript and
@@ -1296,6 +1330,57 @@ export class AgentSession {
       const entry: CustomEntry = {
         type: "custom",
         kind: KEN_TURN_CUSTOM_KIND,
+        id: crypto.randomUUID(),
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        data: payload,
+      };
+      await this.sessionManager.appendEntry(this.sessionPath, entry);
+    }
+  }
+
+  /**
+   * Record one autopilot verdict marker (prompted / done / human / capped)
+   * against this build session. Kept in memory for the live transcript and
+   * persisted as a `custom` entry (parentId null, same as Ken turns) so a
+   * resumed session renders the exact same Ken bubble the live run showed
+   * instead of dropping the marker or falling back to a raw verdict string.
+   * No-op persistence for transient sessions (kept in memory only).
+   */
+  async persistAutopilotMarker(
+    phase: AutopilotMarkerPayload["phase"],
+    extra?: { reason?: string; body?: string },
+  ): Promise<void> {
+    const afterMessageCount = this.messages.filter((m) => m.role !== "system").length;
+    const payload: AutopilotMarkerPayload = {
+      version: 1,
+      phase,
+      afterMessageCount,
+      ...(extra?.reason !== undefined ? { reason: extra.reason } : {}),
+      ...(extra?.body !== undefined ? { body: extra.body } : {}),
+    };
+    this.autopilotMarkers.push(payload);
+    if (!this.sessionPath) return;
+    const entry: CustomEntry = {
+      type: "custom",
+      kind: AUTOPILOT_MARKER_CUSTOM_KIND,
+      id: crypto.randomUUID(),
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      data: payload,
+    };
+    await this.sessionManager.appendEntry(this.sessionPath, entry);
+  }
+
+  /** Re-append the in-memory autopilot markers to the current session file.
+   *  Mirrors `rePersistKenTurns` — called after a continuation/compaction file
+   *  is created so the auto-review history survives the rewrite. */
+  private async rePersistAutopilotMarkers(): Promise<void> {
+    if (!this.sessionPath) return;
+    for (const payload of this.autopilotMarkers) {
+      const entry: CustomEntry = {
+        type: "custom",
+        kind: AUTOPILOT_MARKER_CUSTOM_KIND,
         id: crypto.randomUUID(),
         parentId: null,
         timestamp: new Date().toISOString(),
@@ -1389,9 +1474,13 @@ export class AgentSession {
     this.opts = { ...this.opts, signal };
   }
 
-  /** True when speedProfile is "optimized" (1-h cache TTL + pre-warm). */
+  /** True when speedProfile is "optimized" (1-h cache TTL + pre-warm), or the
+   *  session was constructed with `forceLongCacheRetention` (Ken sessions). */
   private isSpeedOptimized(): boolean {
-    return this.settingsManager?.get("speedProfile") === "optimized";
+    return (
+      this.opts.forceLongCacheRetention === true ||
+      this.settingsManager?.get("speedProfile") === "optimized"
+    );
   }
 
   /**
@@ -1480,6 +1569,8 @@ export class AgentSession {
     // Restore Ken's advisory turns (custom entries, not on the message branch) so
     // they reappear in the transcript and survive into the continuation file.
     this.kenTurns = this.sessionManager.getKenTurns(loaded.entries);
+    // Restore autopilot verdict markers the same way (not on the message DAG).
+    this.autopilotMarkers = this.sessionManager.getAutopilotMarkers(loaded.entries);
 
     // Track the current leaf for subsequent entries
     this.currentLeafId = loaded.header.leafId;
@@ -1526,21 +1617,36 @@ export class AgentSession {
         before: String(compacted.result.originalCount),
         after: String(compacted.result.newCount),
       });
+
+      // Compaction rewrote history, so the on-disk file no longer reflects
+      // what's in memory — fork a fresh session file for the compacted state
+      // (mirrors compact()'s own persistence) so `ggcoder continue` picks up
+      // the summary instead of the full original transcript.
+      const session = await this.sessionManager.create(this.cwd, this.provider, this.model);
+      this.sessionId = session.id;
+      this.sessionPath = session.path;
+      this.currentLeafId = null;
+
+      // Re-persist (compacted) messages — skip system, it's rebuilt on load
+      for (const msg of this.messages) {
+        if (msg.role === "system") continue;
+        await this.persistMessage(msg);
+      }
+      this.lastPersistedIndex = this.messages.length;
+      // Carry Ken's restored turns into the continuation file.
+      await this.rePersistKenTurns();
+      await this.rePersistAutopilotMarkers();
+      return;
     }
 
-    // Create new session file for continuation
-    const session = await this.sessionManager.create(this.cwd, this.provider, this.model);
-    this.sessionId = session.id;
-    this.sessionPath = session.path;
-
-    // Re-persist (compacted) messages — skip system, it's rebuilt on load
-    for (const msg of this.messages) {
-      if (msg.role === "system") continue;
-      await this.persistMessage(msg);
-    }
+    // Plain resume (no compaction needed): keep using the original session
+    // file/id and append future turns to it in place. Forking a new file here
+    // unconditionally used to create a byte-identical duplicate every time a
+    // session was merely reopened (e.g. app/window restart) with zero new
+    // messages in between — the duplicate entries seen in the session list.
+    this.sessionId = loaded.header.id;
+    this.sessionPath = sessionPath;
     this.lastPersistedIndex = this.messages.length;
-    // Carry Ken's restored turns into the continuation file.
-    await this.rePersistKenTurns();
   }
 
   private async prepareDynamicContext(_latestUserPrompt?: string): Promise<Message[]> {

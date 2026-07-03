@@ -1421,8 +1421,9 @@ dependencies = [
 
 [[package]]
 name = "gg-app"
-version = "0.12.1"
+version = "0.14.1"
 dependencies = [
+ "base64 0.22.1",
  "futures-util",
  "libc",
  "log",

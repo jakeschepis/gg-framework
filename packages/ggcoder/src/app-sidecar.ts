@@ -13,6 +13,7 @@
  */
 import http from "node:http";
 import fs from "node:fs/promises";
+import { watch as fsWatch } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
@@ -23,10 +24,23 @@ import { runJsonMode } from "./modes/json-mode.js";
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { AgentSession } from "./core/agent-session.js";
 import { buildKenSystemPrompt, buildKenAutopilotSystemPrompt } from "./core/ken-prompt.js";
-import { buildKenDigest, buildKenAutopilotContext } from "./core/ken-context.js";
+import {
+  buildKenDigest,
+  buildKenAutopilotContext,
+  buildKenAutopilotPlanContext,
+} from "./core/ken-context.js";
 import { parseAutopilotVerdict, type AutopilotVerdict } from "./core/autopilot-verdict.js";
-import { collectProjectContext } from "./system-prompt.js";
-import type { KenTurnPayload } from "./core/session-manager.js";
+import {
+  isWorkflowCommandText,
+  countAssistantMessages,
+  shouldStartAutopilotCycle,
+  extractTurnToolCalls,
+  isMechanicalOnlyTurn,
+  type WorkflowCommandSpec,
+} from "./core/autopilot-gate.js";
+import { driveAutopilotCycle } from "./core/autopilot-cycle.js";
+import { validateKenModelPref, effectiveKenModel, type KenModelPref } from "./core/ken-model.js";
+import type { KenTurnPayload, AutopilotMarkerPayload } from "./core/session-manager.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { MOONSHOT_OAUTH_KEY, XIAOMI_CREDITS_KEY } from "@kenkaiiii/gg-core";
 import { loginAnthropic } from "./core/oauth/anthropic.js";
@@ -72,6 +86,12 @@ import {
   type MCPScope,
   type MCPServerConfig,
 } from "./core/mcp/index.js";
+import { buildSnapshot, levelForXp, rankForLevel } from "./core/progress/ranks.js";
+import { loadProgress, peekProgress, updateProgress } from "./core/progress/store.js";
+import { awardPrompt, awardCommits } from "./core/progress/engine.js";
+import { detectNewCommits, repoKey } from "./core/progress/git-xp.js";
+import { rebuildFromSessions } from "./core/progress/rebuild.js";
+import type { ProgressFile, ProgressSnapshot } from "./core/progress/types.js";
 
 const ALL_PROVIDERS: Provider[] = [
   "anthropic",
@@ -109,6 +129,10 @@ interface AppSettings {
   /** Autopilot (auto-review) on/off keyed by normalized project cwd. Per-window
    *  (one window = one cwd); absent/false → off. Restored on boot. */
   autopilot?: Record<string, boolean>;
+  /** Ken's model override keyed by normalized project cwd. Absent → Ken follows
+   *  GG Coder's model (the historical behavior). Set → Ken (chat + autopilot)
+   *  uses this model regardless of GG Coder's. */
+  kenModels?: Record<string, KenModelPref>;
 }
 
 function appSettingsFile(): string {
@@ -138,6 +162,7 @@ async function loadAppSettings(): Promise<AppSettings> {
       projectModels:
         raw.projectModels && typeof raw.projectModels === "object" ? raw.projectModels : undefined,
       autopilot: raw.autopilot && typeof raw.autopilot === "object" ? raw.autopilot : undefined,
+      kenModels: raw.kenModels && typeof raw.kenModels === "object" ? raw.kenModels : undefined,
     };
   } catch {
     return { projectsRoot: defaultProjectsRoot() };
@@ -161,6 +186,24 @@ async function saveProjectModelPrefs(cwd: string, prefs: ProjectModelPrefs): Pro
   const s = await loadAppSettings();
   const key = projectModelKey(cwd);
   s.projectModels = { ...(s.projectModels ?? {}), [key]: prefs };
+  await saveAppSettings(s);
+}
+
+/** Read this project's persisted Ken model override, if any. */
+async function loadKenModelPref(cwd: string): Promise<KenModelPref | undefined> {
+  const s = await loadAppSettings();
+  return s.kenModels?.[projectModelKey(cwd)];
+}
+
+/** Persist (or with null, clear) this project's Ken model override via
+ *  read-modify-write so the rest of the settings file is preserved. */
+async function saveKenModelPref(cwd: string, pref: KenModelPref | null): Promise<void> {
+  const s = await loadAppSettings();
+  const key = projectModelKey(cwd);
+  const next = { ...(s.kenModels ?? {}) };
+  if (pref) next[key] = pref;
+  else delete next[key];
+  s.kenModels = next;
   await saveAppSettings(s);
 }
 
@@ -236,6 +279,15 @@ interface HistoryEntryForWire {
    *  question, an `assistant` row is Ken's reply. The webview renders these in
    *  Ken's color (user bubble tinted; assistant as a Ken bubble). */
   ken?: boolean;
+  /** Present when this entry is a persisted autopilot verdict marker (an
+   *  `assistant` row with empty `text`). The webview renders it exactly like
+   *  the live `autopilot` item — never the raw verdict keyword the model
+   *  actually replied with (e.g. `ALL_CLEAR`). */
+  autopilot?: {
+    phase: "prompted" | "done" | "human" | "capped" | "plan_approved";
+    reason?: string;
+    body?: string;
+  };
   toolImages?: Array<{ src: string; path?: string }>;
   subagentGroup?: Array<{
     agentName?: string;
@@ -624,6 +676,14 @@ async function main(): Promise<void> {
   // `?session=` query for the SSE /events stream).
   const sessions = new Map<string, SessionContext>();
 
+  // XP/rank progress — loaded once per daemon; awards fan out to every window.
+  // Each frame is tagged `origin: true` only for the session that earned the
+  // XP, so that window alone plays sounds/chips while the rest just re-render.
+  const progress = await createProgressManager(paths.agentDir, (snapshot, originId) => {
+    for (const ctx of sessions.values())
+      ctx.broadcast("progress", { ...snapshot, origin: ctx.id === originId });
+  });
+
   /** Resolve the target session id: the `x-gg-session` header, else a
    *  `?session=` query param (used by the SSE /events connection). */
   function sessionIdFromReq(req: http.IncomingMessage, url: string): string | null {
@@ -669,7 +729,10 @@ async function main(): Promise<void> {
           typeof body.sessionPath === "string" && body.sessionPath ? body.sessionPath : undefined;
         const id = randomUUID();
         try {
-          const ctx = await createSession({ auth, paths }, { id, cwd: sessionCwd, sessionPath });
+          const ctx = await createSession(
+            { auth, paths, progress },
+            { id, cwd: sessionCwd, sessionPath },
+          );
           sessions.set(id, ctx);
           log("INFO", "app-sidecar", "session created", { id, cwd: sessionCwd });
           daemonJson(res, 200, { sessionId: id });
@@ -692,6 +755,13 @@ async function main(): Promise<void> {
         log("INFO", "app-sidecar", "session disposed", { id });
       }
       daemonJson(res, 200, { ok: true });
+      return;
+    }
+
+    // Progress is daemon-level so the Home screen can paint before a project
+    // session exists; per-session callers still work through the same endpoint.
+    if (method === "GET" && url === "/progress") {
+      daemonJson(res, 200, progress.snapshot());
       return;
     }
 
@@ -757,24 +827,132 @@ function lastAssistantText(messages: ReturnType<AgentSession["getMessages"]>): s
 }
 
 /**
- * Assemble Ken's context digest for one `@Ken` question: project docs (up the
- * tree) + git/env + the build session's compaction summary + recent activity.
- * Prepended to the user's question as Ken's prompt body each turn.
+ * Assemble Ken's context digest for one `@Ken` question: git/env + the build
+ * session's compaction summary + recent activity. Prepended to the user's
+ * question as Ken's prompt body each turn. Project docs (CLAUDE.md/AGENTS.md)
+ * are NOT here — they're folded into Ken's cached system prompt once per
+ * session instead (see ken-prompt.ts), so they hit the provider prompt cache
+ * instead of being re-sent uncached on every question. Workflow commands +
+ * autopilot-injected prompts are passed through so the digest labels them as
+ * what they are instead of user-authored asks.
  */
-async function buildKenContext(
+function buildKenContext(
   buildSession: AgentSession,
   cwd: string,
   gitBranch: string | null,
   question: string,
-): Promise<string> {
-  const projectContext = await collectProjectContext(cwd).catch(() => [] as string[]);
+  workflowCommands: readonly WorkflowCommandSpec[],
+  injectedPrompts: readonly string[],
+): string {
   return buildKenDigest({
     question,
-    projectContext,
     cwd,
     gitBranch,
     messages: buildSession.getMessages(),
+    workflowCommands,
+    injectedPrompts,
   });
+}
+
+// ── Progress ("Ranks") ──────────────────────────────────────────────────
+// Daemon-level XP/rank manager: one durable file (~/.gg/progress.json), awards
+// applied under a file lock, snapshots broadcast to EVERY session's SSE clients,
+// and an fs.watch on ~/.gg so writes from OTHER daemon processes (dev + packaged
+// app side by side) re-broadcast here too — deduped by the lastEvent nonce.
+// XP failures are debug-log-only; progress must never break a run.
+
+interface ProgressManager {
+  /** Current snapshot for GET /progress + the SSE ready path. */
+  snapshot: () => ProgressSnapshot;
+  /** Award XP for one successfully completed run (prompt + any new commits). */
+  awardRun: (cwd: string, runStartedAt: number, originId?: string) => Promise<void>;
+}
+
+async function createProgressManager(
+  agentDir: string,
+  broadcastAll: (snapshot: ProgressSnapshot, originId?: string) => void,
+): Promise<ProgressManager> {
+  // Boot: recovery chain main → backup → one-time session-history rebuild → empty.
+  let file: ProgressFile = await loadProgress({ rebuild: () => rebuildFromSessions() });
+  // Don't re-celebrate an old levelUp event on boot.
+  let lastSeenNonce: string | null = file.lastEvent?.nonce ?? null;
+  log("INFO", "app-sidecar", "progress loaded", {
+    xp: String(file.xp),
+    level: String(levelForXp(file.xp)),
+  });
+
+  function snapshot(): ProgressSnapshot {
+    return buildSnapshot(file);
+  }
+
+  async function awardRun(cwd: string, runStartedAt: number, originId?: string): Promise<void> {
+    try {
+      const now = Date.now();
+      const updated = await updateProgress(async (f) => {
+        const levelBefore = levelForXp(f.xp);
+        awardPrompt(f, now, cwd);
+
+        // Commit XP: probe repo root + HEAD, then score lastHead..HEAD bounded
+        // by the run window. First sight of a repo records HEAD, scores nothing.
+        const probe = await detectNewCommits(cwd, undefined, runStartedAt);
+        if (probe) {
+          const key = repoKey(probe.repoRoot);
+          const lastHead = f.repos[key]?.lastHead;
+          if (lastHead && lastHead !== probe.head) {
+            const detected = await detectNewCommits(cwd, lastHead, runStartedAt);
+            if (detected && detected.commits.length > 0) {
+              awardCommits(f, detected.commits, now, cwd);
+            }
+          }
+          f.repos[key] = { lastHead: probe.head };
+        }
+
+        // One combined lastEvent per run so other windows celebrate exactly once.
+        const levelAfter = levelForXp(f.xp);
+        const levelUp =
+          levelAfter > levelBefore
+            ? { from: levelBefore, to: levelAfter, rankName: rankForLevel(levelAfter).name }
+            : null;
+        f.lastEvent = { nonce: randomUUID(), levelUp };
+        return { file: f, levelledUp: levelUp !== null };
+      });
+      file = updated;
+      lastSeenNonce = updated.lastEvent?.nonce ?? null;
+      broadcastAll(buildSnapshot(updated), originId);
+    } catch (err) {
+      log("DEBUG", "app-sidecar", "progress award failed", {
+        message: err instanceof Error ? err.message : String(err),
+      });
+    }
+  }
+
+  // Watch ~/.gg (dir watch survives the atomic tmp+rename) for progress.json
+  // writes from other daemon processes; debounce, reload read-only, dedupe by nonce.
+  let watchDebounce: NodeJS.Timeout | null = null;
+  try {
+    const watcher = fsWatch(agentDir, (_event, filename) => {
+      if (filename !== "progress.json") return;
+      if (watchDebounce) clearTimeout(watchDebounce);
+      watchDebounce = setTimeout(() => {
+        void (async () => {
+          const reloaded = await peekProgress();
+          if (!reloaded) return;
+          const nonce = reloaded.lastEvent?.nonce ?? null;
+          if (nonce === lastSeenNonce) return;
+          file = reloaded;
+          lastSeenNonce = nonce;
+          broadcastAll(buildSnapshot(reloaded));
+        })();
+      }, 150);
+    });
+    watcher.unref();
+  } catch (err) {
+    log("DEBUG", "app-sidecar", "progress watch unavailable", {
+      message: err instanceof Error ? err.message : String(err),
+    });
+  }
+
+  return { snapshot, awardRun };
 }
 
 interface SessionContext {
@@ -802,10 +980,14 @@ interface SessionContext {
  * logger, PATH, shared auth file, and radio live at the daemon level.
  */
 async function createSession(
-  deps: { auth: AuthStorage; paths: Awaited<ReturnType<typeof ensureAppDirs>> },
+  deps: {
+    auth: AuthStorage;
+    paths: Awaited<ReturnType<typeof ensureAppDirs>>;
+    progress: ProgressManager;
+  },
   opts: { id: string; cwd: string; sessionPath?: string },
 ): Promise<SessionContext> {
-  const { auth } = deps;
+  const { auth, progress } = deps;
   const paths = deps.paths;
   const cwd = opts.cwd;
   // Base host for parsing request-URL query params (value is irrelevant to
@@ -916,6 +1098,12 @@ async function createSession(
       } catch {
         content = "";
       }
+      // Record the submitted plan so the autopilot gate can route this turn
+      // into a PLAN review instead of a stale work review (plan mode is
+      // already false here, so the gate's planMode check alone never catches
+      // a submission). setPendingPlan bumps planGeneration, which invalidates
+      // any in-flight Ken plan review racing a user action.
+      setPendingPlan(planPath, content);
       broadcast("plan_exit", { planPath, content });
       return "Plan submitted for user review. Wait for the user to approve, reject, or dismiss it before implementing.";
     },
@@ -991,6 +1179,9 @@ async function createSession(
 
   let running = false;
   let titleGenerated = false;
+  // Bumped by /cancel — a run whose cancel generation changed mid-flight was
+  // canceled and earns no XP.
+  let cancelGeneration = 0;
   // Autopilot (auto-review) toggle for THIS window's project. Loaded from
   // gg-app.json on boot; flipped via POST /autopilot. When on, POST /prompt runs
   // runAutopilotCycle after the user's turn settles — Ken auto-reviews the work
@@ -1009,6 +1200,47 @@ async function createSession(
   let autopilotCancelled = false;
   // Hard cap on review→prompt→review rounds per user turn (loop safety).
   const MAX_AUTOPILOT_ROUNDS = 3;
+  // Prompt bodies Autopilot Ken injected into the BUILD session this
+  // conversation. Passed into every Ken digest so injected prompts render as
+  // "Ken autopilot (injected)" instead of `**User:**` — otherwise multi-round
+  // cycles drift into Ken reviewing against his own last prompt. Cleared
+  // whenever the conversation resets (new session / plan accept / task run).
+  let injectedAutopilotPrompts: string[] = [];
+  // The plan GG Coder submitted via exit_plan that still awaits a decision
+  // (Ken's auto-review in autopilot, or the user's modal). Path + the content
+  // read at submission time (fallback if the file becomes unreadable).
+  let pendingPlanPath: string | null = null;
+  let pendingPlanContent = "";
+  // Bumped on EVERY pending-plan set/clear. Ken's plan review captures it
+  // before reviewing and re-checks it before acting on the verdict, so a user
+  // Accept/Reject racing an in-flight review always wins — the stale verdict
+  // is discarded silently.
+  let planGeneration = 0;
+
+  function setPendingPlan(planPath: string, content: string): void {
+    pendingPlanPath = planPath;
+    pendingPlanContent = content;
+    planGeneration++;
+  }
+
+  function clearPendingPlan(): void {
+    if (pendingPlanPath === null) return;
+    pendingPlanPath = null;
+    pendingPlanContent = "";
+    planGeneration++;
+  }
+
+  // Workflow (prompt-template) commands: built-in + the project's custom
+  // `.gg/commands/*.md`. Used to gate autopilot off command turns and to label
+  // expanded templates in Ken's digests. Loaded fresh so a newly added custom
+  // command is picked up without a restart (mirrors GET /commands).
+  async function loadWorkflowCommandSpecs(): Promise<WorkflowCommandSpec[]> {
+    const custom = await loadCustomCommands(cwd).catch(() => []);
+    return [
+      ...PROMPT_COMMANDS.map((c) => ({ name: c.name, aliases: c.aliases, prompt: c.prompt })),
+      ...custom.map((c) => ({ name: c.name, aliases: [] as string[], prompt: c.prompt })),
+    ];
+  }
 
   // ── Telegram serve (remote control via Telegram) ───────────
   // A single embedded serve session lives in this sidecar process. Only the main
@@ -1027,6 +1259,37 @@ async function createSession(
   let pendingKenModel: { provider: Provider; model: string } | null = null;
   const kenToolCallNames = new Map<string, string>();
 
+  // Ken's per-project model override. null → Ken (chat + autopilot) follows GG
+  // Coder's model, including live switches (the historical behavior). Set → Ken
+  // is pinned to his own model and GG Coder switches no longer touch him. A
+  // stale persisted pin (model dropped from the registry / provider logged
+  // out) validates to null so Ken degrades to following instead of erroring.
+  let kenModelOverride: KenModelPref | null = validateKenModelPref(await loadKenModelPref(cwd), {
+    modelExists: (id) => getModel(id) !== undefined,
+    providerConnected: () => true, // async auth checked below
+  });
+  if (kenModelOverride && !(await auth.hasProviderAuth(kenModelOverride.provider))) {
+    log("WARN", "app-sidecar", "ken model override provider not connected — following GG", {
+      provider: kenModelOverride.provider,
+      model: kenModelOverride.model,
+    });
+    kenModelOverride = null;
+  }
+
+  /** The model Ken uses next turn: the pin when set, else GG Coder's. */
+  function kenCurrentModel(): { provider: Provider; model: string } {
+    if (kenModelOverride) return kenModelOverride;
+    const st = session.getState();
+    return { provider: st.provider, model: st.model };
+  }
+
+  /** Footer payload: Ken's effective model + whether it's a pin. Merged into
+   *  /state, the SSE ready frame, and every ken_model_change broadcast. */
+  function kenStatePayload(): ReturnType<typeof effectiveKenModel> {
+    const st = session.getState();
+    return effectiveKenModel(kenModelOverride, { provider: st.provider, model: st.model });
+  }
+
   async function syncKenModel(provider: Provider, model: string): Promise<void> {
     if (kenRunning) {
       pendingKenModel = { provider, model };
@@ -1041,16 +1304,19 @@ async function createSession(
 
   async function ensureKenSession(): Promise<AgentSession> {
     if (kenSession) return kenSession;
-    const st = session.getState();
+    const target = kenCurrentModel();
     const ken = new AgentSession({
-      provider: st.provider,
-      model: st.model,
+      provider: target.provider,
+      model: target.model,
       cwd,
-      systemPrompt: buildKenSystemPrompt(),
+      systemPrompt: await buildKenSystemPrompt(cwd),
       allowedTools: KEN_ALLOWED_TOOLS,
       allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
       transient: true,
       signal: kenAbort.signal,
+      // Ken's bursty, spread-out turns (chat) outlast the default 5-min cache
+      // TTL regardless of the user's global speedProfile pick.
+      forceLongCacheRetention: true,
     });
     await ken.initialize();
     // Bridge Ken's bus to the shared SSE fan-out with ken_-prefixed types so the
@@ -1075,7 +1341,10 @@ async function createSession(
       broadcastError("ken_error", "ken error", d.error);
     });
     kenSession = ken;
-    log("INFO", "app-sidecar", "ken session ready", { provider: st.provider, model: st.model });
+    log("INFO", "app-sidecar", "ken session ready", {
+      provider: target.provider,
+      model: target.model,
+    });
     return ken;
   }
 
@@ -1104,24 +1373,27 @@ async function createSession(
 
   async function ensureKenAutoSession(): Promise<AgentSession> {
     if (kenAutoSession) return kenAutoSession;
-    const st = session.getState();
+    const target = kenCurrentModel();
     const ken = new AgentSession({
-      provider: st.provider,
-      model: st.model,
+      provider: target.provider,
+      model: target.model,
       cwd,
-      systemPrompt: buildKenAutopilotSystemPrompt(),
+      systemPrompt: await buildKenAutopilotSystemPrompt(cwd),
       allowedTools: KEN_ALLOWED_TOOLS,
       allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
       transient: true,
       signal: kenAutoAbort.signal,
+      // Autopilot review rounds routinely span the injected GG Coder run
+      // (often >5 min) regardless of the user's global speedProfile pick.
+      forceLongCacheRetention: true,
     });
     await ken.initialize();
     // Deliberately no bus bridge: the review is silent. Errors surface via the
     // runAutopilotReview try/catch as autopilot_error frames.
     kenAutoSession = ken;
     log("INFO", "app-sidecar", "ken autopilot session ready", {
-      provider: st.provider,
-      model: st.model,
+      provider: target.provider,
+      model: target.model,
     });
     return ken;
   }
@@ -1146,13 +1418,28 @@ async function createSession(
   // run_start frame.
   async function runAgent(label: string, run: () => Promise<void>): Promise<void> {
     running = true;
+    // Progress (Ranks): completed, non-canceled runs with ≥1 assistant turn earn
+    // XP — prompt + any commits authored during the run window.
+    const runStartedAt = Date.now();
+    const cancelGenAtStart = cancelGeneration;
+    const assistantsBeforeRun = countAssistantMessages(session.getMessages());
+    let runSucceeded = false;
     broadcast("run_start", { text: label });
     try {
       await run();
+      runSucceeded = true;
     } catch (err) {
       broadcastError("error", "run failed", err);
     } finally {
       running = false;
+      if (
+        runSucceeded &&
+        cancelGeneration === cancelGenAtStart &&
+        countAssistantMessages(session.getMessages()) > assistantsBeforeRun
+      ) {
+        // Fire-and-forget — XP must never delay or break run teardown.
+        void progress.awardRun(cwd, runStartedAt, opts.id);
+      }
       // A run may have switched branches (git checkout) or spawned/finished
       // background tasks — refresh the footer extras once it settles.
       gitBranch = await getGitBranch(cwd).catch(() => gitBranch);
@@ -1185,17 +1472,20 @@ async function createSession(
   // One review = prompt the kenAuto session with the review digest, read its
   // final assistant text, parse a verdict. Returns null on failure (surfaced as
   // an autopilot_error frame) so the cycle stops rather than looping blind.
-  async function runAutopilotReview(): Promise<AutopilotVerdict | null> {
+  // `originalRequest` is the user prompt that started the turn under review —
+  // pinned in the digest so it can't scroll out during multi-round cycles.
+  async function runAutopilotReview(originalRequest: string): Promise<AutopilotVerdict | null> {
     autopilotReviewing = true;
     broadcast("autopilot_review_start", {});
     try {
       const ken = await ensureKenAutoSession();
-      const projectContext = await collectProjectContext(cwd).catch(() => [] as string[]);
       const digest = buildKenAutopilotContext({
-        projectContext,
         cwd,
         gitBranch,
         messages: session.getMessages(),
+        originalRequest,
+        injectedPrompts: [...injectedAutopilotPrompts],
+        workflowCommands: await loadWorkflowCommandSpecs(),
       });
       await ken.prompt(digest);
       return parseAutopilotVerdict(lastAssistantText(ken.getMessages()));
@@ -1211,46 +1501,219 @@ async function createSession(
     }
   }
 
+  // One PLAN review: like runAutopilotReview but the digest carries the
+  // submitted plan's markdown (`## Plan under review`) and the plan-review
+  // instruction — Ken judges the plan itself, not finished work. Returns null
+  // on failure; a failure caused by the user's own action racing the review
+  // (cancel or a manual Accept/Reject that bumped planGeneration) stays
+  // SILENT — no autopilot_error — because the user's decision already won.
+  async function runAutopilotPlanReview(originalRequest: string): Promise<AutopilotVerdict | null> {
+    const planPath = pendingPlanPath;
+    if (planPath === null) return null;
+    const genAtStart = planGeneration;
+    autopilotReviewing = true;
+    broadcast("autopilot_review_start", {});
+    try {
+      const ken = await ensureKenAutoSession();
+      // Re-read the plan file (the run may have revised it in place); fall
+      // back to the content captured at exit_plan time.
+      const planContent = await fs.readFile(planPath, "utf-8").catch(() => pendingPlanContent);
+      const digest = buildKenAutopilotPlanContext({
+        cwd,
+        gitBranch,
+        messages: session.getMessages(),
+        originalRequest,
+        injectedPrompts: [...injectedAutopilotPrompts],
+        workflowCommands: await loadWorkflowCommandSpecs(),
+        planContent,
+      });
+      await ken.prompt(digest);
+      if (autopilotCancelled || planGeneration !== genAtStart) return null;
+      return parseAutopilotVerdict(lastAssistantText(ken.getMessages()));
+    } catch (err) {
+      // User action mid-review (manual Accept aborts the kenAuto run): drop
+      // the review silently — the user's decision supersedes Ken's.
+      if (autopilotCancelled || planGeneration !== genAtStart) return null;
+      broadcastError("autopilot_error", "autopilot plan review failed", err);
+      return null;
+    } finally {
+      autopilotReviewing = false;
+      // Apply any model switch that landed mid-review.
+      const pending = pendingKenAutoModel;
+      pendingKenAutoModel = null;
+      if (pending) await syncKenAutoModel(pending.provider, pending.model);
+    }
+  }
+
+  // The prompt fed to the fresh session after a plan is accepted — the SAME
+  // string the webview sends on a manual Accept (see PlanReviewModal's accept
+  // handler in gg-app/src/App.tsx). Keep the two in lockstep so auto- and
+  // manual approval produce identical implementation turns.
+  const IMPLEMENT_PLAN_PROMPT =
+    "The plan has been approved. Implement it now, following each step in order.";
+
   // Drive the review→prompt→review loop for one finished user turn. Only ever
-  // called from POST /prompt after the user's own run resolves — never from the
-  // task runner, resume, /ken, or error paths, so there's no recursion and no
-  // guard tangle. Bounded by MAX_AUTOPILOT_ROUNDS and cancellable between steps.
-  async function runAutopilotCycle(): Promise<void> {
+  // called after shouldStartAutopilotCycle approves the turn (POST /prompt or
+  // the stranded-queue drain) — never from the task runner, resume, /ken, or
+  // error paths, so there's no recursion and no guard tangle. The loop's
+  // control flow lives in driveAutopilotCycle (core/autopilot-cycle.ts) so
+  // every exit path is unit-tested; this only wires the real dependencies.
+  async function runAutopilotCycle(originalRequest: string): Promise<void> {
     if (!autopilot || autopilotCancelled) return;
     autopilotActive = true;
+    // Generation captured by the last plan review; acceptPlan re-checks it so
+    // a user Accept/Reject landing mid-review always wins.
+    let planGenAtReview = -1;
     try {
-      // Lean context per user turn: wipe prior review history so each new turn
-      // starts cheap, while within this cycle the few review messages persist so
-      // Ken remembers what he already asked GG Coder to fix.
-      await kenAutoSession?.newSession().catch(() => {});
-      for (let round = 1; round <= MAX_AUTOPILOT_ROUNDS; round++) {
-        if (autopilotCancelled) return;
-        const verdict = await runAutopilotReview();
-        if (!verdict || autopilotCancelled) return;
-        if (verdict.kind === "all_clear") {
-          broadcast("autopilot_done", {});
-          return;
-        }
-        if (verdict.kind === "ignore") {
-          // Nothing worth reviewing (small talk, a mechanical git op, etc.) —
-          // stop the cycle silently, no marker at all.
-          broadcast("autopilot_ignored", {});
-          return;
-        }
-        if (verdict.kind === "human") {
-          broadcast("autopilot_human", { reason: verdict.reason });
-          return;
-        }
-        // prompt → show a compact Ken-tinted marker (not the prompt body), then
-        // feed GG Coder. Bracketed by runAgent so the run streams normally; the
-        // shared finally no longer re-triggers autopilot, so this can't recurse.
-        broadcast("autopilot_prompted", { round, body: verdict.body });
-        await runAgent(verdict.body, () => session.prompt(verdict.body));
-        if (autopilotCancelled) return;
-      }
-      broadcast("autopilot_capped", { rounds: MAX_AUTOPILOT_ROUNDS });
+      await driveAutopilotCycle({
+        // A plan-pending cycle needs extra rounds: approve+implement and the
+        // post-implement work review each consume one, so +2 keeps a real fix
+        // round available.
+        maxRounds: pendingPlanPath !== null ? MAX_AUTOPILOT_ROUNDS + 2 : MAX_AUTOPILOT_ROUNDS,
+        isCancelled: () => autopilotCancelled,
+        // An injected run entering plan mode WITHOUT submitting (enter_plan,
+        // no exit_plan) halts the cycle — Ken never prompts into a read-only
+        // plan-mode session. A submitted plan takes the planPending branch.
+        isPlanMode: () => session.getPlanMode(),
+        planPending: () => pendingPlanPath !== null,
+        reviewPlan: async () => {
+          planGenAtReview = planGeneration;
+          return runAutopilotPlanReview(originalRequest);
+        },
+        // Auto-accept: the inlined POST /plan/accept body. Returns false when
+        // the plan generation moved since the review (user acted) — the cycle
+        // exits silently and the user's action stands.
+        acceptPlan: async () => {
+          if (pendingPlanPath === null || planGeneration !== planGenAtReview) return false;
+          const planPath = pendingPlanPath;
+          try {
+            await session.newSession();
+            injectedAutopilotPrompts = [];
+            titleGenerated = false;
+            await session.setApprovedPlan(planPath);
+          } catch (err) {
+            broadcastError("autopilot_error", "autopilot plan accept failed", err);
+            return false;
+          }
+          clearPendingPlan();
+          // Ordering is load-bearing: the webview reads its still-open plan
+          // modal state (step count) on autopilot_plan_accepted, and
+          // session_reset clears it — accepted must land first.
+          broadcast("autopilot_plan_accepted", {});
+          broadcast("session_reset", {});
+          // Persisted into the NEW session so a resume shows the marker.
+          void session.persistAutopilotMarker("plan_approved");
+          return true;
+        },
+        runImplement: () =>
+          runAgent(IMPLEMENT_PLAN_PROMPT, () => session.prompt(IMPLEMENT_PLAN_PROMPT)),
+        // Lean context per user turn: wipe prior review history so each new
+        // turn starts cheap, while within this cycle the few review messages
+        // persist so Ken remembers what he already asked GG Coder to fix.
+        resetReviewer: async () => {
+          await kenAutoSession?.newSession().catch(() => {});
+        },
+        review: () => runAutopilotReview(originalRequest),
+        // prompt → record the injected body (so later digests label it as
+        // Ken's, not the user's), show a compact Ken-tinted marker (not the
+        // prompt body), then feed GG Coder bracketed by runAgent so the run
+        // streams normally; the shared finally never re-triggers autopilot,
+        // so this can't recurse.
+        onInjected: (body, round) => {
+          // A revision injection supersedes the pending plan — if the run
+          // resubmits via exit_plan, onExitPlan re-sets it (no-op for work-
+          // branch injections, where nothing is pending).
+          clearPendingPlan();
+          injectedAutopilotPrompts.push(body);
+          broadcast("autopilot_prompted", { round, body });
+          void session.persistAutopilotMarker("prompted", { body });
+        },
+        runPrompt: (body) => runAgent(body, () => session.prompt(body)),
+        emit: (event) => {
+          broadcast(event.type, event.data);
+          // Persist the terminal verdict marker so a resumed session renders the
+          // same Ken bubble the live run showed instead of dropping it or
+          // falling back to the raw verdict text (e.g. ALL_CLEAR).
+          if (event.type === "autopilot_done") {
+            void session.persistAutopilotMarker("done");
+          } else if (event.type === "autopilot_human") {
+            void session.persistAutopilotMarker("human", { reason: event.data.reason });
+          } else if (event.type === "autopilot_capped") {
+            void session.persistAutopilotMarker("capped");
+          }
+          // autopilot_ignored renders nothing live, so nothing is persisted either.
+        },
+      });
     } finally {
       autopilotActive = false;
+    }
+  }
+
+  // ── Stranded-queue drain ───────────────────────────────
+  // A prompt POSTed while an autopilot cycle is between injected runs (build
+  // idle, Ken reviewing) queues — but the queue only drains INTO a running
+  // turn as steering. If the cycle ends without another run (ALL_CLEAR /
+  // IGNORE / HUMAN / error), that message would sit stranded until the next
+  // unrelated prompt, then land mislabeled as "concurrent steering" of an
+  // unrelated run. Drain it here as a fresh turn of its own (with its own
+  // gated review). Also covers the non-autopilot tail window: a message queued
+  // after the run's last steering drain but before run_end.
+  let drainingStrandedQueue = false;
+  async function runStrandedQueue(): Promise<void> {
+    if (drainingStrandedQueue) return;
+    drainingStrandedQueue = true;
+    try {
+      for (;;) {
+        if (running || autopilotActive) return;
+        const next = session.takeNextQueuedMessage();
+        if (!next) return;
+        broadcast("queued", { count: session.getQueuedCount() });
+        if (!next.text.trim() && next.attachments.length === 0) continue;
+        // A queued message draining as a fresh turn supersedes any pending
+        // plan, exactly like a direct POST /prompt turn.
+        clearPendingPlan();
+        const workflowCommand =
+          next.attachments.length === 0 &&
+          isWorkflowCommandText(next.text, await loadWorkflowCommandSpecs());
+        const assistantsBefore = countAssistantMessages(session.getMessages());
+        const messagesBefore = session.getMessages().length;
+        await runAgent(next.text, async () => {
+          if (next.attachments.length > 0) {
+            await session.promptWithAttachments(next.text, next.attachments);
+          } else {
+            await session.prompt(next.text);
+          }
+        });
+        const decision = shouldStartAutopilotCycle({
+          enabled: autopilot,
+          cancelled: autopilotCancelled,
+          planMode: session.getPlanMode(),
+          // A submitted plan (exit_plan fired) routes into the PLAN review
+          // branch — the cycle reviews the plan itself instead of skipping.
+          planPending: pendingPlanPath !== null,
+          workflowCommand,
+          assistantMessagesAdded: countAssistantMessages(session.getMessages()) - assistantsBefore,
+          // Skip the review API call outright for turns that only started a
+          // background process (dev server/watcher), ran a read-only lookup, or
+          // committed/pushed — Ken's autopilot contract already IGNOREs these,
+          // so there's no reason to pay for that verdict.
+          mechanicalOnly: isMechanicalOnlyTurn(
+            extractTurnToolCalls(session.getMessages(), messagesBefore),
+          ),
+        });
+        if (decision.start) {
+          log("INFO", "app-sidecar", "autopilot cycle starting (queued turn)", {
+            kind: decision.kind,
+          });
+          await runAutopilotCycle(next.text);
+        } else if (autopilot) {
+          log("INFO", "app-sidecar", "autopilot skipped (queued turn)", {
+            reason: decision.reason,
+          });
+        }
+      }
+    } finally {
+      drainingStrandedQueue = false;
     }
   }
 
@@ -1265,6 +1728,8 @@ async function createSession(
     if (!task) return false;
     // Fresh session per task so one task's context never bleeds into the next.
     await session.newSession();
+    injectedAutopilotPrompts = [];
+    clearPendingPlan();
     titleGenerated = false;
     broadcast("session_reset", {});
     markTaskInProgress(cwd, task.id);
@@ -1388,8 +1853,14 @@ async function createSession(
         supportedThinkingLevels: getSupportedThinkingLevels(st.provider, st.model),
         supportsVideo: getModel(st.model)?.supportsVideo ?? false,
         autopilot,
+        ...kenStatePayload(),
         ...footerExtras(),
       });
+      return;
+    }
+
+    if (method === "GET" && url === "/progress") {
+      json(res, 200, progress.snapshot());
       return;
     }
 
@@ -1414,6 +1885,7 @@ async function createSession(
             supportedThinkingLevels: getSupportedThinkingLevels(st.provider, st.model),
             supportsVideo: getModel(st.model)?.supportsVideo ?? false,
             autopilot,
+            ...kenStatePayload(),
             ...footerExtras(),
           },
         })}\n\n`,
@@ -1595,9 +2067,37 @@ async function createSession(
             history.push({ role: "assistant", text: turn.reply, ken: true });
           }
         };
+
+        // Autopilot verdict markers to interleave, same anchor scheme as Ken
+        // turns — each becomes a single assistant row the webview renders
+        // exactly like the live `autopilot` item (never a raw verdict string).
+        const autopilotByCount = new Map<number, AutopilotMarkerPayload[]>();
+        for (const marker of session.getAutopilotMarkers()) {
+          const list = autopilotByCount.get(marker.afterMessageCount) ?? [];
+          list.push(marker);
+          autopilotByCount.set(marker.afterMessageCount, list);
+        }
+        const flushAutopilot = (count: number): void => {
+          const markers = autopilotByCount.get(count);
+          if (!markers) return;
+          autopilotByCount.delete(count);
+          for (const marker of markers) {
+            history.push({
+              role: "assistant",
+              text: "",
+              autopilot: {
+                phase: marker.phase,
+                ...(marker.reason !== undefined ? { reason: marker.reason } : {}),
+                ...(marker.body !== undefined ? { body: marker.body } : {}),
+              },
+            });
+          }
+        };
         let nonSystemCount = 0;
-        // Turns recorded before any build message (anchor 0) render at the top.
+        // Turns/markers recorded before any build message (anchor 0) render at
+        // the top.
         flushKen(0);
+        flushAutopilot(0);
 
         for (const msg of messages) {
           if (msg.role === "system") continue;
@@ -1712,14 +2212,19 @@ async function createSession(
             }
           }
 
-          // Interleave any Ken turns recorded right after this message.
+          // Interleave any Ken turns / autopilot markers recorded right after
+          // this message.
           flushKen(nonSystemCount);
+          flushAutopilot(nonSystemCount);
         }
 
-        // Flush remaining Ken turns whose anchor is at/after the message count
-        // (e.g. asked before any build message, or anchors beyond the current
-        // count after compaction shrank the history) so none are dropped.
+        // Flush remaining Ken turns / autopilot markers whose anchor is at/after
+        // the message count (e.g. recorded before any build message, or anchors
+        // beyond the current count after compaction shrank the history) so none
+        // are dropped.
         for (const count of [...kenByCount.keys()].sort((a, b) => a - b)) flushKen(count);
+        for (const count of [...autopilotByCount.keys()].sort((a, b) => a - b))
+          flushAutopilot(count);
 
         json(res, 200, { history });
       })();
@@ -1784,6 +2289,19 @@ async function createSession(
         // Fresh user turn: clear any cancel flag left from a prior cycle so this
         // turn's autopilot review can run.
         autopilotCancelled = false;
+        // A typed message while a plan modal/review is pending (reject,
+        // feedback, anything) supersedes the pending plan — the bump also
+        // invalidates any in-flight Ken plan review.
+        clearPendingPlan();
+        // Gate inputs captured around the run: whether this turn is a workflow
+        // slash command (attachment prompts skip slash expansion entirely), and
+        // how many assistant messages the run actually adds. Computed even when
+        // autopilot is currently off — the toggle can flip ON mid-run, and the
+        // gate reads the post-run value.
+        const workflowCommand =
+          attachments.length === 0 && isWorkflowCommandText(text, await loadWorkflowCommandSpecs());
+        const assistantsBefore = countAssistantMessages(session.getMessages());
+        const messagesBefore = session.getMessages().length;
         await runAgent(text, async () => {
           if (attachments.length > 0) {
             // Persist each attachment under .gg/uploads so files are inspectable
@@ -1798,10 +2316,41 @@ async function createSession(
             await session.prompt(text);
           }
         });
-        // After the user's run settles, kick off Ken's auto-review loop. This is
-        // the ONLY entry point into the cycle — it drives any follow-up GG Coder
-        // runs itself, so the shared runAgent finally never recurses.
-        if (autopilot && !autopilotCancelled) await runAutopilotCycle();
+        // After the user's run settles, kick off Ken's auto-review loop — but
+        // only when the turn is actually reviewable (shouldStartAutopilotCycle):
+        // workflow commands (/compare, /bullet-proof, …) end with reports or
+        // A/B/C choices reserved for the USER; registry commands (/help) and
+        // failed runs add no assistant work to judge; a turn that ended in plan
+        // mode has a pending Accept/Reject modal Ken must not preempt. This is
+        // the ONLY entry point into the cycle besides the stranded-queue drain —
+        // it drives any follow-up GG Coder runs itself, so the shared runAgent
+        // finally never recurses.
+        const decision = shouldStartAutopilotCycle({
+          enabled: autopilot,
+          cancelled: autopilotCancelled,
+          planMode: session.getPlanMode(),
+          // A submitted plan (exit_plan fired) routes into the PLAN review
+          // branch — the cycle reviews the plan itself instead of skipping.
+          planPending: pendingPlanPath !== null,
+          workflowCommand,
+          assistantMessagesAdded: countAssistantMessages(session.getMessages()) - assistantsBefore,
+          // Skip the review API call outright for turns that only started a
+          // background process (dev server/watcher), ran a read-only lookup, or
+          // committed/pushed — Ken's autopilot contract already IGNOREs these,
+          // so there's no reason to pay for that verdict.
+          mechanicalOnly: isMechanicalOnlyTurn(
+            extractTurnToolCalls(session.getMessages(), messagesBefore),
+          ),
+        });
+        if (decision.start) {
+          log("INFO", "app-sidecar", "autopilot cycle starting", { kind: decision.kind });
+          await runAutopilotCycle(text);
+        } else if (autopilot) {
+          log("INFO", "app-sidecar", "autopilot skipped", { reason: decision.reason });
+        }
+        // A prompt sent while Ken was reviewing (build idle) queued but had no
+        // run to steer into — run it now as a fresh turn so it never strands.
+        await runStrandedQueue();
       });
       return;
     }
@@ -1832,7 +2381,14 @@ async function createSession(
         broadcast("ken_run_start", { text });
         try {
           const ken = await ensureKenSession();
-          const digest = await buildKenContext(session, cwd, gitBranch, text);
+          const digest = await buildKenContext(
+            session,
+            cwd,
+            gitBranch,
+            text,
+            await loadWorkflowCommandSpecs(),
+            injectedAutopilotPrompts,
+          );
           await ken.prompt(digest);
           // Record the turn against the BUILD session so it persists + survives
           // resume (advisory custom entry, never an LLM message). Reply is Ken's
@@ -2028,8 +2584,12 @@ async function createSession(
           return;
         }
         await session.switchModel(target.provider, target.id);
-        await syncKenModel(target.provider, target.id);
-        await syncKenAutoModel(target.provider, target.id);
+        // Ken follows GG Coder's model only while un-pinned; a user-set Ken
+        // override survives GG model switches untouched.
+        if (!kenModelOverride) {
+          await syncKenModel(target.provider, target.id);
+          await syncKenAutoModel(target.provider, target.id);
+        }
         // Clamp the reasoning level to what the new model supports (mirrors the
         // CLI): keep thinking on at the first supported tier if it was on but
         // the prior level is unsupported here; leave it off if it was off.
@@ -2056,10 +2616,62 @@ async function createSession(
         // model_change is emitted by switchModel; follow with thinking_change so
         // the footer toggle reflects the new model's supported levels.
         broadcast("thinking_change", payload);
+        // Un-pinned Ken just followed the switch — update his footer chip too.
+        // When Ken is pinned, his effective model did not change, so skip the
+        // no-op event (keeps footer/event tests from treating a GG switch as a
+        // Ken switch).
+        if (!kenModelOverride) broadcast("ken_model_change", kenStatePayload());
         // The new model usually has a different context window — push extras so
         // the footer's context meter rescales immediately.
         broadcast("extras", footerExtras());
         json(res, 200, { provider: target.provider, model: target.id, ...payload });
+      });
+      return;
+    }
+
+    // Set or clear Ken's model pin. Body: { model: "<id>" } to pin, or
+    // { model: null } / "" to clear (Ken resumes following GG Coder). Applies
+    // to BOTH Ken sessions (chat + autopilot reviewer); a switch landing while
+    // either is mid-run defers via the pending-model mechanics.
+    if (method === "POST" && url === "/ken/model") {
+      void readBody(req).then(async (raw) => {
+        let modelId: string | null;
+        try {
+          const parsed = (JSON.parse(raw) as { model?: string | null }).model;
+          modelId = typeof parsed === "string" && parsed.trim() ? parsed.trim() : null;
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (modelId === null) {
+          // Clear the pin → follow GG Coder again, syncing both sessions back.
+          kenModelOverride = null;
+          await saveKenModelPref(cwd, null);
+          const st = session.getState();
+          await syncKenModel(st.provider, st.model);
+          await syncKenAutoModel(st.provider, st.model);
+          log("INFO", "app-sidecar", "ken model pin cleared — following GG", {
+            provider: st.provider,
+            model: st.model,
+          });
+        } else {
+          const target = getModel(modelId);
+          if (!target) {
+            json(res, 404, { error: `unknown model: ${modelId}` });
+            return;
+          }
+          kenModelOverride = { provider: target.provider, model: target.id };
+          await saveKenModelPref(cwd, kenModelOverride);
+          await syncKenModel(target.provider, target.id);
+          await syncKenAutoModel(target.provider, target.id);
+          log("INFO", "app-sidecar", "ken model pinned", {
+            provider: target.provider,
+            model: target.id,
+          });
+        }
+        const payload = kenStatePayload();
+        broadcast("ken_model_change", payload);
+        json(res, 200, payload);
       });
       return;
     }
@@ -2107,6 +2719,7 @@ async function createSession(
     }
 
     if (method === "POST" && url === "/cancel") {
+      cancelGeneration++;
       abort.abort();
       abort = new AbortController();
       session.setSignal(abort.signal);
@@ -2137,6 +2750,8 @@ async function createSession(
       void session
         .newSession()
         .then(() => {
+          injectedAutopilotPrompts = [];
+          clearPendingPlan();
           broadcast("session_reset", {});
           json(res, 200, { ok: true });
         })
@@ -2168,8 +2783,27 @@ async function createSession(
           json(res, 409, { error: "cannot accept a plan while the agent is running" });
           return;
         }
+        // Manual accept, possibly racing Ken's autopilot plan review: the user
+        // always wins. Bump the plan generation (invalidates any in-flight
+        // review's verdict), stop the cycle, abort a mid-prompt review on the
+        // kenAuto session, and clear the spinner — autopilot_ignored renders
+        // nothing, so no stale "approve or reject" bubble ever lands. The
+        // webview's follow-up "implement" /prompt arrives as a fresh turn
+        // (resetting autopilotCancelled), so the implementation still gets its
+        // normal post-run review; if it lands while the cycle is winding down
+        // it queues and runStrandedQueue drains it as a fresh turn.
+        clearPendingPlan();
+        autopilotCancelled = true;
+        kenAutoAbort.abort();
+        kenAutoAbort = new AbortController();
+        kenAutoSession?.setSignal(kenAutoAbort.signal);
+        if (autopilotReviewing) {
+          autopilotReviewing = false;
+          broadcast("autopilot_ignored", {});
+        }
         try {
           await session.newSession();
+          injectedAutopilotPrompts = [];
           titleGenerated = false;
           await session.setApprovedPlan(planPath);
           broadcast("session_reset", {});

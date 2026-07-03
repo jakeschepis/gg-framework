@@ -7,6 +7,13 @@ interface Props {
   currentModel: string;
   onSelect: (modelId: string) => void;
   onClose: () => void;
+  /** Menu heading (defaults to "select model"). */
+  title?: string;
+  /** When set, renders a "Follow GG Coder" row above the model grid (Ken's
+   *  picker) — selecting it clears the pin. `followActive` highlights it when
+   *  no pin is set. */
+  onSelectFollow?: () => void;
+  followActive?: boolean;
 }
 
 /**
@@ -14,7 +21,15 @@ interface Props {
  * names in a multi-column grid (there are many models), with the active one
  * highlighted. Closes on outside-click or Escape.
  */
-export function ModelMenu({ models, currentModel, onSelect, onClose }: Props): React.ReactElement {
+export function ModelMenu({
+  models,
+  currentModel,
+  onSelect,
+  onClose,
+  title,
+  onSelectFollow,
+  followActive,
+}: Props): React.ReactElement {
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -41,11 +56,26 @@ export function ModelMenu({ models, currentModel, onSelect, onClose }: Props): R
       style={{ background: theme.surface2, borderColor: theme.border }}
     >
       <div className="model-menu-title" style={{ color: theme.textMuted }}>
-        select model
+        {title ?? "select model"}
       </div>
+      {onSelectFollow && (
+        <button
+          className={`model-menu-item model-menu-follow${followActive ? " active" : ""}`}
+          style={{
+            color: followActive ? theme.primary : theme.text,
+            background: followActive ? theme.surface2 : "transparent",
+          }}
+          onClick={onSelectFollow}
+          title="Ken adopts whatever model GG Coder is using"
+        >
+          Follow GG Coder
+        </button>
+      )}
       <div className="model-menu-grid">
         {models.map((m) => {
-          const active = m.id === currentModel;
+          // With a follow row present (Ken's picker), a model is only "active"
+          // when it's an explicit pin — not when Ken merely inherits it.
+          const active = m.id === currentModel && !(onSelectFollow && followActive);
           return (
             <button
               key={`${m.provider}:${m.id}`}
