@@ -91,6 +91,21 @@ export interface AutopilotMarkerPayload {
   afterMessageCount: number;
 }
 
+/** Custom-entry kind for a generic app transcript marker (plan-mode banner,
+ *  task header, error row, user-bubble display hint). Same not-on-the-DAG
+ *  treatment as Ken turns / autopilot markers: persisted with `parentId: null`
+ *  so the LLM never sees it, anchored by `afterMessageCount` so the host can
+ *  interleave it back into the transcript on resume. */
+export const APP_MARKER_CUSTOM_KIND = "app_transcript_marker";
+
+export interface AppMarkerPayload {
+  version: 1;
+  kind: "plan" | "task" | "error" | "user_hint" | "compaction";
+  afterMessageCount: number;
+  /** Kind-specific display fields (reason/title/headline/kenSent/counts/…). */
+  data: Record<string, unknown>;
+}
+
 export type SessionEntry =
   | MessageEntry
   | ModelChangeEntry
@@ -507,6 +522,34 @@ export class SessionManager {
             question: p.question,
             reply: p.reply,
             afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
+          },
+        ];
+      }
+      return [];
+    });
+  }
+
+  /** Read all persisted app transcript markers in file order, validated +
+   *  normalized (same not-on-the-DAG treatment as Ken turns). */
+  getAppMarkers(entries: SessionEntry[]): AppMarkerPayload[] {
+    return entries.flatMap((entry): AppMarkerPayload[] => {
+      if (entry.type !== "custom" || entry.kind !== APP_MARKER_CUSTOM_KIND) return [];
+      const p = entry.data as Partial<AppMarkerPayload> | undefined;
+      const kind = p?.kind;
+      if (
+        p?.version === 1 &&
+        (kind === "plan" ||
+          kind === "task" ||
+          kind === "error" ||
+          kind === "user_hint" ||
+          kind === "compaction")
+      ) {
+        return [
+          {
+            version: 1,
+            kind,
+            afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
+            data: typeof p.data === "object" && p.data !== null ? p.data : {},
           },
         ];
       }

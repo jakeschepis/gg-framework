@@ -7,6 +7,7 @@ import {
   SessionManager,
   KEN_TURN_CUSTOM_KIND,
   AUTOPILOT_MARKER_CUSTOM_KIND,
+  APP_MARKER_CUSTOM_KIND,
   type SessionEntry,
   type CustomEntry,
 } from "./session-manager.js";
@@ -237,6 +238,90 @@ describe("SessionManager.getAutopilotMarkers", () => {
     const markers = manager2.getAutopilotMarkers(loaded.entries);
     expect(markers).toHaveLength(1);
     expect(markers[0]).toMatchObject({ phase: "human", reason: "needs a call" });
+  });
+});
+
+describe("SessionManager.getAppMarkers", () => {
+  const manager = new SessionManager("/unused");
+
+  it("reads valid app markers in file order, ignoring other kinds", () => {
+    const entries: SessionEntry[] = [
+      autopilotEntry(
+        "p1",
+        { version: 1, kind: "plan", afterMessageCount: 0, data: { reason: "big change" } },
+        APP_MARKER_CUSTOM_KIND,
+      ),
+      entry("m1"),
+      autopilotEntry("a1", { version: 1, phase: "done", afterMessageCount: 1 }),
+      autopilotEntry(
+        "e1",
+        { version: 1, kind: "error", afterMessageCount: 1, data: { headline: "Rate limited" } },
+        APP_MARKER_CUSTOM_KIND,
+      ),
+    ];
+    const markers = manager.getAppMarkers(entries);
+    expect(markers).toHaveLength(2);
+    expect(markers[0]).toMatchObject({
+      kind: "plan",
+      afterMessageCount: 0,
+      data: { reason: "big change" },
+    });
+    expect(markers[1]).toMatchObject({ kind: "error", data: { headline: "Rate limited" } });
+  });
+
+  it("drops malformed payloads (bad version / unknown kind) and normalizes fields", () => {
+    const markers = manager.getAppMarkers([
+      autopilotEntry("b1", { version: 2, kind: "plan", data: {} }, APP_MARKER_CUSTOM_KIND),
+      autopilotEntry("b2", { version: 1, kind: "nope", data: {} }, APP_MARKER_CUSTOM_KIND),
+      autopilotEntry("b3", null, APP_MARKER_CUSTOM_KIND),
+      // Missing afterMessageCount → 0; missing/null data → {}.
+      autopilotEntry("ok", { version: 1, kind: "task", data: null }, APP_MARKER_CUSTOM_KIND),
+    ]);
+    expect(markers).toEqual([{ version: 1, kind: "task", afterMessageCount: 0, data: {} }]);
+  });
+
+  it("accepts the compaction kind (persisted N → M counts for the resumed notice)", () => {
+    const markers = manager.getAppMarkers([
+      autopilotEntry(
+        "c1",
+        {
+          version: 1,
+          kind: "compaction",
+          afterMessageCount: 3,
+          data: { originalCount: 40, newCount: 6 },
+        },
+        APP_MARKER_CUSTOM_KIND,
+      ),
+    ]);
+    expect(markers).toEqual([
+      {
+        version: 1,
+        kind: "compaction",
+        afterMessageCount: 3,
+        data: { originalCount: 40, newCount: 6 },
+      },
+    ]);
+  });
+
+  it("keeps app markers out of the LLM message history on a written file", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager2 = new SessionManager(sessionsDir);
+    const created = await manager2.create(sessionsDir, "anthropic", "test-model");
+    await manager2.appendEntry(created.path, entry("m1"));
+    await manager2.appendEntry(
+      created.path,
+      autopilotEntry(
+        "u1",
+        { version: 1, kind: "user_hint", afterMessageCount: 1, data: { kenSent: true } },
+        APP_MARKER_CUSTOM_KIND,
+      ),
+    );
+    const loaded = await manager2.load(created.path);
+    const msgs = manager2.getMessages(loaded.entries, loaded.header.leafId);
+    expect(JSON.stringify(msgs)).not.toContain("kenSent");
+    expect(manager2.getAppMarkers(loaded.entries)).toEqual([
+      { version: 1, kind: "user_hint", afterMessageCount: 1, data: { kenSent: true } },
+    ]);
   });
 });
 

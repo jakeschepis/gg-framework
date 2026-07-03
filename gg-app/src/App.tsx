@@ -120,6 +120,12 @@ const PLACEHOLDER_SHUFFLE_FRAME_MS = 24;
 
 // Autopilot Ken's "all clear" line, rotated so the auto-review loop doesn't
 // repeat the exact same sentence every time GG Coder's work checks out.
+// Info row shown when a video attachment is sent to a model without native
+// video analysis. Shared by the live send path and history restore so the
+// resumed transcript matches the live one exactly.
+const VIDEO_CAPABILITY_WARNING =
+  "This model can't watch video directly. The agent can still extract frames or audio with ffmpeg if needed — switch to a video-capable model (Gemini, Kimi, MiniMax) for native video analysis.";
+
 const ALL_CLEAR_VARIATIONS = [
   "All clear. Looks good to me.",
   "Checks out. Nothing left to flag.",
@@ -132,6 +138,22 @@ const ALL_CLEAR_VARIATIONS = [
   "Good to go, no issues found.",
   "This holds together. All clear.",
 ] as const;
+
+function stableIndex(seed: string, modulo: number): number {
+  let hash = 2166136261;
+  for (let i = 0; i < seed.length; i++) {
+    hash ^= seed.charCodeAt(i);
+    hash = Math.imul(hash, 16777619);
+  }
+  return (hash >>> 0) % modulo;
+}
+
+function allClearCopy(seed: string | undefined, fallbackId: number): string {
+  const index = seed
+    ? stableIndex(seed, ALL_CLEAR_VARIATIONS.length)
+    : fallbackId % ALL_CLEAR_VARIATIONS.length;
+  return ALL_CLEAR_VARIATIONS[index];
+}
 
 function shufflePlaceholderFrame(target: string, frame: number): string {
   const revealCount = Math.ceil((target.length * frame) / PLACEHOLDER_SHUFFLE_FRAMES);
@@ -224,6 +246,8 @@ export type Item =
       phase: "prompted" | "done" | "human" | "capped" | "plan_approved";
       reason?: string;
       body?: string;
+      /** Stable seed from persisted marker data so resumed all-clear copy doesn't flicker. */
+      copySeed?: string;
     };
 
 export interface TranscriptImage {
@@ -973,7 +997,40 @@ function App(): React.ReactElement {
             if (h.hook) return { kind: "hook", id: nextId(), hook: h.hook };
             // A resumed compacted session shows the quiet compaction notice in
             // place of the raw summary body (counts aren't persisted).
-            if (h.compacted) return { kind: "compaction", id: nextId(), status: "done" };
+            if (h.compacted)
+              return {
+                kind: "compaction",
+                id: nextId(),
+                status: "done",
+                originalCount: h.compactionCounts?.originalCount,
+                newCount: h.compactionCounts?.newCount,
+              };
+            // Persisted display-only markers: plan-mode banner, task header,
+            // error rows, and the video-capability info row — all rendered
+            // identically to their live counterparts.
+            if (h.plan) return { kind: "plan", id: nextId(), reason: h.plan.reason };
+            if (h.task) return { kind: "task", id: nextId(), title: h.task.title };
+            if (h.error) {
+              const prefix =
+                h.error.scope === "ken_error"
+                  ? "Ken: "
+                  : h.error.scope === "autopilot_error"
+                    ? "Autopilot: "
+                    : "";
+              return {
+                kind: "error",
+                id: nextId(),
+                headline: `${prefix}${h.error.headline}`,
+                message: h.error.message,
+                guidance: h.error.guidance,
+              };
+            }
+            if (h.infoKind === "video_warning")
+              return { kind: "info", id: nextId(), text: VIDEO_CAPABILITY_WARNING };
+            // Ken "Send to GG Coder" prompts: restore the shimmer label, not the
+            // full prompt body (matches live).
+            if (h.kenSent && h.role === "user")
+              return { kind: "user", id: nextId(), text: h.text, kenSent: true };
             // Persisted Ken (mentor) turns: his reply restores as a Ken bubble,
             // the `@Ken` question as a Ken-tinted user bubble (matches live).
             if (h.ken && h.role === "assistant") return { kind: "ken", id: nextId(), text: h.text };
@@ -989,6 +1046,7 @@ function App(): React.ReactElement {
                 phase: h.autopilot.phase,
                 reason: h.autopilot.reason,
                 body: h.autopilot.body,
+                copySeed: h.autopilot.copySeed,
               };
             if (h.role !== "user") return { kind: h.role, id: nextId(), text: h.text };
             // App-button prompts (e.g. "Initialize Git") were shown live as a
@@ -1007,6 +1065,9 @@ function App(): React.ReactElement {
               ...(label !== null ? { label } : {}),
               images: h.images && h.images.length > 0 ? h.images : undefined,
               ...(parsed && parsed.files.length > 0 ? { files: parsed.files } : {}),
+              ...(h.enhancements && h.enhancements.length > 0
+                ? { enhancements: h.enhancements }
+                : {}),
             };
           }),
         );
@@ -1328,7 +1389,7 @@ function App(): React.ReactElement {
       stickToBottomRef.current = true;
       pushItem({ kind: "user", id: nextId(), text: trimmed, kenSent: true });
       endStreamingText();
-      void sendPrompt(trimmed).catch(() => {});
+      void sendPrompt(trimmed, [], { kenSent: true }).catch(() => {});
     },
     [pushItem, endStreamingText],
   );
@@ -1541,7 +1602,11 @@ function App(): React.ReactElement {
       setMention(null);
       setMentionedPaths([]);
       setEnhancement(null);
-      void sendPrompt(prompt, queuedWire);
+      void sendPrompt(
+        prompt,
+        queuedWire,
+        sentEnhancements ? { enhancements: sentEnhancements } : undefined,
+      );
       return;
     }
     const wire = attachments.map(toWire);
@@ -1562,7 +1627,7 @@ function App(): React.ReactElement {
       pushItem({
         kind: "info",
         id: nextId(),
-        text: "This model can't watch video directly. The agent can still extract frames or audio with ffmpeg if needed — switch to a video-capable model (Gemini, Kimi, MiniMax) for native video analysis.",
+        text: VIDEO_CAPABILITY_WARNING,
       });
     }
     setInput("");
@@ -1572,7 +1637,11 @@ function App(): React.ReactElement {
     setMentionedPaths([]);
     setEnhancement(null);
     endStreamingText();
-    void sendPrompt(prompt, wire);
+    void sendPrompt(
+      prompt,
+      wire,
+      sentEnhancements ? { enhancements: sentEnhancements } : undefined,
+    );
   }
 
   // ── Attachment intake (paste / attach button / whole-window drag-drop) ──
@@ -2508,7 +2577,7 @@ const TranscriptRow = memo(function TranscriptRow({
         prompted: item.body?.trim()
           ? `Sending GG Coder back in:\n\n${item.body.trim()}`
           : "Sending GG Coder back in for another pass.",
-        done: ALL_CLEAR_VARIATIONS[item.id % ALL_CLEAR_VARIATIONS.length],
+        done: allClearCopy(item.copySeed, item.id),
         human: item.reason?.trim() ? item.reason.trim() : "Need you to weigh in on this one.",
         capped: "Paused autopilot after 3 rounds. Take a look before I keep going.",
         plan_approved: "Plan looks solid. Approved it — implementation is underway.",

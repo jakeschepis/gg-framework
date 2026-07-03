@@ -1,5 +1,14 @@
 # @kenkaiiii/ggcoder
 
+## 5.8.1
+
+### Patch Changes
+
+- Session resume now renders 1:1 with the live transcript: stale autopilot all-clear markers are deduped and range-clamped (no more duplicate Ken bubbles bunching at the bottom of reopened sessions), queued steering prompts resume as clean bubbles without the internal wrapper, Ken "Send to GG Coder" labels, enhancer highlights, plan-mode banners, task headers, error rows, and compaction counts all persist and restore, and all-clear wording is deterministic across reopens.
+  - @kenkaiiii/gg-ai@5.8.1
+  - @kenkaiiii/gg-agent@5.8.1
+  - @kenkaiiii/gg-core@5.8.1
+
 ## 5.8.0
 
 ### Minor Changes

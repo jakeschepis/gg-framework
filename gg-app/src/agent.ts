@@ -300,12 +300,24 @@ export async function readDroppedFileAttachment(path: string): Promise<Attachmen
   }
 }
 
-export async function sendPrompt(text: string, attachments: Attachment[] = []): Promise<void> {
+/** Display hints for the user bubble this prompt creates — persisted by the
+ *  sidecar so a resumed session re-renders the same bubble (Ken "Sent to GG
+ *  Coder" label, enhancer term highlights). */
+export interface PromptMeta {
+  kenSent?: boolean;
+  enhancements?: PromptSegment[];
+}
+
+export async function sendPrompt(
+  text: string,
+  attachments: Attachment[] = [],
+  meta?: PromptMeta,
+): Promise<void> {
   await logInfo(
     `prompt: ${text.slice(0, 80)}${attachments.length ? ` (+${attachments.length} att)` : ""}`,
   );
   try {
-    await invoke("agent_prompt", { text, attachments });
+    await invoke("agent_prompt", { text, attachments, meta: meta ?? null });
   } catch (e) {
     await logError(`agent_prompt failed: ${String(e)}`);
     throw e;
@@ -416,6 +428,8 @@ export interface HistoryEntry {
   /** True when this user message is a post-compaction summary marker, so the
    *  webview renders the quiet compaction notice instead of the summary body. */
   compacted?: boolean;
+  /** Persisted counts for a compacted row's "N → M messages" summary. */
+  compactionCounts?: { originalCount: number; newCount: number };
   /** True when this entry is a persisted Ken Kai (mentor) turn: a `user` row is
    *  the `@Ken` question, an `assistant` row is Ken's reply. Rendered in Ken's
    *  color (user bubble tinted, assistant as a Ken bubble) on resume. */
@@ -427,7 +441,23 @@ export interface HistoryEntry {
     phase: "prompted" | "done" | "human" | "capped" | "plan_approved";
     reason?: string;
     body?: string;
+    /** Stable seed from persisted marker data so resumed all-clear copy doesn't flicker. */
+    copySeed?: string;
   };
+  /** True when this user prompt came from a Ken "Send to GG Coder" button —
+   *  render the shimmering label instead of the prompt body (matches live). */
+  kenSent?: boolean;
+  /** Enhancer highlight segments, restored for unedited enhanced sends. */
+  enhancements?: PromptSegment[];
+  /** Plan-mode entry banner (reason), persisted at plan_enter. */
+  plan?: { reason: string };
+  /** Task header row (title), persisted at task_start. */
+  task?: { title: string };
+  /** Error row persisted by the sidecar's broadcastError. `scope` selects the
+   *  live headline prefix (ken_error → "Ken: ", autopilot_error → "Autopilot: "). */
+  error?: { scope: string; headline: string; message?: string; guidance?: string };
+  /** Webview-copy info row marker (e.g. the video-capability warning). */
+  infoKind?: "video_warning";
   /** Tool-produced images rendered inline (same as live `images` items),
    *  reconstructed from ImageContent blocks in persisted tool results. */
   toolImages?: Array<{ src: string; path?: string }>;

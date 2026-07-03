@@ -40,7 +40,15 @@ import {
 } from "./core/autopilot-gate.js";
 import { driveAutopilotCycle } from "./core/autopilot-cycle.js";
 import { validateKenModelPref, effectiveKenModel, type KenModelPref } from "./core/ken-model.js";
-import type { KenTurnPayload, AutopilotMarkerPayload } from "./core/session-manager.js";
+import type { KenTurnPayload, AppMarkerPayload } from "./core/session-manager.js";
+import {
+  normalizeAutopilotMarkersForHistory,
+  normalizeAppMarkersForHistory,
+  normalizeKenTurnsForHistory,
+  restoreUserRow,
+  restoreAssistantTexts,
+  autopilotMarkerCopySeed,
+} from "./core/session-history.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { MOONSHOT_OAUTH_KEY, XIAOMI_CREDITS_KEY } from "@kenkaiiii/gg-core";
 import { loginAnthropic } from "./core/oauth/anthropic.js";
@@ -275,6 +283,8 @@ interface HistoryEntryForWire {
   hook?: "ideal" | "loop_break" | "regrounding" | null;
   command?: boolean;
   compacted?: boolean;
+  /** Persisted counts for a compacted row's "N → M messages" summary. */
+  compactionCounts?: { originalCount: number; newCount: number };
   /** True when this entry is a Ken Kai (mentor) turn: a `user` row is the `@Ken`
    *  question, an `assistant` row is Ken's reply. The webview renders these in
    *  Ken's color (user bubble tinted; assistant as a Ken bubble). */
@@ -287,7 +297,24 @@ interface HistoryEntryForWire {
     phase: "prompted" | "done" | "human" | "capped" | "plan_approved";
     reason?: string;
     body?: string;
+    /** Stable seed derived from persisted marker data for deterministic all-clear copy. */
+    copySeed?: string;
   };
+  /** True when this user prompt came from a Ken "Send to GG Coder" button —
+   *  the webview renders the shimmering label instead of the prompt body. */
+  kenSent?: boolean;
+  /** Enhancer highlight segments for this user prompt (unedited enhanced sends). */
+  enhancements?: unknown[];
+  /** Plan-mode entry banner (ASCII logo + reason), persisted at plan_enter. */
+  plan?: { reason: string };
+  /** Task header row (task title), persisted at task_start. */
+  task?: { title: string };
+  /** Error row (headline/message/guidance), persisted by broadcastError.
+   *  `scope` selects the live prefix (ken_error → "Ken: ", autopilot_error →
+   *  "Autopilot: "). */
+  error?: { scope: string; headline: string; message?: string; guidance?: string };
+  /** Webview-copy info row marker (e.g. the video-capability warning). */
+  infoKind?: "video_warning";
   toolImages?: Array<{ src: string; path?: string }>;
   subagentGroup?: Array<{
     agentName?: string;
@@ -1061,6 +1088,16 @@ async function createSession(
       ...(f.statusCode != null ? { statusCode: f.statusCode } : {}),
       ...(f.resetsAt != null ? { resetsAt: f.resetsAt } : {}),
     });
+    // Persist the error row (display-only marker) so a resumed session shows
+    // the same headline/message/guidance the live run did. Best-effort.
+    void session
+      .persistAppMarker("error", {
+        scope: type,
+        headline: f.headline,
+        ...(f.message ? { message: f.message } : {}),
+        guidance: f.guidance,
+      })
+      .catch(() => {});
   }
 
   // The session file path to resume (passed by the daemon's POST /session);
@@ -1087,6 +1124,8 @@ async function createSession(
     onEnterPlan: async (reason) => {
       await session.setPlanMode(true);
       broadcast("plan_enter", { reason: reason ?? "" });
+      // Persist the plan-mode banner so a resumed session still shows it.
+      void session.persistAppMarker("plan", { reason: reason ?? "" }).catch(() => {});
     },
     onExitPlan: async (planPath: string) => {
       await session.setPlanMode(false);
@@ -1630,13 +1669,24 @@ async function createSession(
         },
         runPrompt: (body) => runAgent(body, () => session.prompt(body)),
         emit: (event) => {
-          broadcast(event.type, event.data);
           // Persist the terminal verdict marker so a resumed session renders the
           // same Ken bubble the live run showed instead of dropping it or
           // falling back to the raw verdict text (e.g. ALL_CLEAR).
           if (event.type === "autopilot_done") {
+            // Broadcast the SAME copySeed the persisted marker will produce on
+            // resume, so the live all-clear wording matches the resumed one
+            // (computed before persist — same synchronous message count).
+            const seed = autopilotMarkerCopySeed({
+              version: 1,
+              phase: "done",
+              afterMessageCount: session.getMessages().filter((m) => m.role !== "system").length,
+            });
+            broadcast(event.type, { ...event.data, copySeed: seed });
             void session.persistAutopilotMarker("done");
-          } else if (event.type === "autopilot_human") {
+            return;
+          }
+          broadcast(event.type, event.data);
+          if (event.type === "autopilot_human") {
             void session.persistAutopilotMarker("human", { reason: event.data.reason });
           } else if (event.type === "autopilot_capped") {
             void session.persistAutopilotMarker("capped");
@@ -1735,6 +1785,8 @@ async function createSession(
     markTaskInProgress(cwd, task.id);
     broadcast("tasks_list", { tasks: loadTasksSync(cwd) });
     broadcast("task_start", { id: task.id, title: task.title });
+    // Persist the task header so a resumed task session shows what ran.
+    void session.persistAppMarker("task", { title: task.title }).catch(() => {});
     const shortId = task.id.slice(0, 8);
     const completionHint =
       `\n\n---\nWhen you have fully completed this task, call the tasks tool to mark it done:\n` +
@@ -2052,8 +2104,14 @@ async function createSession(
         // they were recorded after, so each lands right after that message. A
         // turn becomes two wire rows: the `@Ken` question (user) + Ken's reply
         // (assistant), both flagged `ken` so the webview tints them.
+        // Deduped; stale anchors are clamped to the last message (Ken turns
+        // carry real conversation, so they render at the end instead of
+        // vanishing).
         const kenByCount = new Map<number, KenTurnPayload[]>();
-        for (const turn of session.getKenTurns()) {
+        for (const turn of normalizeKenTurnsForHistory(
+          session.getKenTurns(),
+          messages.filter((m) => m.role !== "system").length,
+        )) {
           const list = kenByCount.get(turn.afterMessageCount) ?? [];
           list.push(turn);
           kenByCount.set(turn.afterMessageCount, list);
@@ -2071,8 +2129,18 @@ async function createSession(
         // Autopilot verdict markers to interleave, same anchor scheme as Ken
         // turns — each becomes a single assistant row the webview renders
         // exactly like the live `autopilot` item (never a raw verdict string).
-        const autopilotByCount = new Map<number, AutopilotMarkerPayload[]>();
-        for (const marker of session.getAutopilotMarkers()) {
+        // Compact/continuation rewrites can carry old markers whose original
+        // afterMessageCount is beyond the restored message list; dropping those
+        // prevents stale all-clear bubbles from bunching at the bottom on resume.
+        const restoredMessageCount = messages.filter((m) => m.role !== "system").length;
+        const autopilotByCount = new Map<
+          number,
+          ReturnType<typeof normalizeAutopilotMarkersForHistory>
+        >();
+        for (const marker of normalizeAutopilotMarkersForHistory(
+          session.getAutopilotMarkers(),
+          restoredMessageCount,
+        )) {
           const list = autopilotByCount.get(marker.afterMessageCount) ?? [];
           list.push(marker);
           autopilotByCount.set(marker.afterMessageCount, list);
@@ -2089,8 +2157,70 @@ async function createSession(
                 phase: marker.phase,
                 ...(marker.reason !== undefined ? { reason: marker.reason } : {}),
                 ...(marker.body !== undefined ? { body: marker.body } : {}),
+                copySeed: marker.copySeed,
               },
             });
+          }
+        };
+
+        // App transcript markers (plan banner / task header / error rows /
+        // user-bubble hints), same anchor scheme. user_hint markers don't
+        // become rows — they decorate the user row at their anchor instead.
+        const appMarkersByCount = new Map<number, AppMarkerPayload[]>();
+        const userHintByCount = new Map<number, Record<string, unknown>>();
+        // Compaction-count markers pair with compacted summary rows in file
+        // order (FIFO), not by anchor — the summary user message is what
+        // positions the notice.
+        const compactionCounts: Array<{ originalCount: number; newCount: number }> = [];
+        for (const marker of normalizeAppMarkersForHistory(
+          session.getAppMarkers(),
+          restoredMessageCount,
+        )) {
+          if (marker.kind === "user_hint") {
+            userHintByCount.set(marker.afterMessageCount, marker.data);
+            continue;
+          }
+          if (marker.kind === "compaction") {
+            const d = marker.data;
+            if (typeof d.originalCount === "number" && typeof d.newCount === "number") {
+              compactionCounts.push({ originalCount: d.originalCount, newCount: d.newCount });
+            }
+            continue;
+          }
+          const list = appMarkersByCount.get(marker.afterMessageCount) ?? [];
+          list.push(marker);
+          appMarkersByCount.set(marker.afterMessageCount, list);
+        }
+        const flushAppMarkers = (count: number): void => {
+          const markers = appMarkersByCount.get(count);
+          if (!markers) return;
+          appMarkersByCount.delete(count);
+          for (const marker of markers) {
+            const d = marker.data;
+            if (marker.kind === "plan") {
+              history.push({
+                role: "assistant",
+                text: "",
+                plan: { reason: typeof d.reason === "string" ? d.reason : "" },
+              });
+            } else if (marker.kind === "task") {
+              history.push({
+                role: "assistant",
+                text: "",
+                task: { title: typeof d.title === "string" ? d.title : "" },
+              });
+            } else if (marker.kind === "error" && typeof d.headline === "string") {
+              history.push({
+                role: "assistant",
+                text: "",
+                error: {
+                  scope: typeof d.scope === "string" ? d.scope : "error",
+                  headline: d.headline,
+                  ...(typeof d.message === "string" ? { message: d.message } : {}),
+                  ...(typeof d.guidance === "string" ? { guidance: d.guidance } : {}),
+                },
+              });
+            }
           }
         };
         let nonSystemCount = 0;
@@ -2098,6 +2228,7 @@ async function createSession(
         // the top.
         flushKen(0);
         flushAutopilot(0);
+        flushAppMarkers(0);
 
         for (const msg of messages) {
           if (msg.role === "system") continue;
@@ -2148,39 +2279,54 @@ async function createSession(
             continue;
           }
 
-          // User or assistant message — existing text/hook/command/compacted
-          // extraction, plus sub-agent group detection for assistant tool_calls.
-          const text =
-            typeof msg.content === "string"
-              ? msg.content
-              : msg.content
-                  .map((c) =>
-                    c.type === "text" && "text" in c && typeof c.text === "string" ? c.text : "",
-                  )
-                  .join("");
-          const images =
-            typeof msg.content === "string"
-              ? []
-              : msg.content.flatMap((c) =>
-                  c.type === "image" ? [`data:${c.mediaType};base64,${c.data}`] : [],
-                );
-          const hook = msg.role === "user" ? detectHookKind(text) : null;
-          const compacted =
-            msg.role === "user" && !hook && text.startsWith("[Previous conversation summary]");
-          const command =
-            msg.role === "user" && !hook && !compacted
-              ? detectPromptCommand(text, commandCandidates)
-              : null;
-
-          if (text.trim() || images.length > 0) {
-            history.push({
-              role: msg.role as "user" | "assistant",
-              text: command ?? text,
-              images,
-              hook,
-              command: command !== null,
-              compacted,
-            });
+          // User or assistant message — text/hook/command/compacted extraction,
+          // plus sub-agent group detection for assistant tool_calls.
+          if (msg.role === "user") {
+            // Rebuild the live bubble: strip the steering wrapper, drop
+            // attachment/file notes the model saw but the bubble never showed.
+            const restored = restoreUserRow(msg.content);
+            const text = restored.text;
+            const hook = detectHookKind(text);
+            const compacted = !hook && text.startsWith("[Previous conversation summary]");
+            const command =
+              !hook && !compacted ? detectPromptCommand(text, commandCandidates) : null;
+            if (text.trim() || restored.images.length > 0) {
+              const hint = userHintByCount.get(nonSystemCount);
+              history.push({
+                role: "user",
+                text: command ?? text,
+                images: restored.images,
+                hook,
+                command: command !== null,
+                compacted,
+                // Markers accumulate across continuation files (each rewrite
+                // re-persists prior ones) but only the LATEST summary row
+                // survives compaction — so consume from the newest end.
+                ...(compacted && compactionCounts.length > 0
+                  ? { compactionCounts: compactionCounts.pop() }
+                  : {}),
+                ...(hint?.kenSent === true ? { kenSent: true } : {}),
+                ...(Array.isArray(hint?.enhancements) ? { enhancements: hint.enhancements } : {}),
+              });
+              // Live showed the video-capability warning right after the bubble.
+              if (restored.videoWarning) {
+                history.push({ role: "assistant", text: "", infoKind: "video_warning" });
+              }
+            }
+          } else {
+            // Assistant: one wire row per persisted text block — live streaming
+            // splits bubbles at server_tool_call boundaries, and the persisted
+            // content keeps those blocks separate.
+            for (const blockText of restoreAssistantTexts(msg.content)) {
+              history.push({
+                role: "assistant",
+                text: blockText,
+                images: [],
+                hook: null,
+                command: false,
+                compacted: false,
+              });
+            }
           }
 
           // Assistant tool_call blocks: detect sub-agent delegations.
@@ -2212,19 +2358,21 @@ async function createSession(
             }
           }
 
-          // Interleave any Ken turns / autopilot markers recorded right after
-          // this message.
+          // Interleave any Ken turns / autopilot / app markers recorded right
+          // after this message.
           flushKen(nonSystemCount);
           flushAutopilot(nonSystemCount);
+          flushAppMarkers(nonSystemCount);
         }
 
-        // Flush remaining Ken turns / autopilot markers whose anchor is at/after
-        // the message count (e.g. recorded before any build message, or anchors
-        // beyond the current count after compaction shrank the history) so none
-        // are dropped.
+        // Flush remaining Ken turns whose anchor is at/after the message count so
+        // none are dropped. Autopilot/app markers beyond the restored message
+        // count were already filtered above; any remaining marker here is valid.
         for (const count of [...kenByCount.keys()].sort((a, b) => a - b)) flushKen(count);
         for (const count of [...autopilotByCount.keys()].sort((a, b) => a - b))
           flushAutopilot(count);
+        for (const count of [...appMarkersByCount.keys()].sort((a, b) => a - b))
+          flushAppMarkers(count);
 
         json(res, 200, { history });
       })();
@@ -2260,10 +2408,16 @@ async function createSession(
       void readBody(req).then(async (raw) => {
         let text: string;
         let attachments: AppAttachment[];
+        let meta: { kenSent?: boolean; enhancements?: unknown[] } | undefined;
         try {
-          const body = JSON.parse(raw) as { text?: string; attachments?: AppAttachment[] };
+          const body = JSON.parse(raw) as {
+            text?: string;
+            attachments?: AppAttachment[];
+            meta?: { kenSent?: boolean; enhancements?: unknown[] };
+          };
           text = body.text ?? "";
           attachments = Array.isArray(body.attachments) ? body.attachments : [];
+          meta = typeof body.meta === "object" && body.meta !== null ? body.meta : undefined;
         } catch {
           json(res, 400, { error: "invalid JSON body" });
           return;
@@ -2286,6 +2440,22 @@ async function createSession(
           return;
         }
         json(res, 202, { accepted: true });
+        // Webview display hint for this prompt's user bubble (kenSent shimmer
+        // label / enhancer highlight segments). Anchored +1 so it attaches to
+        // the user message the prompt below is about to push. Queued prompts
+        // skip this (their position in the run is unpredictable).
+        if (meta && (meta.kenSent === true || Array.isArray(meta.enhancements))) {
+          void session
+            .persistAppMarker(
+              "user_hint",
+              {
+                ...(meta.kenSent === true ? { kenSent: true } : {}),
+                ...(Array.isArray(meta.enhancements) ? { enhancements: meta.enhancements } : {}),
+              },
+              1,
+            )
+            .catch(() => {});
+        }
         // Fresh user turn: clear any cancel flag left from a prior cycle so this
         // turn's autopilot review can run.
         autopilotCancelled = false;

@@ -634,6 +634,7 @@ async fn agent_prompt(
     client: State<'_, reqwest::Client>,
     text: String,
     attachments: Option<serde_json::Value>,
+    meta: Option<serde_json::Value>,
 ) -> Result<(), String> {
     let port = port_for(&webview).ok_or("daemon not ready")?;
     let gg_sid = session_for(&webview).ok_or("session not ready")?;
@@ -643,6 +644,7 @@ async fn agent_prompt(
         .json(&serde_json::json!({
             "text": text,
             "attachments": attachments.unwrap_or(serde_json::Value::Array(vec![])),
+            "meta": meta.unwrap_or(serde_json::Value::Null),
         }))
         .send()
         .await

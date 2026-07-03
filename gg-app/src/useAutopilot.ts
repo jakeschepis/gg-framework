@@ -36,11 +36,18 @@ export function useAutopilot(opts: {
   const pushMarker = useCallback(
     (
       phase: "prompted" | "done" | "human" | "capped",
-      extra?: { reason?: string; body?: string },
+      extra?: { reason?: string; body?: string; copySeed?: string },
     ) => {
       setItems((prev) => [
         ...prev,
-        { kind: "autopilot", id: nextId(), phase, reason: extra?.reason, body: extra?.body },
+        {
+          kind: "autopilot",
+          id: nextId(),
+          phase,
+          reason: extra?.reason,
+          body: extra?.body,
+          copySeed: extra?.copySeed,
+        },
       ]);
     },
     [setItems, nextId],
@@ -65,7 +72,11 @@ export function useAutopilot(opts: {
           return false;
         case "autopilot_done":
           setAutopilotReviewing(false);
-          pushMarker("done");
+          // copySeed mirrors the persisted marker's seed so the live all-clear
+          // wording is the SAME line a resumed session shows.
+          pushMarker("done", {
+            copySeed: typeof d.copySeed === "string" ? d.copySeed : undefined,
+          });
           return true;
         case "autopilot_ignored":
           // Nothing worth reviewing (small talk, a mechanical git op, etc.) —

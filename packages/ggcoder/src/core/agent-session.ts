@@ -25,11 +25,13 @@ import {
   SessionManager,
   KEN_TURN_CUSTOM_KIND,
   AUTOPILOT_MARKER_CUSTOM_KIND,
+  APP_MARKER_CUSTOM_KIND,
   type MessageEntry,
   type BranchInfo,
   type CustomEntry,
   type KenTurnPayload,
   type AutopilotMarkerPayload,
+  type AppMarkerPayload,
 } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
@@ -200,6 +202,11 @@ export class AgentSession {
   // persisted + reloaded so a resumed session shows the identical Ken bubble
   // the live run showed instead of dropping it or replaying a raw verdict.
   private autopilotMarkers: AutopilotMarkerPayload[] = [];
+  // Generic app transcript markers (plan-mode banner, task header, error rows,
+  // user-bubble display hints). Same not-on-the-DAG treatment as kenTurns —
+  // display only, persisted + reloaded so a resumed session shows the same
+  // transcript rows the live run showed.
+  private appMarkers: AppMarkerPayload[] = [];
   private tools: AgentTool[] = [];
   /** Rebuilds the read tool for a new model (video byte cap is baked in at
    *  creation). Called from switchModel so video-capable models get the
@@ -758,21 +765,23 @@ export class AgentSession {
     // agent sees them mid-loop instead of after it stops.
     if (this.userQueue.length > 0) {
       const queued = this.userQueue.splice(0);
-      // Frame the queued text as concurrent steering — without this wrapper the
-      // model treats a mid-run message as a fresh request that supersedes the
-      // original task and silently drops it.
-      // Plain-text-only queue: keep the simple merged-string message.
-      if (queued.every((m) => m.attachments.length === 0)) {
-        const merged = queued.map((m) => m.text).join("\n\n");
-        return [{ role: "user", content: wrapSteeringText(merged) }];
-      }
-      // Any queued attachments → deliver one user message with text + media
-      // blocks built the same way as a non-queued attachment prompt.
-      const parts: Array<TextContent | ImageContent | VideoContent> = [
-        { type: "text", text: STEERING_PREFIX },
-      ];
-      for (const m of queued) parts.push(...this.buildAttachmentParts(m.text, m.attachments));
-      return [{ role: "user", content: parts }];
+      // Frame each queued item as concurrent steering — without this wrapper
+      // the model treats a mid-run message as a fresh request that supersedes
+      // the original task and silently drops it. ONE message per queued item
+      // (not merged): each persists as its own user message, so a resumed
+      // session shows the same number of bubbles the live run did.
+      return queued.map((m): Message => {
+        if (m.attachments.length === 0) {
+          return { role: "user", content: wrapSteeringText(m.text) };
+        }
+        // Queued attachments ride the same native-block path as a non-queued
+        // attachment prompt, prefixed with the steering framing.
+        const parts: Array<TextContent | ImageContent | VideoContent> = [
+          { type: "text", text: STEERING_PREFIX },
+          ...this.buildAttachmentParts(m.text, m.attachments),
+        ];
+        return { role: "user", content: parts };
+      });
     }
     if (!this.settingsManager.get("idealReviewEnabled")) return null;
     if (!this.loopBreakInjected) {
@@ -1092,6 +1101,13 @@ export class AgentSession {
     // Carry Ken's advisory turns into the new file so they survive compaction.
     await this.rePersistKenTurns();
     await this.rePersistAutopilotMarkers();
+    await this.rePersistAppMarkers();
+    // Persist the compaction counts so a resumed session's quiet notice can
+    // show the same "N → M messages" summary the live run did.
+    await this.persistAppMarker("compaction", {
+      originalCount: result.result.originalCount,
+      newCount: result.result.newCount,
+    });
 
     this.eventBus.emit("compaction_end", {
       originalCount: result.result.originalCount,
@@ -1103,6 +1119,13 @@ export class AgentSession {
     // A fresh session drops any in-flight plan state so its prompt is clean.
     this.planModeRef.current = false;
     this.approvedPlanPath = undefined;
+    // Display-only history belongs to the OLD session. Without this, stale Ken
+    // turns / autopilot verdicts / app markers linger in memory, show up in the
+    // new session's /history, and get re-persisted into the new file by the
+    // next compaction — the cross-session duplicate-marker propagation bug.
+    this.kenTurns = [];
+    this.autopilotMarkers = [];
+    this.appMarkers = [];
     const basePrompt =
       this.customSystemPrompt ??
       (await buildSystemPrompt(
@@ -1390,6 +1413,61 @@ export class AgentSession {
     }
   }
 
+  /** App transcript markers recorded against this session, in record order.
+   *  Used by the host to interleave display-only rows (plan banner, task
+   *  header, errors, user-bubble hints) back into the transcript on resume. */
+  getAppMarkers(): AppMarkerPayload[] {
+    return this.appMarkers;
+  }
+
+  /**
+   * Record one app transcript marker (display-only row) against this session.
+   * Same treatment as autopilot markers: kept in memory for the live
+   * transcript, persisted as a `custom` entry (parentId null, never on the
+   * message DAG) so a resumed session shows the identical row. `anchorOffset`
+   * shifts the recorded `afterMessageCount` — pass +1 for a marker that should
+   * attach to the user message about to be pushed by the imminent prompt.
+   * No-op persistence for transient sessions.
+   */
+  async persistAppMarker(
+    kind: AppMarkerPayload["kind"],
+    data: Record<string, unknown>,
+    anchorOffset = 0,
+  ): Promise<void> {
+    const afterMessageCount =
+      this.messages.filter((m) => m.role !== "system").length + anchorOffset;
+    const payload: AppMarkerPayload = { version: 1, kind, afterMessageCount, data };
+    this.appMarkers.push(payload);
+    if (!this.sessionPath) return;
+    const entry: CustomEntry = {
+      type: "custom",
+      kind: APP_MARKER_CUSTOM_KIND,
+      id: crypto.randomUUID(),
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      data: payload,
+    };
+    await this.sessionManager.appendEntry(this.sessionPath, entry);
+  }
+
+  /** Re-append the in-memory app markers to the current session file. Mirrors
+   *  `rePersistKenTurns` — called after a continuation/compaction file is
+   *  created so display-only rows survive the rewrite. */
+  private async rePersistAppMarkers(): Promise<void> {
+    if (!this.sessionPath) return;
+    for (const payload of this.appMarkers) {
+      const entry: CustomEntry = {
+        type: "custom",
+        kind: APP_MARKER_CUSTOM_KIND,
+        id: crypto.randomUUID(),
+        parentId: null,
+        timestamp: new Date().toISOString(),
+        data: payload,
+      };
+      await this.sessionManager.appendEntry(this.sessionPath, entry);
+    }
+  }
+
   /**
    * Generate a short LLM session title from the conversation so far (first user
    * message + first assistant reply). Best-effort; returns null on failure or
@@ -1571,6 +1649,8 @@ export class AgentSession {
     this.kenTurns = this.sessionManager.getKenTurns(loaded.entries);
     // Restore autopilot verdict markers the same way (not on the message DAG).
     this.autopilotMarkers = this.sessionManager.getAutopilotMarkers(loaded.entries);
+    // Restore app transcript markers (plan banner / task header / errors / hints).
+    this.appMarkers = this.sessionManager.getAppMarkers(loaded.entries);
 
     // Track the current leaf for subsequent entries
     this.currentLeafId = loaded.header.leafId;
@@ -1636,6 +1716,12 @@ export class AgentSession {
       // Carry Ken's restored turns into the continuation file.
       await this.rePersistKenTurns();
       await this.rePersistAutopilotMarkers();
+      await this.rePersistAppMarkers();
+      // Record this load-time auto-compaction's counts for the resumed notice.
+      await this.persistAppMarker("compaction", {
+        originalCount: compacted.result.originalCount,
+        newCount: compacted.result.newCount,
+      });
       return;
     }
 

@@ -22,6 +22,16 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.14.2",
+    date: "2026-07-03",
+    items: [
+      "Reopening a session now looks exactly like you never left. I rebuilt the whole resume path so every bubble, label, and highlight comes back precisely the way you saw it live.",
+      "No more ghost messages. Old sessions sometimes piled duplicate all-clear notes from me at the bottom, and I hunted every last one down.",
+      "Messages you sent mid-run come back clean too. The internal plumbing that used to leak into reopened chats is gone for good.",
+      "Plan banners, task headers, and error details now survive a restart, so the story of what happened in a session stays complete forever.",
+    ],
+  },
+  {
     version: "0.14.1",
     date: "2026-07-03",
     items: [
