@@ -119,7 +119,8 @@ describe("useAgentEvents", () => {
     expect(items[0]).toMatchObject({ kind: "assistant", text: "Hello" });
 
     // First-token path creates the bubble synchronously; a second delta buffers
-    // via rAF, so flush it by ending the stream (endStreamingText drains buffer).
+    // via the 100ms flush timer, so flush it by ending the stream
+    // (endStreamingText drains the buffer).
     act(() => {
       hook.result.current.handleEvent(ev("text_delta", { text: " world" }));
       hook.result.current.endStreamingText();

@@ -30,6 +30,10 @@ export const TOOL_PROMPT_HINTS: Record<string, string> = {
   exit_plan: "Submit a .gg/plans/ markdown plan for user approval and leave plan mode.",
   subagent: "Delegate focused, isolated subtasks (research, parallel exploration).",
   skill: "Invoke a named skill for specialized instructions.",
+  tool_search:
+    "Search the extended tool catalog (MCP servers/integrations) by capability — e.g. " +
+    "'search public GitHub code', 'UI design screenshots'. Matches become callable on your " +
+    "next step. Check the catalog BEFORE concluding you lack a capability.",
   generate_image:
     "Generate or edit images using OpenAI's gpt-image-2 model. Only use when the user explicitly asks to create or edit an image — never generate images proactively. Requires OpenAI to be connected. Pass `image` with a file path to edit an existing image. Save with `out_path`.",
   "mcp__kencode-search__referenceSources":

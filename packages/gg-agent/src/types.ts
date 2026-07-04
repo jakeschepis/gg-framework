@@ -124,6 +124,13 @@ export interface AgentRetryEvent {
   observedLimit?: number;
   /** When true, the retry should not be shown to the user (hidden retry). */
   silent?: boolean;
+  /**
+   * Chars of streamed text preserved in message history across this retry
+   * (transport failures only). When > 0 the retry CONTINUES from the partial
+   * instead of replaying — UIs must keep the streamed text on screen rather
+   * than rolling it back.
+   */
+  preservedChars?: number;
 }
 
 export interface AgentToolCallDeltaEvent {

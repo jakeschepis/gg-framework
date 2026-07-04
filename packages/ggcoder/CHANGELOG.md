@@ -1,5 +1,23 @@
 # @kenkaiiii/ggcoder
 
+## 5.8.3
+
+### Patch Changes
+
+- Fix Anthropic empty-args tool calls and underscore-path project discovery. Truncated tool-input JSON now surfaces as a retryable parse error instead of emitting a phantom `args:{}` call, and eager/fine-grained tool streaming is gated behind a default-off flag. Project discovery reads the real cwd from ggcoder session headers, so projects whose path contains an underscore no longer vanish from the picker.
+  - @kenkaiiii/gg-ai@5.8.3
+  - @kenkaiiii/gg-agent@5.8.3
+  - @kenkaiiii/gg-core@5.8.3
+
+## 5.8.2
+
+### Patch Changes
+
+- Ship deferred MCP tools, leaner prompts, and smoother retry recovery for faster coding-agent turns.
+  - @kenkaiiii/gg-ai@5.8.2
+  - @kenkaiiii/gg-agent@5.8.2
+  - @kenkaiiii/gg-core@5.8.2
+
 ## 5.8.1
 
 ### Patch Changes

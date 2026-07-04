@@ -368,7 +368,11 @@ export async function* agentLoop(
 ): AsyncGenerator<AgentEvent, AgentResult> {
   const maxTurns = options.maxTurns ?? DEFAULT_MAX_TURNS;
   const maxContinuations = options.maxContinuations ?? 5;
-  const toolMap = new Map<string, AgentTool>((options.tools ?? []).map((t) => [t.name, t]));
+  // Rebuilt each turn: hosts may push tools onto the live `options.tools`
+  // array mid-run (background MCP connect, tool_search promotion) — the
+  // provider already sees them next turn via the shared array reference, so
+  // execution must resolve against the same up-to-date set.
+  let toolMap = new Map<string, AgentTool>((options.tools ?? []).map((t) => [t.name, t]));
 
   const totalUsage: Usage = { inputTokens: 0, outputTokens: 0 };
   let turn = 0;
@@ -406,6 +410,13 @@ export async function* agentLoop(
   // cheap "transient glitch" case) before paying for a full response round-trip.
   const STALL_RETRIES_BEFORE_NON_STREAMING = 2;
   const STALL_DELAY_MS = 1_000; // Brief pause before retry -- just enough to avoid tight loops
+  // Minimum streamed text worth preserving across a transport-failure retry.
+  // Below this, replaying the turn is cheaper than the extra history messages.
+  const MIN_PARTIAL_PRESERVE_CHARS = 200;
+  const PARTIAL_CONTINUATION_PROMPT =
+    "[Your previous response was cut off by a connection failure. The text " +
+    "above is what was already delivered to the user. Continue exactly from " +
+    "where it stopped — do not repeat or restart it.]";
   const OVERLOAD_BASE_DELAY_MS = 2_000;
   const OVERLOAD_MAX_DELAY_MS = 30_000;
   const STREAM_FIRST_EVENT_TIMEOUT_MS = 45_000; // 45s to get first event (Opus thinks long)
@@ -463,6 +474,7 @@ export async function* agentLoop(
     while (turn < maxTurns) {
       options.signal?.throwIfAborted();
       turn++;
+      toolMap = new Map((options.tools ?? []).map((t) => [t.name, t]));
 
       // Estimate message payload size for diagnostics.
       // Gated behind _diagFn — the char-counting loop is O(n) over the
@@ -541,6 +553,9 @@ export async function* agentLoop(
       let toolcallDeltaCount = 0;
       let runawayDetected: { kind: "chars" | "events"; chars: number; events: number } | null =
         null;
+      // Text streamed this attempt — preserved across transport-failure retries
+      // instead of being discarded and re-billed (see the retry branch below).
+      let attemptText = "";
       // Track consumer processing time — helps distinguish "API stopped sending"
       // from "our consumer was slow to pull the next event"
       let lastYieldEndTime = Date.now();
@@ -729,6 +744,7 @@ export async function* agentLoop(
             idleTimer = null;
           }
           if (event.type === "text_delta") {
+            attemptText += event.text;
             yield { type: "text_delta" as const, text: event.text };
           } else if (event.type === "thinking_delta") {
             yield { type: "thinking_delta" as const, text: event.text };
@@ -977,6 +993,22 @@ export async function* agentLoop(
             });
           }
           const delayMs = Math.min(STALL_DELAY_MS * 2 ** (stallRetries - 1), 8_000);
+          // Preserve partial output: everything streamed before the drop is
+          // already paid for (output tokens) and already shown to the user.
+          // Keep it as a completed assistant message + continuation instruction
+          // instead of replaying the whole turn from scratch (bench/RESULTS.md,
+          // bench C — replay re-bills 100% of pre-drop output). Skipped when a
+          // tool call was mid-stream: partial tool-call JSON is unusable, and
+          // the model must re-issue the call intact on the replay.
+          let preservedChars = 0;
+          if (attemptText.length >= MIN_PARTIAL_PRESERVE_CHARS && toolcallDeltaCount === 0) {
+            messages.push({
+              role: "assistant" as const,
+              content: [{ type: "text" as const, text: attemptText }],
+            });
+            messages.push({ role: "user" as const, content: PARTIAL_CONTINUATION_PROMPT });
+            preservedChars = attemptText.length;
+          }
           diag("retry", {
             reason: cause,
             attempt: stallRetries,
@@ -984,6 +1016,7 @@ export async function* agentLoop(
             delayMs,
             events: streamEventCount,
             nonStreaming: useNonStreamingFallback,
+            preservedChars,
           });
           yield {
             type: "retry" as const,
@@ -992,6 +1025,7 @@ export async function* agentLoop(
             maxAttempts: MAX_STALL_RETRIES,
             delayMs,
             silent: stallRetries <= 2,
+            ...(preservedChars > 0 ? { preservedChars } : {}),
           };
           await abortableSleep(delayMs, options.signal);
           turn--; // Don't count the failed turn

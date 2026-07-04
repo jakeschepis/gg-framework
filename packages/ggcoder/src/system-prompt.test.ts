@@ -246,6 +246,27 @@ describe("buildSystemPrompt", () => {
     expect(tools.length).toBeLessThan(950);
   });
 
+  it("routes public-code research guidance through tool_search when MCP tools are deferred", async () => {
+    const cwd = await makeProject();
+    // Deferred MCP loading: kencode tools live in the catalog, tool_search is active.
+    const deferred = await buildSystemPrompt(cwd, undefined, false, undefined, [
+      "read",
+      "bash",
+      "tool_search",
+    ]);
+    // Research section must not name tools the model can't call yet…
+    expect(deferred).not.toContain("SearchCode literal text/RE2");
+    expect(deferred).not.toContain("ReferenceSources");
+    // …and must point discovery at tool_search instead (research + tools hint).
+    expect(deferred).toContain("call `tool_search` first");
+    expect(deferred).toContain("Check the catalog BEFORE concluding");
+
+    // Neither kencode nor tool_search active: the public-code sentence is omitted.
+    const bare = await buildSystemPrompt(cwd, undefined, false, undefined, ["read", "bash"]);
+    expect(bare).not.toContain("SearchCode literal text/RE2");
+    expect(bare).not.toContain("tool_search");
+  });
+
   it("measures representative system prompt sizes", async () => {
     const normalCwd = await makeProject();
     const normalToolNames = [

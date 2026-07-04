@@ -97,12 +97,22 @@ async function renderApprovedPlanSection(
   );
 }
 
-function renderResearchSection(): string {
+function renderResearchSection(toolNames: readonly string[] | undefined): string {
+  const active = new Set(toolNames ?? DEFAULT_TOOL_NAMES);
+  // The public-code guidance references the kencode-search MCP tools by name.
+  // With deferred MCP loading those live in the tool_search catalog until
+  // promoted — so point at discovery instead of naming tools the model can't
+  // call yet. Never reference an unavailable tool.
+  const publicCode = active.has("mcp__kencode-search__searchCode")
+    ? `For public code, use ReferenceSources for curated repos or DiscoverRepos for current/top repos, then verify exact snippets with SearchCode literal text/RE2 (not semantic); \`path\` is a literal path substring and \`repo\` only after broad/peek proof. `
+    : active.has("tool_search")
+      ? `For public GitHub code and design references, call \`tool_search\` first (e.g. "search public code" or "UI design screens") — it unlocks the matching tools for your next step. `
+      : "";
   return (
     `## Research & Verification\n\n` +
     `Your training data has a cutoff; the real current date is the final line of this prompt. Assume your knowledge of library versions, APIs, CLI flags, config schema, defaults, and best practices has changed since then — treat it as a stale hint to verify, never as ground truth. ` +
     `Do not rely on memory for APIs, CLI flags, config schema, internals, or error wording — verify first. Use \`source_path\` for installed deps and inspect with read/grep/find/ls; use \`web_search\` then \`web_fetch\` for authoritative docs. ` +
-    `For public code, use ReferenceSources for curated repos or DiscoverRepos for current/top repos, then verify exact snippets with SearchCode literal text/RE2 (not semantic); \`path\` is a literal path substring and \`repo\` only after broad/peek proof. ` +
+    publicCode +
     `Run targeted checks when they are relevant to the change; read/fix failures; never report unrun or failing checks as passing.`
   );
 }
@@ -201,7 +211,7 @@ export async function buildSystemPrompt(
   const approvedPlanSection = await renderApprovedPlanSection(approvedPlanPath);
   if (approvedPlanSection) sections.push(approvedPlanSection);
 
-  sections.push(renderResearchSection(), renderCodeQualitySection());
+  sections.push(renderResearchSection(toolNames), renderCodeQualitySection());
 
   const toolsSection = renderToolsSection(toolNames);
   if (toolsSection) sections.push(toolsSection);

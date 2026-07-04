@@ -191,7 +191,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   // ── Event-machine private refs (used nowhere outside this hook) ──
   const streamingIdRef = useRef<number | null>(null);
   const pendingChunksRef = useRef<string>("");
-  const rafIdRef = useRef<number | null>(null);
+  const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Transcript id of the active sub-agent group for this run (null until the
   // first subagent spawns). Lets later parallel agents join the same in-chat
   // feed instead of each opening a fresh block.
@@ -217,10 +217,13 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   const planReviewContentRef = useRef<string | null>(null);
 
   // Streaming deltas arrive faster than React can usefully render each one.
-  // We buffer chunks in a ref and flush once per animation frame (~16ms),
-  // reducing re-renders by 5-10× with no visible difference.
+  // We buffer chunks in a ref and flush every 100ms — imperceptible for prose
+  // but roughly halves streaming render CPU vs per-frame flushing, since the
+  // Markdown re-render dominates and CPU scales with flush count
+  // (bench/RESULTS.md, bench B). First token still paints immediately.
+  const STREAM_FLUSH_MS = 100;
   const flushChunks = useCallback(() => {
-    rafIdRef.current = null;
+    flushTimerRef.current = null;
     const chunk = pendingChunksRef.current;
     if (!chunk) return;
     pendingChunksRef.current = "";
@@ -243,10 +246,10 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
         streamingIdRef.current = id;
         setItems((prev) => [...prev, { kind: "assistant", id, text }]);
       } else {
-        // Subsequent tokens: buffer and flush via rAF
+        // Subsequent tokens: buffer and flush on the 100ms timer
         pendingChunksRef.current += text;
-        if (rafIdRef.current === null) {
-          rafIdRef.current = requestAnimationFrame(flushChunks);
+        if (flushTimerRef.current === null) {
+          flushTimerRef.current = setTimeout(flushChunks, STREAM_FLUSH_MS);
         }
       }
     },
@@ -255,11 +258,11 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
 
   // Flush any pending buffered text and end the current streaming section.
   // Called whenever streaming transitions to tool calls, a new prompt, etc.
-  // Without this, the last few buffered tokens (waiting for rAF) would be lost.
+  // Without this, the last few buffered tokens (waiting for the timer) would be lost.
   const endStreamingText = useCallback(() => {
-    if (rafIdRef.current !== null) {
-      cancelAnimationFrame(rafIdRef.current);
-      rafIdRef.current = null;
+    if (flushTimerRef.current !== null) {
+      clearTimeout(flushTimerRef.current);
+      flushTimerRef.current = null;
     }
     if (pendingChunksRef.current) {
       const chunk = pendingChunksRef.current;

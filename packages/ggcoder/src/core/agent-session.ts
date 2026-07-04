@@ -48,6 +48,8 @@ import {
 } from "../tools/index.js";
 import type { BackgroundProcess } from "./process-manager.js";
 import { MCPClientManager, getAllMcpServers } from "./mcp/index.js";
+import { DeferredToolCatalog } from "./mcp/deferred-catalog.js";
+import { createToolSearchTool } from "../tools/tool-search.js";
 import { log } from "./logger.js";
 import { setEstimatorModel } from "./compaction/token-estimator.js";
 import { discoverAgents } from "./agents.js";
@@ -249,6 +251,8 @@ export class AgentSession {
   private processManager?: ProcessManager;
   private lspManager?: LspManager;
   private mcpManager?: MCPClientManager;
+  /** Deferred MCP tools awaiting discovery via tool_search (bench A win). */
+  private mcpCatalog?: DeferredToolCatalog;
   private provider: Provider;
   private model: string;
   private cwd: string;
@@ -533,7 +537,7 @@ export class AgentSession {
       const mcpTools = this.opts.allowedTools
         ? connected.filter((t) => this.isToolAllowed(t.name))
         : connected;
-      this.tools.push(...mcpTools);
+      this.addMcpTools(mcpTools);
       // Background connect resolves AFTER initialize() has already built the
       // system prompt (the default path awaits this before buildSystemPrompt,
       // so its prompt already lists the tools). Refresh messages[0] so the
@@ -550,6 +554,33 @@ export class AgentSession {
         "WARN",
         "mcp",
         `MCP initialization failed: ${err instanceof Error ? err.message : String(err)}`,
+      );
+    }
+  }
+
+  /**
+   * Route freshly connected MCP tools: deferred into the tool_search catalog
+   * (default — keeps ~8k tokens of schema out of every cache-miss turn, see
+   * bench/RESULTS.md bench A) or pushed eagerly when the user opted out.
+   * Allow-listed sessions (Ken) always get the eager path — their fixed tool
+   * expectations predate the catalog, and tool_search isn't allow-listed.
+   * Promotion pushes onto the live `this.tools` array the running agent loop
+   * re-reads every turn, so promoted tools are callable on the next step.
+   */
+  private addMcpTools(mcpTools: AgentTool[]): void {
+    if (mcpTools.length === 0) return;
+    const defer = !this.opts.allowedTools && this.settingsManager.get("deferredMcpTools");
+    if (!defer) {
+      this.tools.push(...mcpTools);
+      return;
+    }
+    this.mcpCatalog ??= new DeferredToolCatalog();
+    this.mcpCatalog.add(mcpTools);
+    if (!this.tools.some((t) => t.name === "tool_search")) {
+      this.tools.push(
+        createToolSearchTool(this.mcpCatalog, (promoted) => {
+          this.tools.push(...promoted);
+        }),
       );
     }
   }
@@ -1044,7 +1075,11 @@ export class AgentSession {
           // Use getAllMcpServers so user-configured servers survive the reconnect.
           const servers = await getAllMcpServers(this.provider, apiKey, this.cwd);
           const mcpTools = await this.mcpManager.connectAll(servers);
-          this.tools.push(...mcpTools);
+          // Drop stale MCP tools from both the live set and deferred catalog before
+          // re-adding. Some tools may already have been promoted out of the catalog.
+          this.tools = this.tools.filter((t) => !t.name.startsWith("mcp__"));
+          this.mcpCatalog?.removeWhere((name) => name.startsWith("mcp__"));
+          this.addMcpTools(mcpTools);
         } catch (err) {
           log(
             "WARN",

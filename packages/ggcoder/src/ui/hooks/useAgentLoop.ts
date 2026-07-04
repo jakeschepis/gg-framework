@@ -410,12 +410,16 @@ export function useAgentLoop(
         let wasAborted = false;
 
         // Throttled streaming text flush — accumulate deltas in refs (zero-cost),
-        // only call setState at ~16ms intervals to avoid saturating the event loop
-        // with React renders during fast token streaming.
+        // only call setState at 100ms intervals to avoid saturating the event
+        // loop with React renders during fast token streaming. 100ms (10fps) is
+        // imperceptible for prose but cuts streaming render CPU ~49% vs 16ms
+        // (bench/RESULTS.md, bench B — the Markdown re-render dominates, so CPU
+        // scales with flush count, not delta count). Worst case it adds 100ms
+        // to the first visible token — noise next to seconds of provider TTFT.
         let streamFlushTimer: ReturnType<typeof setTimeout> | null = null;
         let streamTextDirty = false;
         let streamThinkingDirty = false;
-        const STREAM_FLUSH_MS = 16; // ~1 frame at 60fps
+        const STREAM_FLUSH_MS = 100;
 
         // ── Diagnostic timing markers (perceived-TTFB investigation) ──
         // Track the four points along the path: run start → first thinking
@@ -902,27 +906,34 @@ export function useAgentLoop(
                 setStallError(event.error.message);
                 break;
 
-              case "retry":
+              case "retry": {
                 // The stream restarts from scratch on retry — the provider
                 // will re-emit text from the beginning. Without clearing
                 // the accumulated buffers, the retry's deltas append to the
                 // aborted attempt's partial text, producing a visible
                 // duplicate (e.g. "Now I'll work on this..Now I'll work on this..").
+                // EXCEPTION: preserved retries (preservedChars > 0) continue
+                // from the partial — the loop kept the streamed text in message
+                // history, so the on-screen text must stay and the continuation
+                // deltas append to it. Thinking always rolls back (never preserved).
+                const preserved = (event.preservedChars ?? 0) > 0;
                 if (streamFlushTimer) {
                   clearTimeout(streamFlushTimer);
                   streamFlushTimer = null;
                 }
-                textVisibleRef.current = "";
+                if (!preserved) {
+                  textVisibleRef.current = "";
+                  charCountRef.current = 0;
+                  streamTextDirty = false;
+                  setStreamingText("");
+                }
                 thinkingBufferRef.current = "";
                 thinkingVisibleRef.current = "";
-                charCountRef.current = 0;
-                streamTextDirty = false;
                 streamThinkingDirty = false;
-                setStreamingText("");
                 setStreamingThinking("");
                 // Let the UI roll back pending progressive flushes from the
                 // aborted attempt before the retry's new stream starts.
-                onRetry?.();
+                if (!preserved) onRetry?.();
                 // Hidden retries (silent) don't update the UI — the user
                 // only sees retry indicators after silent attempts are exhausted.
                 if (!event.silent) {
@@ -937,6 +948,7 @@ export function useAgentLoop(
                   });
                 }
                 break;
+              }
 
               case "turn_end": {
                 // Flush any throttled streaming text before processing turn end
