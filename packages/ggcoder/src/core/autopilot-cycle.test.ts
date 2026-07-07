@@ -2,6 +2,8 @@ import { describe, it, expect, vi } from "vitest";
 import {
   driveAutopilotCycle,
   buildPlanRevisionPrompt,
+  frameAutopilotInjection,
+  AUTOPILOT_INJECTION_PREAMBLE,
   AUTOPILOT_PLAN_DRAFTING_REASON,
   type AutopilotCycleDeps,
   type AutopilotCycleEmit,
@@ -75,6 +77,19 @@ function pendingFlag(initial = true): { get: () => boolean; set: (v: boolean) =>
   let value = initial;
   return { get: () => value, set: (v) => (value = v) };
 }
+
+describe("frameAutopilotInjection", () => {
+  it("prepends the autopilot preamble and preserves the body verbatim", () => {
+    const framed = frameAutopilotInjection("Add a test for the login flow.");
+    expect(framed.startsWith(AUTOPILOT_INJECTION_PREAMBLE)).toBe(true);
+    expect(framed.endsWith("Add a test for the login flow.")).toBe(true);
+    expect(framed).toContain("no human is watching");
+  });
+
+  it("is deterministic so the run and the digest match-string stay in sync", () => {
+    expect(frameAutopilotInjection("do x")).toBe(frameAutopilotInjection("do x"));
+  });
+});
 
 describe("driveAutopilotCycle — work branch (unchanged behavior)", () => {
   it("ALL_CLEAR → autopilot_done, no injected run", async () => {

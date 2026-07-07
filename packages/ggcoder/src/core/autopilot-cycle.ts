@@ -30,6 +30,38 @@ import type { AutopilotVerdict } from "./autopilot-verdict.js";
 export const AUTOPILOT_PLAN_DRAFTING_REASON =
   "GG Coder is still drafting a plan (plan mode is active with nothing submitted). Finish or cancel the plan yourself; autopilot can't prompt a read-only session.";
 
+/** Situational-awareness preamble prepended to EVERY build-session run that
+ *  Autopilot Ken injects (fix prompts, plan-revision prompts, the post-approval
+ *  "implement it now" run). GG Coder otherwise can't tell an autopilot-injected
+ *  prompt from a human one — it lands as a plain user message — so it behaves as
+ *  if someone is watching: it may stop to ask permission for safe, already-
+ *  implied work (which only burns a review round, since no human is there) and
+ *  it may end a turn on "should work" instead of proving it. This tells it the
+ *  turn came from the automated reviewer, that no human is watching, so it must
+ *  self-verify and only surface genuine user-level decisions. NEVER prepended to
+ *  human-typed prompts — the sidecar applies it only at the autopilot cycle's
+ *  injection sites. */
+export const AUTOPILOT_INJECTION_PREAMBLE =
+  "[Autopilot] This turn was triggered by Ken, GG Coder's automated reviewer — " +
+  "not by a human, and no human is watching it land. So:\n" +
+  "- Prove your work before finishing: run the tests/build or screenshot the UI. " +
+  'Don\'t end on "should work" — nobody is here to catch a mistake, so verify it ' +
+  "yourself.\n" +
+  "- Don't stop to ask permission for work that's already implied by the original " +
+  "request and safe to do. Just do it and keep going.\n" +
+  "- Only surface a question when it needs a real human decision (a product/taste " +
+  "call, a destructive or irreversible action, a missing secret or external " +
+  "access). State it plainly and stop; Ken routes it to the user.\n\n" +
+  "Your instruction:";
+
+/** Prepend {@link AUTOPILOT_INJECTION_PREAMBLE} to a body destined for the build
+ *  session during an autopilot cycle. Deterministic so the sidecar can compute
+ *  the same framed string both when it runs the prompt AND when it records the
+ *  match-string Ken's digest uses to label the message as injected. */
+export function frameAutopilotInjection(body: string): string {
+  return `${AUTOPILOT_INJECTION_PREAMBLE}\n\n${body}`;
+}
+
 /** Prompt injected into the build session when Ken rejects a plan with
  *  feedback. Mirrors the webview's manual "Feedback" wording in spirit: the
  *  plan was not approved, revise it, resubmit via exit_plan. */

@@ -5,6 +5,7 @@ import type {
   KenTurnPayload,
 } from "./session-manager.js";
 import { STEERING_PREFIX } from "./steering.js";
+import { frameAutopilotInjection } from "./autopilot-cycle.js";
 import {
   normalizeAutopilotMarkersForHistory,
   normalizeAppMarkersForHistory,
@@ -70,6 +71,12 @@ describe("restoreUserRow", () => {
   it("strips the mid-run steering wrapper so queued prompts resume clean", () => {
     const row = restoreUserRow(`${STEERING_PREFIX}also add dark mode`);
     expect(row.text).toBe("also add dark mode");
+  });
+
+  it("strips the autopilot preamble so injected prompts resume as the clean body", () => {
+    const row = restoreUserRow(frameAutopilotInjection("Add a test for the login flow."));
+    expect(row.text).toBe("Add a test for the login flow.");
+    expect(row.text).not.toContain("[Autopilot]");
   });
 
   it("drops attachment notes and the attached-files block, keeps typed text + images", () => {

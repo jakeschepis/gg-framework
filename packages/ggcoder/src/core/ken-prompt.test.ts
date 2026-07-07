@@ -66,6 +66,25 @@ describe("buildKenAutopilotSystemPrompt — verdict contract", () => {
     expect(prompt).toContain("Ken autopilot (injected)");
   });
 
+  it("kills the standalone why — reasons live only inside a PROMPT body", () => {
+    // Drift regression: chat Ken is trained to drop a one-line reason before a
+    // prompt; autopilot Ken carried that habit over and front-loaded reasoning
+    // prose before the keyword, which parsed as a HUMAN stop and stalled the
+    // cycle. The contract must name the habit and give the why exactly one
+    // legal home: inside the PROMPT body, only when GG Coder needs it.
+    expect(prompt).toContain("NOT ");
+    expect(prompt).toContain("no audience for a why");
+    expect(prompt).toContain("Never justify your verdict");
+    expect(prompt).toContain("INSIDE a PROMPT body");
+    expect(prompt).toContain("when GG Coder itself needs it");
+  });
+
+  it("shows a contrastive WRONG/RIGHT example of the drift", () => {
+    // Models obey a wrong→right pair better than prohibitions alone.
+    expect(prompt).toContain("WRONG — reasoning before the keyword");
+    expect(prompt).toContain("RIGHT — keyword first");
+  });
+
   it("forbids commentary before or after the keyword line", () => {
     // Leak regression: Ken once prefaced ALL_CLEAR with a recap/opinion ("The
     // label is now a plain non-clickable span... Typecheck passed.\nALL_CLEAR"),
@@ -83,6 +102,36 @@ describe("buildKenSystemPrompt — chat mode unaffected", () => {
     expect(prompt).toContain("Send to GG Coder");
     // The verdict contract is autopilot-only.
     expect(prompt).not.toContain("ALL_CLEAR");
+  });
+});
+
+describe("GG Coder capabilities — both modes know what the executor can do", () => {
+  it("teaches Ken GG Coder's real toolset in chat AND autopilot", async () => {
+    // Ken directs GG Coder, so both prompts must ground his instructions in the
+    // executor's actual capabilities (plan mode, subagents, bash, screenshots),
+    // not leave him guessing from the transcript.
+    for (const prompt of [
+      await buildKenSystemPrompt(TEST_CWD),
+      await buildKenAutopilotSystemPrompt(TEST_CWD),
+    ]) {
+      expect(prompt).toContain("What GG Coder can do");
+      expect(prompt).toContain("enter_plan");
+      expect(prompt).toContain("subagents");
+      expect(prompt).toContain("bash");
+      expect(prompt).toContain("screenshot");
+    }
+  });
+
+  it("draws the boundary: Ken's own tools check, GG Coder's tools build", async () => {
+    // Ken should verify facts with his own read-only tools before delegating,
+    // not send GG Coder to find out something he could confirm faster himself.
+    for (const prompt of [
+      await buildKenSystemPrompt(TEST_CWD),
+      await buildKenAutopilotSystemPrompt(TEST_CWD),
+    ]) {
+      expect(prompt).toContain("Check with your own eyes first");
+      expect(prompt).toContain("then delegate the real work");
+    }
   });
 });
 

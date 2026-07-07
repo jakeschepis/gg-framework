@@ -38,7 +38,7 @@ import {
   isMechanicalOnlyTurn,
   type WorkflowCommandSpec,
 } from "./core/autopilot-gate.js";
-import { driveAutopilotCycle } from "./core/autopilot-cycle.js";
+import { driveAutopilotCycle, frameAutopilotInjection } from "./core/autopilot-cycle.js";
 import { validateKenModelPref, effectiveKenModel, type KenModelPref } from "./core/ken-model.js";
 import type { KenTurnPayload, AppMarkerPayload } from "./core/session-manager.js";
 import {
@@ -1060,6 +1060,35 @@ async function createSession(
     for (const c of clients) c.res.write(frame);
   }
 
+  // Replace CLI-specific guidance (slash commands, CLI tool names) with
+  // desktop-app equivalents so the webview never shows "run ggcoder login".
+  function desktopGuidance(guidance: string): string {
+    return (
+      guidance
+        // Auth: ggcoder login → Login to AI Providers button
+        .replaceAll(/Run `ggcoder login`/gi, "Use the Login to AI Providers button")
+        .replaceAll(/ggcoder login/gi, "the Login to AI Providers button")
+        // /compact: rewrite the full sentence pattern
+        .replaceAll(
+          /Run \/compact to shrink history, or start a new session\./gi,
+          "Compact the context to shrink history, or start a new session.",
+        )
+        // /model: handle each phrasing pattern
+        .replaceAll(
+          /switch to claude-fable-5 with \/model/gi,
+          "switch to claude-fable-5 using the model selector",
+        )
+        .replaceAll(/Switch with \/model\./gi, "Switch using the model selector.")
+        .replaceAll(
+          /try a different model with \/model\./gi,
+          "try a different model using the model selector.",
+        )
+        .replaceAll(/Use \/model to switch/gi, "Use the model selector to switch")
+        // /help
+        .replaceAll(/see \/help/gi, "check the help menu")
+    );
+  }
+
   // Turn any thrown value into the same clear headline/message/guidance shape
   // the TUI shows (see gg-ai's formatError) instead of a bare `err.message`, log
   // the full detail, and broadcast it under `type` ("error" or "ken_error").
@@ -1072,6 +1101,7 @@ async function createSession(
     err: unknown,
   ): void {
     const f = formatError(err);
+    const guidance = desktopGuidance(f.guidance);
     log("ERROR", "app-sidecar", logLabel, {
       headline: f.headline,
       source: f.source,
@@ -1083,7 +1113,7 @@ async function createSession(
     broadcast(type, {
       headline: f.headline,
       ...(f.message ? { message: f.message } : {}),
-      guidance: f.guidance,
+      guidance,
       ...(f.provider ? { provider: f.provider } : {}),
       ...(f.statusCode != null ? { statusCode: f.statusCode } : {}),
       ...(f.resetsAt != null ? { resetsAt: f.resetsAt } : {}),
@@ -1095,7 +1125,7 @@ async function createSession(
         scope: type,
         headline: f.headline,
         ...(f.message ? { message: f.message } : {}),
-        guidance: f.guidance,
+        guidance,
       })
       .catch(() => {});
   }
@@ -1644,8 +1674,15 @@ async function createSession(
           void session.persistAutopilotMarker("plan_approved");
           return true;
         },
-        runImplement: () =>
-          runAgent(IMPLEMENT_PLAN_PROMPT, () => session.prompt(IMPLEMENT_PLAN_PROMPT)),
+        runImplement: () => {
+          // Autopilot-injected run: frame it so GG Coder knows no human is
+          // watching the implementation. Record the framed string so Ken's
+          // digest labels it as injected, not as the user's ask. The run_start
+          // label stays the clean prompt.
+          const framed = frameAutopilotInjection(IMPLEMENT_PLAN_PROMPT);
+          injectedAutopilotPrompts.push(framed);
+          return runAgent(IMPLEMENT_PLAN_PROMPT, () => session.prompt(framed));
+        },
         // Lean context per user turn: wipe prior review history so each new
         // turn starts cheap, while within this cycle the few review messages
         // persist so Ken remembers what he already asked GG Coder to fix.
@@ -1663,11 +1700,17 @@ async function createSession(
           // resubmits via exit_plan, onExitPlan re-sets it (no-op for work-
           // branch injections, where nothing is pending).
           clearPendingPlan();
-          injectedAutopilotPrompts.push(body);
+          // Record the FRAMED string (what actually lands in the build session,
+          // see runPrompt) so Ken's digest matches and labels it as injected.
+          // The webview marker + persisted body stay the CLEAN prompt so the UI
+          // shows Ken's actual instruction, not the autopilot preamble.
+          injectedAutopilotPrompts.push(frameAutopilotInjection(body));
           broadcast("autopilot_prompted", { round, body });
           void session.persistAutopilotMarker("prompted", { body });
         },
-        runPrompt: (body) => runAgent(body, () => session.prompt(body)),
+        // Autopilot-injected run: GG Coder receives the framed prompt (no human
+        // is watching this turn) while run_start keeps the clean label.
+        runPrompt: (body) => runAgent(body, () => session.prompt(frameAutopilotInjection(body))),
         emit: (event) => {
           // Persist the terminal verdict marker so a resumed session renders the
           // same Ken bubble the live run showed instead of dropping it or

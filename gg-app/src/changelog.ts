@@ -22,6 +22,72 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.14.12",
+    date: "2026-07-07",
+    items: [
+      "Error messages finally speak desktop. When something goes wrong, the app now tells you exactly what to click instead of spitting out terminal commands you'd never run anyway. Clean, clear, and to the point.",
+    ],
+  },
+  {
+    version: "0.14.11",
+    date: "2026-07-07",
+    items: [
+      "Kencode search is back. My code search engine that digs through millions of real repositories was silently failing to start inside the app, and every session quietly lost it. I traced it deep into the build pipeline, fixed it at the root, and confirmed live searches flow again.",
+      "I also wired a tripwire into every future build that refuses to ship if this ever breaks again. You get the fix today and the insurance forever.",
+    ],
+  },
+  {
+    version: "0.14.10",
+    date: "2026-07-06",
+    items: [
+      "Edits just got surgical. I taught the agent to pin the exact lines it wants to change with tiny fingerprints instead of retyping your code, so edits land right the first time, burn fewer tokens, and can never scribble over a file that changed under its feet. On repetitive code it now says in 39 tokens what used to take 160.",
+      "The agent's terminal grew a memory. Multi-step shell work can now run in one living session where cd, environment variables, and setup carry over between commands. Less repeating itself, more getting things done.",
+      "I benchmarked all of this against a live model before shipping it. Equal or better accuracy, faster on almost every task, cheaper on every one. Receipts, not vibes.",
+    ],
+  },
+  {
+    version: "0.14.9",
+    date: "2026-07-06",
+    items: [
+      "Your session list is yours again. Ken's silent autopilot reviews were quietly leaving behind a fake 2-message session every few minutes, burying your real work under a wall of clones. I plugged the leak for good, so what you see in the picker is exactly what you built. Nothing else.",
+      "Autopilot got tougher to derail. When Ken hands GG Coder the next move, the app now catches his instruction even when he wraps it in chatter, so autopilot keeps rolling instead of stopping to ask you about something it could handle itself.",
+      "I also drilled Ken on keeping his reviews clean and machine-tight, so autopilot cycles run leaner and stall less.",
+    ],
+  },
+  {
+    version: "0.14.8",
+    date: "2026-07-05",
+    items: [
+      "Your search and tool helpers just went on a diet. Each one used to drag along a chunky launcher that ate around 90 MB for no reason, and with a few windows open that really added up. I taught GG Coder to run the real thing directly and skip the dead weight, so you get the same power for a fraction of the memory.",
+      "This covers every tool, not just mine. Whatever MCP tools you plug in, they now start lean instead of hauling that extra baggage, so your machine stays snappy no matter how loaded up you get.",
+    ],
+  },
+  {
+    version: "0.14.7",
+    date: "2026-07-05",
+    items: [
+      "Your machine breathes easier now. GG Coder used to leave stray search and tool helpers running every time you closed a project, and they quietly piled up and ate your memory for days. I taught it to hunt down every one of those leftovers on startup, no matter which tools you plugged in, so your RAM stays yours.",
+      "This works for any tool you add, not just the ones I ship. However exotic your setup gets, GG Coder now cleans up after itself instead of slowly bogging down your computer in the background.",
+      "Ken gives sharper advice. He now knows exactly what GG Coder can do under the hood, so his guidance is grounded in the real tools at hand instead of guesses, and his handoffs back to the agent come through clean.",
+    ],
+  },
+  {
+    version: "0.14.6",
+    date: "2026-07-05",
+    items: [
+      "Autopilot just got a lot more independent. When Ken sends GG Coder back in, it now knows nobody is looking over its shoulder, so it proves its own work before calling it done instead of stopping to check with a human who isn't there.",
+      "Fewer pointless pauses. GG Coder stops asking permission for the obvious next step when it's already clear what you want, so autopilot keeps moving and finishes more in one run.",
+    ],
+  },
+  {
+    version: "0.14.5",
+    date: "2026-07-04",
+    items: [
+      "Your research helpers just got faster and cheaper. When GG Coder sends a scout off to read your code or dig through the project, I now put it on the quickest model for the job. Answers come back sooner and cost you less.",
+      "No tradeoff on quality. The helpers that actually change your code still run on the big brain, so your edits stay sharp while the quick lookups fly.",
+    ],
+  },
+  {
     version: "0.14.4",
     date: "2026-07-03",
     items: [

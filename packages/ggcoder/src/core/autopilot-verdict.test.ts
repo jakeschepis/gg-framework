@@ -114,11 +114,70 @@ describe("parseAutopilotVerdict", () => {
     expect(parseAutopilotVerdict(reply)).toEqual({ kind: "ignore" });
   });
 
-  it("does NOT recover a PROMPT or HUMAN keyword from a later line — only bare ALL_CLEAR/IGNORE", () => {
-    // PROMPT/HUMAN carry a payload that can't be safely recovered from an
-    // arbitrary position in surrounding prose, so this still falls to human.
+  it("recovers a buried PROMPT with the body on following lines", () => {
     const reply = "Some commentary about the change.\nPROMPT\nFix the bug.";
+    expect(parseAutopilotVerdict(reply)).toEqual({ kind: "prompt", body: "Fix the bug." });
+  });
+
+  it("recovers a buried PROMPT with an inline body (the real drift shape)", () => {
+    // The exact drift that stalled a live autopilot cycle: reasoning prose
+    // first, then `PROMPT <body>` on one line — used to parse as a HUMAN stop
+    // and dump the whole reply into the chat as a Ken bubble.
+    const reply =
+      "The diagnosis is solid and confirmed on disk. The fix is mechanically " +
+      "implied by the original ask. Safe to proceed without new user input.\n" +
+      "PROMPT Apply the fix: guard AgentSession.compact() on this.opts.transient.";
+    const v = parseAutopilotVerdict(reply);
+    expect(v.kind).toBe("prompt");
+    if (v.kind === "prompt") {
+      expect(v.body).toBe("Apply the fix: guard AgentSession.compact() on this.opts.transient.");
+    }
+  });
+
+  it("never matches lowercase or mid-line 'prompt' prose as a buried PROMPT", () => {
+    // Buried recovery is uppercase + line-start only — casual prose mentioning
+    // "prompt" after an unrecognized first line must stay a HUMAN stop.
+    expect(
+      parseAutopilotVerdict("Waiting on input.\nprompt the user for their API key first.").kind,
+    ).toBe("human");
+    expect(
+      parseAutopilotVerdict("Unclear ask.\nWe should write a prompt for GG Coder here.").kind,
+    ).toBe("human");
+  });
+
+  it("prefers a buried HUMAN over a buried PROMPT — stops beat actions on ties", () => {
+    const reply = "Recap first.\nPROMPT Fix the thing.\nHUMAN\nActually the user must decide.";
     const v = parseAutopilotVerdict(reply);
     expect(v.kind).toBe("human");
+    if (v.kind === "human") expect(v.reason).toBe("Actually the user must decide.");
+  });
+
+  it("downgrades a buried bare PROMPT with no body to human", () => {
+    const v = parseAutopilotVerdict("Recap of what happened.\nPROMPT");
+    expect(v.kind).toBe("human");
+  });
+
+  it("recovers a buried HUMAN, dropping the leading reasoning prose", () => {
+    // Ken drifted: he wrote his whole recap first, THEN the verdict. Recover the
+    // reason after the keyword and drop the prose — HUMAN stops either way.
+    const reply =
+      "The screenshot shows a clean squared inward spiral that matches the " +
+      "reference. Tests green. GG Coder asked whether to dress it up with art — " +
+      "that's a taste/product call the user should own.\nHUMAN\nStructural spiral " +
+      "is done; dressing it up with art is a taste call only you can make.";
+    const v = parseAutopilotVerdict(reply);
+    expect(v.kind).toBe("human");
+    if (v.kind === "human") {
+      expect(v.reason).toBe(
+        "Structural spiral is done; dressing it up with art is a taste call only you can make.",
+      );
+      expect(v.reason).not.toContain("The screenshot shows");
+    }
+  });
+
+  it("gives a buried bare HUMAN with no trailing reason the default reason", () => {
+    const v = parseAutopilotVerdict("Long recap of the work with no verdict payload.\nHUMAN");
+    expect(v.kind).toBe("human");
+    if (v.kind === "human") expect(v.reason.length).toBeGreaterThan(0);
   });
 });

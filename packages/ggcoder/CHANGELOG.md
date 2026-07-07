@@ -1,5 +1,71 @@
 # @kenkaiiii/ggcoder
 
+## 5.9.1
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/gg-ai@5.9.1
+  - @kenkaiiii/gg-agent@5.9.1
+  - @kenkaiiii/gg-core@5.9.1
+
+## 5.9.0
+
+### Minor Changes
+
+- Hash-anchored span edits and opt-in persistent bash session. The edit tool gains a `{ span, lines }` form: pin a line range by its line+hash anchors from a `read` with `anchors:true` and supply only the replacement lines — no retyping existing code, stale files rejected before any write. Benchmarked on Sonnet 5 at −19% output tokens overall and −76% on repetitive code, with equal correctness. The bash tool gains `persist: true`: commands run in a long-lived session shell where cd, env vars, and shell state survive across calls (~0.3ms vs ~6.4ms per-call overhead).
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.9.0
+- @kenkaiiii/gg-agent@5.9.0
+- @kenkaiiii/gg-core@5.9.0
+
+## 5.8.8
+
+### Patch Changes
+
+- Fix transient Ken sessions leaking to the session store (compact() and newSession() now respect the transient flag), harden autopilot verdict parsing to recover a buried line-start PROMPT keyword, and tighten Ken's autopilot contract so reasoning prose never precedes the verdict.
+  - @kenkaiiii/gg-ai@5.8.8
+  - @kenkaiiii/gg-agent@5.8.8
+  - @kenkaiiii/gg-core@5.8.8
+
+## 5.8.7
+
+### Patch Changes
+
+- Cut MCP server memory: resolve stdio servers to their real bin (via the npx on-demand cache and sole-bin matching) instead of falling back to the ~90 MB npx wrapper per connection. Covers non-bundled defaults like zai and any user-added MCP.
+  - @kenkaiiii/gg-ai@5.8.7
+  - @kenkaiiii/gg-agent@5.8.7
+  - @kenkaiiii/gg-core@5.8.7
+
+## 5.8.6
+
+### Patch Changes
+
+- Fix autopilot leaking the raw HUMAN verdict reason and teach Ken GG Coder's own capabilities so his guidance is grounded in what the tool can actually do.
+  - @kenkaiiii/gg-ai@5.8.6
+  - @kenkaiiii/gg-agent@5.8.6
+  - @kenkaiiii/gg-core@5.8.6
+
+## 5.8.5
+
+### Patch Changes
+
+- Autopilot now tells GG Coder when no human is watching: injected review prompts carry a situational-awareness preamble so the agent self-verifies its work and stops asking permission for safe, already-implied steps, while the transcript and resumed sessions still show Ken's clean instruction.
+  - @kenkaiiii/gg-ai@5.8.5
+  - @kenkaiiii/gg-agent@5.8.5
+  - @kenkaiiii/gg-core@5.8.5
+
+## 5.8.4
+
+### Patch Changes
+
+- Route read-only scout sub-agents (recon/research) to each provider's fast/cheap model via `costTier`, cutting sub-agent latency and spend with no quality risk. Writers and default sub-agents keep the parent model.
+  - @kenkaiiii/gg-ai@5.8.4
+  - @kenkaiiii/gg-agent@5.8.4
+  - @kenkaiiii/gg-core@5.8.4
+
 ## 5.8.3
 
 ### Patch Changes

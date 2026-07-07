@@ -5,6 +5,7 @@ import type {
   KenTurnPayload,
 } from "./session-manager.js";
 import { STEERING_PREFIX } from "./steering.js";
+import { AUTOPILOT_INJECTION_PREAMBLE } from "./autopilot-cycle.js";
 
 export interface HistoryAutopilotMarker extends AutopilotMarkerPayload {
   /** Stable seed derived from persisted marker data for deterministic UI copy. */
@@ -133,6 +134,17 @@ function stripSteering(text: string): string {
   return text.startsWith(STEERING_PREFIX) ? text.slice(STEERING_PREFIX.length) : text;
 }
 
+/** Strip the autopilot situational-awareness preamble that the sidecar prepends
+ *  to every autopilot-injected build-session run (see frameAutopilotInjection).
+ *  The live transcript shows the clean body via the autopilot "prompted" marker;
+ *  on resume the raw session message must render the same clean instruction, not
+ *  the machine-facing preamble. */
+function stripAutopilotPreamble(text: string): string {
+  return text.startsWith(AUTOPILOT_INJECTION_PREAMBLE)
+    ? text.slice(AUTOPILOT_INJECTION_PREAMBLE.length).trimStart()
+    : text;
+}
+
 function stripAttachedFilesBlock(text: string): string {
   if (text.startsWith(ATTACHED_FILES_HEADER)) return "";
   const idx = text.indexOf(`\n\n${ATTACHED_FILES_HEADER}`);
@@ -143,7 +155,7 @@ function stripAttachedFilesBlock(text: string): string {
 export function restoreUserRow(content: Message["content"]): RestoredUserRow {
   if (typeof content === "string") {
     return {
-      text: stripAttachedFilesBlock(stripSteering(content)).trim(),
+      text: stripAttachedFilesBlock(stripAutopilotPreamble(stripSteering(content))).trim(),
       images: [],
       videoWarning: false,
     };
@@ -157,7 +169,7 @@ export function restoreUserRow(content: Message["content"]): RestoredUserRow {
       continue;
     }
     if (c.type !== "text" || typeof c.text !== "string") continue;
-    const stripped = stripSteering(c.text);
+    const stripped = stripAutopilotPreamble(stripSteering(c.text));
     if (stripped.startsWith("[User attached a video file")) videoWarning = true;
     if (ATTACHMENT_NOTE_PATTERNS.some((re) => re.test(stripped))) continue;
     const cleaned = stripAttachedFilesBlock(stripped);

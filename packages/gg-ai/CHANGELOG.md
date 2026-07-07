@@ -1,5 +1,23 @@
 # @kenkaiiii/gg-ai
 
+## 5.9.1
+
+### Patch Changes
+
+- Fix error guidance to use desktop-app UI actions instead of CLI commands in the gg-app
+
+## 5.9.0
+
+## 5.8.8
+
+## 5.8.7
+
+## 5.8.6
+
+## 5.8.5
+
+## 5.8.4
+
 ## 5.8.3
 
 ## 5.8.2

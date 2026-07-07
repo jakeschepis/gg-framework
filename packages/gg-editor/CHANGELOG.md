@@ -1,5 +1,68 @@
 # Changelog
 
+## 0.7.72
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/gg-ai@5.9.1
+  - @kenkaiiii/gg-agent@5.9.1
+  - @kenkaiiii/ggcoder@5.9.1
+
+## 0.7.71
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/ggcoder@5.9.0
+  - @kenkaiiii/gg-ai@5.9.0
+  - @kenkaiiii/gg-agent@5.9.0
+
+## 0.7.70
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/ggcoder@5.8.8
+  - @kenkaiiii/gg-ai@5.8.8
+  - @kenkaiiii/gg-agent@5.8.8
+
+## 0.7.69
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/ggcoder@5.8.7
+  - @kenkaiiii/gg-ai@5.8.7
+  - @kenkaiiii/gg-agent@5.8.7
+
+## 0.7.68
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/ggcoder@5.8.6
+  - @kenkaiiii/gg-ai@5.8.6
+  - @kenkaiiii/gg-agent@5.8.6
+
+## 0.7.67
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/ggcoder@5.8.5
+  - @kenkaiiii/gg-ai@5.8.5
+  - @kenkaiiii/gg-agent@5.8.5
+
+## 0.7.66
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/ggcoder@5.8.4
+  - @kenkaiiii/gg-ai@5.8.4
+  - @kenkaiiii/gg-agent@5.8.4
+
 ## 0.7.65
 
 ### Patch Changes
