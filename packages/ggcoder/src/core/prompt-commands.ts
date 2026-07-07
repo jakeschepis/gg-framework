@@ -435,18 +435,57 @@ Report that /commit is now available with quality checks, an agent code review g
 
 You already know what you just built. For each file you created or modified, use \`mcp__kencode-search__searchCode\` to search for how real projects implement the same patterns. Look at the specific APIs, hooks, functions, and architecture you used.
 
-If you find something consistently done differently across real codebases, or something commonly included that you left out, report it:
+Do not edit files. This command creates follow-up tasks for real gaps.
+
+If you find something consistently done differently across real codebases, or something commonly included that you left out, record it as a finding:
 
 \`\`\`
 [MISSING/DIVERGENT/INCOMPLETE] file:line - What it is
 Wrote: What was implemented
 Real-world: What real projects do instead/additionally
 Evidence: kencode-search - pattern seen in X out of Y repos searched
+Fix: Concrete change needed in this project
 \`\`\`
 
 Style preferences and subjective improvements are not valid findings. Only report things backed by clear kencode-search evidence across multiple repos.
 
-If the code aligns well with real-world patterns, say so. That's a good outcome.`,
+For every valid finding, create one task using the tasks tool (action=add), ordered by impact. Each task must be self-contained so a separate fix agent can execute it with no extra context. Include in every task:
+
+- Finding type (MISSING / DIVERGENT / INCOMPLETE)
+- Exact local file path and line number
+- The specific API, hook, function, config, or architecture pattern compared
+- What this project wrote
+- What real projects do instead or additionally
+- The kencode-search evidence summary
+- The concrete fix to make, with real local names and files to read before editing
+- Relevant verification command(s)
+
+If a finding is too ambiguous to turn into a concrete task, list it as Skipped with the reason instead of creating a vague task.
+
+Final reply format:
+
+\`\`\`
+Compared: <files/patterns reviewed>
+Findings: <N>
+Tasks created: <N>
+Skipped: <N>
+\`\`\`
+
+Then one line per task:
+
+\`\`\`
+[MISSING] file:line — one sentence
+[DIVERGENT] file:line — one sentence
+[INCOMPLETE] file:line — one sentence
+\`\`\`
+
+Then any skipped findings:
+
+\`\`\`
+Skipped: file:line — reason
+\`\`\`
+
+If the code aligns well with real-world patterns, create no tasks and say so. That's a good outcome.`,
   },
   {
     name: "setup-skills",
