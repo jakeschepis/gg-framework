@@ -154,17 +154,16 @@ describe("model registry context windows", () => {
 
   it("registers a Code Assist-supported Gemini default", () => {
     expect(getDefaultModel("gemini")).toMatchObject({
-      id: "gemini-3.1-flash-lite-preview",
-      name: "Gemini 3.1 Flash Lite Preview",
+      id: "gemini-3.1-flash-lite",
+      name: "Gemini 3.1 Flash Lite",
       provider: "gemini",
     });
     expect(getModelsForProvider("gemini").map((model) => model.id)).toEqual([
-      "gemini-3.1-flash-lite-preview",
-      "gemini-3.5-flash",
+      "gemini-3.1-flash-lite",
+      "gemini-3-flash",
+      "gemini-3.1-pro-preview",
     ]);
-    expect(getContextWindow("gemini-3.1-flash-lite-preview", { provider: "gemini" })).toBe(
-      1_048_576,
-    );
-    expect(getContextWindow("gemini-3.5-flash", { provider: "gemini" })).toBe(1_048_576);
+    expect(getContextWindow("gemini-3.1-flash-lite", { provider: "gemini" })).toBe(1_048_576);
+    expect(getContextWindow("gemini-3-flash", { provider: "gemini" })).toBe(1_048_576);
   });
 });

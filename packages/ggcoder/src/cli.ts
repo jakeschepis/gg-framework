@@ -360,7 +360,7 @@ function main(): void {
 
   function getHardcodedDefault(p: string): string {
     if (p === "openai") return "gpt-5.5";
-    if (p === "gemini") return "gemini-3.1-flash-lite-preview";
+    if (p === "gemini") return "gemini-3.1-flash-lite";
     if (p === "glm") return "glm-5.2";
     if (p === "moonshot") return "kimi-k2.7-code";
     if (p === "minimax") return "MiniMax-M3";
@@ -815,7 +815,7 @@ async function runSessions(): Promise<void> {
 
   function getDefault(p: string): string {
     if (p === "openai") return "gpt-5.5";
-    if (p === "gemini") return "gemini-3.1-flash-lite-preview";
+    if (p === "gemini") return "gemini-3.1-flash-lite";
     if (p === "glm") return "glm-5.2";
     if (p === "moonshot") return "kimi-k2.7-code";
     if (p === "minimax") return "MiniMax-M3";

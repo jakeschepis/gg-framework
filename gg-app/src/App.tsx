@@ -54,6 +54,7 @@ import { LiveToolPanel, type LiveToolEntry } from "./LiveToolPanel";
 import { SubAgentFeed, type SubAgentLine } from "./SubAgentFeed";
 import { CompactionNotice } from "./CompactionNotice";
 import { ModelMenu } from "./ModelMenu";
+import { modelDisplayName } from "./model-name";
 import { SlashMenu } from "./SlashMenu";
 import { FileMentionMenu } from "./FileMentionMenu";
 import { ReferencedFiles, appendReferencedFiles, parseReferencedFiles } from "./ReferencedFiles";
@@ -416,6 +417,9 @@ function App(): React.ReactElement {
   const [thinkingStartTs, setThinkingStartTs] = useState<number | null>(null);
   const [thinkingAccumMs, setThinkingAccumMs] = useState(0);
   const [models, setModels] = useState<ModelOption[]>([]);
+  // Footer + menus show the friendly registry name (e.g. "Gemini 3.5 Flash"),
+  // not the raw wire id (e.g. "gemini-3-flash").
+  const modelName = (id: string | undefined | null): string => modelDisplayName(models, id);
   const [modelMenuOpen, setModelMenuOpen] = useState(false);
   const [kenModelMenuOpen, setKenModelMenuOpen] = useState(false);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
@@ -2335,7 +2339,7 @@ function App(): React.ReactElement {
                     setModelMenuOpen((o) => !o);
                   }}
                 >
-                  {state?.model ?? "\u2026"}
+                  {modelName(state?.model)}
                 </button>
               </span>
               <FooterSep />
@@ -2368,7 +2372,7 @@ function App(): React.ReactElement {
                     setKenModelMenuOpen((o) => !o);
                   }}
                 >
-                  {state?.kenModel ?? state?.model ?? "\u2026"}
+                  {modelName(state?.kenModel ?? state?.model)}
                 </button>
               </span>
             </span>

@@ -85,9 +85,9 @@ export function ModelMenu({
                 background: active ? theme.surface2 : "transparent",
               }}
               onClick={() => onSelect(m.id)}
-              title={m.provider}
+              title={`${m.provider} · ${m.id}`}
             >
-              {m.id}
+              {m.name}
             </button>
           );
         })}

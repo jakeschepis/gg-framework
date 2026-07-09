@@ -213,8 +213,8 @@ export const MODELS: ModelInfo[] = [
   },
   // ── Gemini ─────────────────────────────────────────────
   {
-    id: "gemini-3.1-flash-lite-preview",
-    name: "Gemini 3.1 Flash Lite Preview",
+    id: "gemini-3.1-flash-lite",
+    name: "Gemini 3.1 Flash Lite",
     provider: "gemini",
     contextWindow: 1_048_576,
     maxOutputTokens: 65_536,
@@ -226,7 +226,10 @@ export const MODELS: ModelInfo[] = [
     maxThinkingLevel: "high",
   },
   {
-    id: "gemini-3.5-flash",
+    // Wire name `gemini-3-flash` — the Code Assist (OAuth) backend rejects the
+    // display string `gemini-3.5-flash` with a 404, so gemini-cli keeps this
+    // alternative name (SECONDARY_GEMINI_3_5_FLASH_MODEL) for that endpoint.
+    id: "gemini-3-flash",
     name: "Gemini 3.5 Flash",
     provider: "gemini",
     contextWindow: 1_048_576,
@@ -236,6 +239,22 @@ export const MODELS: ModelInfo[] = [
     supportsVideo: true,
     maxVideoBytes: 20 * 1024 * 1024,
     costTier: "low",
+    maxThinkingLevel: "high",
+  },
+  {
+    // Gemini 3.1 Pro is public preview — gated behind Code Assist preview
+    // enablement, so free/personal OAuth accounts 404 on it (see
+    // ACCOUNT_GATED_MODELS in gg-ai's gemini provider).
+    id: "gemini-3.1-pro-preview",
+    name: "Gemini 3.1 Pro (Preview)",
+    provider: "gemini",
+    contextWindow: 1_048_576,
+    maxOutputTokens: 65_536,
+    supportsThinking: true,
+    supportsImages: true,
+    supportsVideo: true,
+    maxVideoBytes: 20 * 1024 * 1024,
+    costTier: "high",
     maxThinkingLevel: "high",
   },
   // ── Moonshot (Kimi) ────────────────────────────────────
@@ -451,7 +470,7 @@ export function getVideoByteLimit(modelId: string): number | undefined {
 export function getDefaultModel(provider: Provider): ModelInfo {
   if (provider === "xiaomi") return MODELS.find((m) => m.id === "mimo-v2.5-pro")!;
   if (provider === "openai") return MODELS.find((m) => m.id === "gpt-5.5")!;
-  if (provider === "gemini") return MODELS.find((m) => m.id === "gemini-3.1-flash-lite-preview")!;
+  if (provider === "gemini") return MODELS.find((m) => m.id === "gemini-3.1-flash-lite")!;
   if (provider === "glm") return MODELS.find((m) => m.id === "glm-5.2")!;
   if (provider === "moonshot") return MODELS.find((m) => m.id === "kimi-k2.7-code")!;
   if (provider === "minimax") return MODELS.find((m) => m.id === "MiniMax-M3")!;
