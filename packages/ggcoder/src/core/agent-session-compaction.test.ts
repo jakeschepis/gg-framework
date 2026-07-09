@@ -140,6 +140,62 @@ describe("AgentSession worker auto-compaction", () => {
   });
 });
 
+describe("AgentSession overflow recovery", () => {
+  // Regression: the desktop app drives the loop through AgentSession (not the
+  // TUI's useContextCompaction hook), and AgentSession never passed
+  // `transformContext` — so a provider `request_too_large` / context-overflow
+  // (the loop's force-compact path) had NO auto recovery and surfaced straight
+  // to the user. This proves the loop's { force: true } call now triggers a
+  // real compaction and hands the shrunken history back for retry.
+  it("force-compacts and returns the shrunken history when the loop reports overflow", async () => {
+    // Pre-turn compaction disabled so we isolate the overflow force path.
+    shouldCompactMock.mockReturnValue(false);
+    const compactedMessages: Message[] = [
+      { role: "system", content: "system prompt" },
+      { role: "user", content: "[compacted]" },
+    ];
+    compactMock.mockResolvedValue({
+      messages: compactedMessages,
+      result: {
+        compacted: true,
+        originalCount: 6,
+        newCount: 2,
+        tokensBeforeEstimate: 500_000,
+        tokensAfterEstimate: 2_000,
+      },
+    });
+
+    let forceResult: Message[] | undefined;
+    agentLoopMock.mockImplementation(async function* (
+      messages: Message[],
+      options: { transformContext?: (m: Message[], o?: { force?: boolean }) => Promise<Message[]> },
+    ) {
+      // Non-force pre-call invocation must pass through untouched.
+      const passthrough = await options.transformContext!(messages);
+      expect(passthrough).toBe(messages);
+      expect(compactMock).not.toHaveBeenCalled();
+      // Force invocation (overflow) must compact and return the smaller array.
+      forceResult = await options.transformContext!(messages, { force: true });
+      yield { type: "agent_done" };
+    });
+
+    const { AgentSession } = await import("./agent-session.js");
+    const session = new AgentSession({
+      provider: "anthropic",
+      model: "claude-test",
+      cwd: tmpProject,
+      systemPrompt: "system prompt",
+      transient: true,
+    });
+    await session.initialize();
+    await session.prompt("do the thing");
+    await session.dispose();
+
+    expect(compactMock).toHaveBeenCalledTimes(1);
+    expect(forceResult).toEqual(compactedMessages);
+  });
+});
+
 /** Every .jsonl under the ggcoder session store — must stay empty for
  *  transient sessions (Ken chat/autopilot, subagent spawns). */
 async function listSessionFiles(): Promise<string[]> {

@@ -22,6 +22,45 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.15.0",
+    date: "2026-07-10",
+    items: [
+      "Your Claude and Codex limits now live right in the title bar. I built a tiny glowing meter that shows how much of your current window is gone and how long until it resets, so you can keep shipping without surprises.",
+      "Tap the meter and your weekly view slides in instantly. I made it follow the model you are using and disappear when it has nothing useful to say.",
+    ],
+  },
+  {
+    version: "0.14.18",
+    date: "2026-07-10",
+    items: [
+      "GPT-5.6's full power dial is finally yours. I opened every step from quick and light to maximum firepower, so you can choose exactly how hard Sol, Terra, or Luna thinks on every task.",
+    ],
+  },
+  {
+    version: "0.14.17",
+    date: "2026-07-10",
+    items: [
+      "Sub-agents no longer quit when the faster, cheaper model is out of reach. I made them switch straight back to your active model and finish the job, so your workflow keeps moving without babysitting.",
+    ],
+  },
+  {
+    version: "0.14.16",
+    date: "2026-07-10",
+    items: [
+      "GPT-5.6 is here and ready to go. I added all three tiers, Sol, Terra, and Luna, straight from OpenAI's latest Codex catalog, so you can pick the exact balance of power and speed your task needs. Sol is the frontier heavyweight, Terra is your daily driver, and Luna is the fast and affordable one.",
+      "Older OpenAI models have been retired. GPT-5.4, 5.4 Mini, and 5.3 Codex are gone, making room for the new 5.6 family and keeping your model picker clean.",
+      "Error messages finally speak app, not terminal. Every hint now tells you to use the model selector or compact button instead of referencing slash commands that only exist in the CLI.",
+    ],
+  },
+  {
+    version: "0.14.15",
+    date: "2026-07-09",
+    items: [
+      "Big sessions no longer hit a wall. When a chat grew too large for the model, the app used to just stop with an error. Now I catch it, quietly trim the history, and keep the conversation rolling so you never lose your flow.",
+      "Error messages read like a human wrote them. Everything now says GG Coder in plain, friendly language, and points you to the exact button to click instead of some command you'd never type.",
+    ],
+  },
+  {
     version: "0.14.14",
     date: "2026-07-08",
     items: [

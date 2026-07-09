@@ -733,6 +733,38 @@ async fn agent_progress(
     res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
 }
 
+/// Proxy: the active provider's subscription quota snapshot. Account-wide, so
+/// no per-window session header is needed.
+#[tauri::command]
+async fn agent_usage(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    provider: String,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    if provider != "anthropic" && provider != "openai" {
+        return Err("unsupported usage provider".into());
+    }
+    let res = client
+        .get(format!("{}/usage?provider={}", sidecar_base(port), provider))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body = res
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("usage request failed")
+            .to_string());
+    }
+    Ok(body)
+}
+
 /// Proxy: submit a prompt (optionally with attachments). The reply streams back
 /// via the `agent-event` event. `attachments` is passed through opaquely.
 #[tauri::command]
@@ -3302,6 +3334,7 @@ pub fn run() {
             open_project_path,
             agent_state,
             agent_progress,
+            agent_usage,
             agent_prompt,
             agent_cancel,
             agent_ken_prompt,

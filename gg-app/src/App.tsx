@@ -81,6 +81,7 @@ import { Toaster } from "./Toaster";
 import { Confetti } from "./Confetti";
 import { RankBadge } from "./RankBadge";
 import { ScorecardModal } from "./ScorecardModal";
+import { TitleUsageMeter } from "./TitleUsageMeter";
 import { useProgress } from "./useProgress";
 import { LoginScreen } from "./LoginScreen";
 import { Markdown, PromptSendProvider } from "./Markdown";
@@ -1875,6 +1876,7 @@ function App(): React.ReactElement {
           <span className="chat-head-title" data-tauri-drag-region>
             {sessionTitle ?? "GG Coder"}
           </span>
+          <TitleUsageMeter currentProvider={state?.provider ?? ""} />
           {windowTotal > 1 && windowIndex !== null && (
             <span
               className={`window-index${isThisFocused ? "" : " dim"}`}

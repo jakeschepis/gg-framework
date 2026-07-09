@@ -1,5 +1,53 @@
 # @kenkaiiii/ggcoder
 
+## 5.10.0
+
+### Minor Changes
+
+- Add OAuth subscription usage snapshots for Anthropic and OpenAI Codex.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.10.0
+- @kenkaiiii/gg-agent@5.10.0
+- @kenkaiiii/gg-core@5.10.0
+
+## 5.9.7
+
+### Patch Changes
+
+- Updated dependencies
+  - @kenkaiiii/gg-core@5.9.7
+  - @kenkaiiii/gg-ai@5.9.7
+  - @kenkaiiii/gg-agent@5.9.7
+
+## 5.9.6
+
+### Patch Changes
+
+- Retry read-only sub-agents on the active parent model when the cheaper model is unavailable.
+  - @kenkaiiii/gg-ai@5.9.6
+  - @kenkaiiii/gg-agent@5.9.6
+  - @kenkaiiii/gg-core@5.9.6
+
+## 5.9.5
+
+### Patch Changes
+
+- Add GPT-5.6 Sol, Terra, and Luna models to the registry; remove GPT-5.4, GPT-5.4 Mini, and GPT-5.3 Codex. Fix provider error hints to reference the model selector instead of CLI-only slash commands so they work in both the desktop app and the CLI.
+  - @kenkaiiii/gg-ai@5.9.5
+  - @kenkaiiii/gg-agent@5.9.5
+  - @kenkaiiii/gg-core@5.9.5
+
+## 5.9.4
+
+### Patch Changes
+
+- Auto-recover from context-overflow errors in the desktop app (request_too_large / 413) by wiring force-compaction + retry into AgentSession, add explicit 413 guidance, and rebrand user-facing error text to "GG Coder".
+  - @kenkaiiii/gg-ai@5.9.4
+  - @kenkaiiii/gg-agent@5.9.4
+  - @kenkaiiii/gg-core@5.9.4
+
 ## 5.9.3
 
 ### Patch Changes

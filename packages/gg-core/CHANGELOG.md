@@ -1,5 +1,36 @@
 # @kenkaiiii/gg-core
 
+## 5.10.0
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.10.0
+
+## 5.9.7
+
+### Patch Changes
+
+- Expose low, medium, high, xhigh, and max reasoning selections for every GPT-5.6 model.
+  - @kenkaiiii/gg-ai@5.9.7
+
+## 5.9.6
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.9.6
+
+## 5.9.5
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.9.5
+
+## 5.9.4
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.9.4
+
 ## 5.9.3
 
 ### Patch Changes

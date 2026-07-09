@@ -213,6 +213,33 @@ export async function getProgress(): Promise<ProgressSnapshot> {
   return invoke<ProgressSnapshot>("agent_progress");
 }
 
+export type SubscriptionUsageProvider = "anthropic" | "openai";
+
+export interface SubscriptionUsageWindow {
+  kind: "current" | "weekly";
+  label: string;
+  usedPercent: number;
+  /** Unix epoch milliseconds. */
+  resetsAt?: number;
+}
+
+export interface SubscriptionUsageProviderSnapshot {
+  provider: SubscriptionUsageProvider;
+  displayName: string;
+  connected: boolean;
+  windows: SubscriptionUsageWindow[];
+  fetchedAt: number;
+  error?: string;
+}
+
+/** Fetch OAuth subscription quota. Tokens never leave the sidecar. */
+export async function getSubscriptionUsage(
+  provider: SubscriptionUsageProvider,
+): Promise<SubscriptionUsageProviderSnapshot> {
+  await waitForReady();
+  return invoke<SubscriptionUsageProviderSnapshot>("agent_usage", { provider });
+}
+
 /**
  * One piece of an enhanced prompt. A `text` segment is verbatim prose; a `term`
  * segment is a corrected technical term the model swapped in, carrying the

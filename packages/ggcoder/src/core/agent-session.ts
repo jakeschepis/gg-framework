@@ -948,6 +948,24 @@ export class AgentSession {
         // polled mid-loop; the ideal review is polled when the agent would stop.
         getSteeringMessages: () => this.getHookSteeringMessages(),
         getFollowUpMessages: () => this.getHookFollowUpMessages(),
+        // Overflow recovery: the loop calls this with { force: true } when the
+        // provider rejects a turn as too large (request_too_large / context
+        // overflow). Force-compact the in-flight history and hand it back so the
+        // loop retries with a smaller request, instead of surfacing the error.
+        // Without this the desktop app (which drives the loop through
+        // AgentSession, not the TUI's useContextCompaction hook) had NO auto
+        // recovery on 413 — the error went straight to the user. The non-force
+        // pre-call invocations pass through untouched: pre-turn compaction is
+        // already handled above, so we only act on the overflow force path.
+        // `loopMessages === this.messages` (prepareDynamicContext returns it by
+        // reference) and the post-loop `this.messages = loopMessages` re-sync
+        // keeps persistence correct after compact() swaps the array.
+        transformContext: async (messages, transformOpts) => {
+          if (!transformOpts?.force) return messages;
+          await this.compact();
+          this.compactionOccurred = true;
+          return this.messages;
+        },
       });
 
       for await (const event of generator as AsyncIterable<AgentEvent>) {

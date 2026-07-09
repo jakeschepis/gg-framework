@@ -69,7 +69,7 @@ describe("formatError Mythos access", () => {
     expect(formatted.guidance).toContain(
       "platform.claude.com/docs/en/about-claude/models/overview",
     );
-    expect(formatted.guidance).toContain("claude-fable-5");
+    expect(formatted.guidance).toContain("Claude Fable 5");
   });
 
   it("does not hijack not_found errors for other models", () => {
@@ -82,6 +82,19 @@ describe("formatError Mythos access", () => {
   });
 });
 
+describe("formatError request too large", () => {
+  it("routes an Anthropic 413 request_too_large to compact, not a blind retry", () => {
+    const f = formatError(
+      new ProviderError("anthropic", "request_too_large: Request exceeds the maximum size", {
+        statusCode: 413,
+      }),
+    );
+    expect(f.guidance).toContain("too large");
+    expect(f.guidance).toContain("Compact");
+    expect(f.guidance).not.toContain("status.anthropic.com");
+  });
+});
+
 describe("VideoUnsupportedError", () => {
   it("formats as a clean capability error naming video-capable models", () => {
     const f = formatError(new VideoUnsupportedError());
@@ -91,13 +104,13 @@ describe("VideoUnsupportedError", () => {
     expect(f.guidance).toContain("Gemini");
     expect(f.guidance).toContain("MiniMax");
     expect(f.guidance).toContain("MiMo");
-    expect(f.guidance).toContain("/model");
+    expect(f.guidance).toContain("model selector");
   });
 
   it("renders headline + guidance only (no bug-report framing)", () => {
     const out = formatErrorForDisplay(new VideoUnsupportedError());
     expect(out).toContain("This model can't analyze video.");
-    expect(out).not.toContain("ggcoder bug");
+    expect(out).not.toContain("GG Coder bug");
   });
 });
 
@@ -110,7 +123,7 @@ describe("formatErrorForDisplay", () => {
       [
         "Anthropic returned an error.",
         "  overloaded_error: Overloaded",
-        "  \u2192 Anthropic's servers are overloaded right now. Retry in a moment \u2014 not a ggcoder issue.",
+        "  → Anthropic's servers are overloaded right now. Retry in a moment — not a GG Coder issue.",
       ].join("\n"),
     );
   });
@@ -123,7 +136,7 @@ describe("formatErrorForDisplay", () => {
       [
         "OpenAI returned an error.",
         "  server_error: something broke",
-        "  \u2192 This is an error from OpenAI, not ggcoder. Retry \u2014 if it keeps happening, check status.openai.com.",
+        "  \u2192 This is an error from OpenAI, not GG Coder. Retry \u2014 if it keeps happening, check status.openai.com.",
       ].join("\n"),
     );
   });
@@ -132,14 +145,14 @@ describe("formatErrorForDisplay", () => {
     const out = formatErrorForDisplay(
       new ProviderError("openai", "This model is not available.", {
         statusCode: 404,
-        hint: "Run /model and choose a listed model.",
+        hint: "Switch to a listed model via the model selector.",
       }),
     );
     expect(out).toBe(
       [
         "OpenAI returned an error.",
         "  This model is not available.",
-        "  \u2192 Run /model and choose a listed model.",
+        "  \u2192 Switch to a listed model via the model selector.",
       ].join("\n"),
     );
   });
@@ -152,29 +165,29 @@ describe("formatErrorForDisplay", () => {
       [
         "Gemini returned an error.",
         "  quota exceeded",
-        "  \u2192 Your Gemini account has a billing or quota issue \u2014 check your balance. Not a ggcoder issue.",
+        "  \u2192 Your Gemini account has a billing or quota issue \u2014 check your balance. Not a GG Coder issue.",
       ].join("\n"),
     );
   });
 
-  it("classifies a network GGAIError without a ggcoder bug headline", () => {
+  it("classifies a network GGAIError without a GG Coder bug headline", () => {
     const out = formatErrorForDisplay(new GGAIError("fetch failed", { source: "network" }));
     expect(out).toBe(
       [
         "Network error \u2014 couldn't reach the provider.",
         "  fetch failed",
-        "  \u2192 Check your internet connection. Not a ggcoder issue \u2014 retry shortly.",
+        "  → Check your internet connection. Not a GG Coder issue — retry shortly.",
       ].join("\n"),
     );
   });
 
-  it("falls back to the ggcoder-bug headline for unknown errors", () => {
+  it("falls back to the GG Coder-bug headline for unknown errors", () => {
     const out = formatErrorForDisplay(new Error("Cannot read property 'foo' of undefined"));
     expect(out).toBe(
       [
-        "ggcoder hit an unexpected error.",
+        "GG Coder hit an unexpected error.",
         "  Cannot read property 'foo' of undefined",
-        "  \u2192 This looks like a ggcoder bug \u2014 please report it to the developer (see /help).",
+        "  → This looks like a GG Coder bug — please report it to the developer (see /help).",
       ].join("\n"),
     );
   });
