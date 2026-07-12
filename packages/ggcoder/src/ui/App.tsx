@@ -26,6 +26,7 @@ import {
 } from "@kenkaiiii/gg-ai";
 import { downscaleForPreview, extractMediaPaths, type ImageAttachment } from "../utils/image.js";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
+import type { SubAgentManager, SubAgentSnapshot } from "../core/subagent-manager.js";
 import { useAgentLoop, type StreamSnapshot, type UserContent } from "./hooks/useAgentLoop.js";
 import { useTranscriptHistory } from "./hooks/useTranscriptHistory.js";
 import type { PasteInfo } from "./components/InputArea.js";
@@ -223,6 +224,7 @@ export interface AppProps {
   sessionPath?: string;
   sessionId?: string;
   processManager?: ProcessManager;
+  subAgentManager?: SubAgentManager;
   settingsFile?: string;
   mcpManager?: MCPClientManager;
   authStorage?: AuthStorage;
@@ -405,6 +407,56 @@ export function App(props: AppProps) {
     const restoredHistoryIds = new Set(history.map((item) => item.id));
     return removeItemsWithIds(restoredLiveItems, restoredHistoryIds);
   });
+  useEffect(() => {
+    if (!props.subAgentManager) return;
+    return props.subAgentManager.subscribe((snapshot: SubAgentSnapshot) => {
+      const status: SubAgentInfo["status"] =
+        snapshot.state === "starting" || snapshot.state === "running"
+          ? "running"
+          : snapshot.state === "completed" || (snapshot.state === "closed" && !snapshot.error)
+            ? "done"
+            : snapshot.state === "interrupted"
+              ? "aborted"
+              : "error";
+      const agent: SubAgentInfo = {
+        toolCallId: snapshot.agent_id,
+        task: snapshot.task_name,
+        agentName: "async",
+        status,
+        toolUseCount: snapshot.tool_use_count,
+        tokenUsage: { ...snapshot.token_usage },
+        currentActivity: snapshot.current_activity,
+        result: snapshot.output ?? snapshot.error,
+        durationMs: snapshot.elapsed_ms,
+      };
+      setLiveItems((previous) => {
+        const containingGroupIndex = previous.findIndex(
+          (item) =>
+            item.kind === "subagent_group" &&
+            item.agents.some((existing) => existing.toolCallId === snapshot.agent_id),
+        );
+        const activeAsyncGroupIndex = previous.findIndex(
+          (item) =>
+            item.kind === "subagent_group" &&
+            item.agents.some(
+              (existing) => existing.agentName === "async" && existing.status === "running",
+            ),
+        );
+        const groupIndex = containingGroupIndex >= 0 ? containingGroupIndex : activeAsyncGroupIndex;
+        if (groupIndex === -1) {
+          return [...previous, { kind: "subagent_group", agents: [agent], id: getId() }];
+        }
+        const group = previous[groupIndex] as SubAgentGroupItem;
+        const agentIndex = group.agents.findIndex((item) => item.toolCallId === snapshot.agent_id);
+        const agents = [...group.agents];
+        if (agentIndex === -1) agents.push(agent);
+        else agents[agentIndex] = agent;
+        const next = [...previous];
+        next[groupIndex] = { ...group, agents };
+        return next;
+      });
+    });
+  }, [props.subAgentManager]);
   // Rolling feed of recent tool actions for the pinned LiveToolPanel. Kept
   // separate from `liveItems` (the scrollback record) so tool calls mutate in
   // place above the activity bar instead of spamming the transcript.
@@ -447,9 +499,13 @@ export function App(props: AppProps) {
   const [currentModel, setCurrentModel] = useState(props.model);
   const [currentProvider, setCurrentProvider] = useState(props.provider);
   const currentProviderRef = useRef(props.provider);
+  const currentModelRef = useRef(props.model);
   const [currentTools, setCurrentTools] = useState(props.tools);
   const currentToolsRef = useRef(props.tools);
   const [thinkingLevel, setThinkingLevel] = useState<ThinkingLevel | undefined>(props.thinking);
+  const thinkingLevelRef = useRef<ThinkingLevel | undefined>(props.thinking);
+  currentModelRef.current = currentModel;
+  thinkingLevelRef.current = thinkingLevel;
   const [renderMarkdown, setRenderMarkdown] = useState(true);
   const messagesRef = useRef<Message[]>(props.sessionStore?.messages ?? props.messages);
   const [planAutoExpand, setPlanAutoExpand] = useState(props.sessionStore?.planAutoExpand ?? false);
@@ -546,6 +602,8 @@ export function App(props: AppProps) {
       cwdRef,
       currentToolsRef,
       providerRef: currentProviderRef,
+      modelRef: currentModelRef,
+      thinkingLevelRef,
       approvedPlanPathRef,
       injectedLanguagesRef,
       messagesRef,
@@ -1206,7 +1264,10 @@ export function App(props: AppProps) {
             return remaining;
           };
 
-          if (name === "subagent") {
+          if (name === "spawn_agent") {
+            // The manager lifecycle creates the keyed row; the spawn acknowledgement is not completion.
+            setLiveItems(appendToolStart);
+          } else if (name === "subagent") {
             setLiveItems(appendToolStart);
             // Create or update the sub-agent group item
             const newAgent: SubAgentInfo = {
@@ -2246,12 +2307,19 @@ export function App(props: AppProps) {
         setComposerInject({ text: queuedText, nonce: nextIdRef.current++ });
       }
       agentLoop.abort();
+      void props.subAgentManager?.interruptAll();
+    } else if (
+      props.subAgentManager
+        ?.list()
+        .some((agent) => agent.state === "starting" || agent.state === "running")
+    ) {
+      void props.subAgentManager.interruptAll();
     } else if (compactionAbortRef.current) {
       compactionAbortRef.current.abort();
     } else {
       handleDoubleExit();
     }
-  }, [agentLoop, handleDoubleExit, setLiveItems]);
+  }, [agentLoop, handleDoubleExit, props.subAgentManager, setLiveItems]);
 
   const handleToggleThinking = useCallback(() => {
     setThinkingLevel((prev) => {

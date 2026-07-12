@@ -11,6 +11,7 @@ import {
   type PermissionsStatus,
 } from "./agent";
 import { toast } from "./toast";
+import { SoundButton } from "./SoundButton";
 
 interface Props {
   onClose: () => void;
@@ -85,6 +86,12 @@ export function SettingsModal({ onClose, onSaved }: Props): React.ReactElement {
           </div>
         </>
       )}
+      <div className="modal-label" style={{ color: theme.textMuted }}>
+        Sound effects
+      </div>
+      <div className="modal-row">
+        <SoundButton variant="settings" />
+      </div>
       <div className="modal-label" style={{ color: theme.textMuted }}>
         Project folder
       </div>

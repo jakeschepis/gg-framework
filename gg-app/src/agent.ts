@@ -25,6 +25,21 @@ export function setWindowTitle(title: string): void {
   void appWindow.setTitle(title).catch(() => {});
 }
 
+export interface SubAgentStatePayload {
+  agent_id: string;
+  task_name: string;
+  state: "starting" | "running" | "completed" | "failed" | "interrupted" | "closed";
+  started_at: number;
+  updated_at: number;
+  elapsed_ms: number;
+  current_activity?: string;
+  turn_count: number;
+  tool_use_count: number;
+  token_usage: { input: number; output: number };
+  output?: string;
+  error?: string;
+}
+
 export interface SidecarEvent {
   type: string;
   data: unknown;
@@ -610,29 +625,36 @@ export interface RadioStation {
 
 export interface RadioState {
   stations: RadioStation[];
-  /** Currently-playing station id for THIS window, or null when off. */
+  /** Currently-playing station id app-wide, or null when paused. */
   current: string | null;
+  volume: number;
 }
 
-/** Read this window's radio state (available stations + what's playing). */
+/** Read app-wide radio state (stations, playback, and volume). */
 export async function getRadioState(): Promise<RadioState> {
   try {
     const res = await invoke<RadioState>("agent_radio_state");
-    return { stations: res.stations ?? [], current: res.current ?? null };
+    return {
+      stations: res.stations ?? [],
+      current: res.current ?? null,
+      volume: Number.isFinite(res.volume) ? res.volume : 70,
+    };
   } catch (e) {
     await logError(`agent_radio_state failed: ${String(e)}`);
-    return { stations: [], current: null };
+    return { stations: [], current: null, volume: 70 };
   }
 }
 
-/**
- * Play a station by id, or stop with "off". Playback is isolated to this
- * window's sidecar. Returns the now-playing id (null when stopped). Throws with
- * a user-facing message when no player is installed.
- */
+/** Play a station by id, or pause with "off". */
 export async function setRadio(station: string): Promise<string | null> {
   const res = await invoke<{ current: string | null }>("agent_radio_set", { station });
   return res.current ?? null;
+}
+
+/** Set app-wide radio volume from 0 to 100. */
+export async function setRadioVolume(volume: number): Promise<number> {
+  const res = await invoke<{ volume: number }>("agent_radio_volume", { volume });
+  return Number.isFinite(res.volume) ? res.volume : volume;
 }
 
 /** Stop a background task by id. Returns the sidecar's status message, if any. */

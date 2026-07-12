@@ -4,6 +4,7 @@ import { theme } from "./theme";
 import {
   listCommands,
   type SidecarEvent,
+  type SubAgentStatePayload,
   type AgentState,
   type BackgroundTask,
   type ProjectTask,
@@ -193,9 +194,10 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   const pendingChunksRef = useRef<string>("");
   const flushTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   // Transcript id of the active sub-agent group for this run (null until the
-  // first subagent spawns). Lets later parallel agents join the same in-chat
-  // feed instead of each opening a fresh block.
+  // first subagent spawns). The per-agent map keeps late async lifecycle events
+  // attached to their original transcript group after a newer run starts.
   const subagentGroupIdRef = useRef<number | null>(null);
+  const subagentGroupByAgentRef = useRef<Map<string, number>>(new Map());
   // Transcript id of the in-flight compaction notice, so compaction_end can
   // flip the same row from shimmer → summary instead of pushing a new line.
   const compactionIdRef = useRef<number | null>(null);
@@ -372,6 +374,90 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           finalizeThinking();
           endStreamingText();
           assistantTextRef.current = "";
+          break;
+        }
+        case "subagent_state": {
+          const snapshot = d as unknown as SubAgentStatePayload;
+          const status: SubAgentLine["status"] =
+            snapshot.state === "starting"
+              ? "starting"
+              : snapshot.state === "running"
+                ? "running"
+                : snapshot.state === "completed"
+                  ? "idle"
+                  : snapshot.state === "interrupted"
+                    ? "interrupted"
+                    : snapshot.state === "closed" && !snapshot.error
+                      ? "done"
+                      : "error";
+          const activity = snapshot.current_activity;
+          const updateAgent = (agent: SubAgentLine): SubAgentLine => {
+            const last = agent.activities[agent.activities.length - 1];
+            return {
+              ...agent,
+              status,
+              toolUseCount: snapshot.tool_use_count,
+              tokenUsage: snapshot.token_usage,
+              durationMs: snapshot.elapsed_ms,
+              activities:
+                activity && activity !== last
+                  ? [...agent.activities, activity].slice(-12)
+                  : agent.activities,
+            };
+          };
+          const mappedGroupId = subagentGroupByAgentRef.current.get(snapshot.agent_id);
+          const activeGroupId = subagentGroupIdRef.current;
+          const shouldCreateGroup = mappedGroupId === undefined && activeGroupId === null;
+          const groupId = mappedGroupId ?? activeGroupId ?? nextId();
+          if (mappedGroupId === undefined) {
+            subagentGroupByAgentRef.current.set(snapshot.agent_id, groupId);
+            if (shouldCreateGroup) subagentGroupIdRef.current = groupId;
+          }
+          if (shouldCreateGroup) {
+            pushItem({
+              kind: "subagent_group",
+              id: groupId,
+              agents: [
+                {
+                  toolCallId: snapshot.agent_id,
+                  agentName: snapshot.task_name,
+                  status,
+                  async: true,
+                  activities: activity ? [activity] : [],
+                  toolUseCount: snapshot.tool_use_count,
+                  tokenUsage: snapshot.token_usage,
+                  durationMs: snapshot.elapsed_ms,
+                },
+              ],
+            });
+          } else {
+            setItems((previous) =>
+              previous.map((item) => {
+                if (item.kind !== "subagent_group" || item.id !== groupId) return item;
+                const found = item.agents.some((agent) => agent.toolCallId === snapshot.agent_id);
+                return {
+                  ...item,
+                  agents: found
+                    ? item.agents.map((agent) =>
+                        agent.toolCallId === snapshot.agent_id ? updateAgent(agent) : agent,
+                      )
+                    : [
+                        ...item.agents,
+                        {
+                          toolCallId: snapshot.agent_id,
+                          agentName: snapshot.task_name,
+                          status,
+                          async: true,
+                          activities: activity ? [activity] : [],
+                          toolUseCount: snapshot.tool_use_count,
+                          tokenUsage: snapshot.token_usage,
+                          durationMs: snapshot.elapsed_ms,
+                        },
+                      ],
+                };
+              }),
+            );
+          }
           break;
         }
         case "tool_call_start": {
@@ -624,7 +710,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
                       ...it,
                       aborted: d.cancelled ? true : it.aborted,
                       agents: it.agents.map((a) =>
-                        a.status === "running"
+                        a.status === "running" && !a.async
                           ? { ...a, status: d.cancelled ? ("error" as const) : ("done" as const) }
                           : a,
                       ),
@@ -633,7 +719,6 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
               ),
             );
           }
-          subagentGroupIdRef.current = null;
           if (d.cancelled) {
             setDoneStatus(null);
             setStatus("cancelled");
@@ -785,6 +870,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           setQueuedCount(0);
           endStreamingText();
           subagentGroupIdRef.current = null;
+          subagentGroupByAgentRef.current.clear();
           break;
         case "session_title":
           setSessionTitle(String(d.title ?? "") || null);

@@ -12,7 +12,8 @@ export interface SubAgentLine {
   toolCallId: string;
   /** Named agent (e.g. "researcher") when supplied, else a positional label. */
   agentName?: string;
-  status: "running" | "done" | "error";
+  status: "starting" | "running" | "idle" | "done" | "error" | "interrupted";
+  async?: boolean;
   /** Rolling feed of tool activities the agent has run (already humanized). */
   activities: string[];
   toolUseCount: number;
@@ -55,7 +56,9 @@ function formatTokens(usage: SubAgentLine["tokenUsage"]): string | null {
 export function SubAgentFeed({ agents, aborted = false }: Props): React.ReactElement | null {
   if (agents.length === 0) return null;
 
-  const running = agents.filter((a) => a.status === "running").length;
+  const running = agents.filter(
+    (agent) => agent.status === "running" || agent.status === "starting",
+  ).length;
   const headerColor = aborted ? theme.error : running > 0 ? theme.primary : theme.success;
   const noun = `agent${agents.length !== 1 ? "s" : ""}`;
   const header = aborted
@@ -74,18 +77,18 @@ export function SubAgentFeed({ agents, aborted = false }: Props): React.ReactEle
       </div>
       <div className="subagents-list">
         {agents.map((agent, i) => {
-          const isRunning = agent.status === "running" && !aborted;
+          const isRunning = (agent.status === "running" || agent.status === "starting") && !aborted;
           const icon = aborted
             ? "\u2717"
             : agent.status === "done"
               ? "\u2713"
-              : agent.status === "error"
+              : agent.status === "error" || agent.status === "interrupted"
                 ? "\u2717"
                 : DOT;
           const iconColor =
             agent.status === "done"
               ? theme.success
-              : agent.status === "error" || aborted
+              : agent.status === "error" || agent.status === "interrupted" || aborted
                 ? theme.error
                 : theme.primary;
 
@@ -117,7 +120,11 @@ export function SubAgentFeed({ agents, aborted = false }: Props): React.ReactEle
                       ? "interrupted"
                       : agent.status === "error"
                         ? "failed"
-                        : `${agent.toolUseCount} ${agent.toolUseCount === 1 ? "tool" : "tools"}`}
+                        : agent.status === "interrupted"
+                          ? "interrupted"
+                          : agent.status === "idle"
+                            ? "idle · ready for follow-up"
+                            : `${agent.toolUseCount} ${agent.toolUseCount === 1 ? "tool" : "tools"}`}
                     {agent.durationMs != null && !aborted
                       ? ` \u00b7 ${formatDuration(agent.durationMs)}`
                       : ""}

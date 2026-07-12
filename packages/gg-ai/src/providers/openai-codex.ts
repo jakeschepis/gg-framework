@@ -24,6 +24,11 @@ import { readSseStream } from "../utils/sse.js";
 import { extractRequestIdFromMessage } from "../utils/request-id.js";
 
 const DEFAULT_BASE_URL = "https://chatgpt.com/backend-api";
+const CODEX_CLIENT_VERSION = "0.144.1";
+
+function usesResponsesLite(model: string): boolean {
+  return model.startsWith("gpt-5.6-");
+}
 
 function outputTextKey(itemId: string | undefined, contentIndex: number | undefined): string {
   return `${itemId ?? ""}:${contentIndex ?? 0}`;
@@ -46,6 +51,7 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   const downgraded = downgradeUnsupportedVideos(downgradedImages, options.supportsVideo);
   const { system, input } = toCodexInput(downgraded, { supportsImages: options.supportsImages });
 
+  const responsesLite = usesResponsesLite(options.model);
   const body: Record<string, unknown> = {
     model: options.model,
     store: false,
@@ -53,7 +59,7 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     instructions: system,
     input,
     tool_choice: "auto",
-    parallel_tool_calls: true,
+    parallel_tool_calls: !responsesLite,
     include: ["reasoning.encrypted_content"],
   };
 
@@ -74,8 +80,10 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     body.temperature = options.temperature;
   }
   body.reasoning = {
-    effort: options.thinking ?? "none",
+    // `ultra` is a client orchestration preset, not a Codex API effort.
+    effort: options.thinking === "ultra" ? "max" : (options.thinking ?? "none"),
     summary: "auto",
+    ...(responsesLite ? { context: "all_turns" } : {}),
   };
 
   const headers: Record<string, string> = {
@@ -83,23 +91,29 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     Accept: "text/event-stream",
     Authorization: `Bearer ${options.apiKey}`,
     "OpenAI-Beta": "responses=experimental",
-    originator: "ggcoder",
-    "User-Agent": `ggcoder (${os.platform()} ${os.release()}; ${os.arch()})`,
+    originator: responsesLite ? "codex_cli_rs" : "ggcoder",
+    "User-Agent": responsesLite
+      ? `codex_cli_rs/${CODEX_CLIENT_VERSION}`
+      : `ggcoder (${os.platform()} ${os.release()}; ${os.arch()})`,
+    ...(responsesLite
+      ? {
+          version: CODEX_CLIENT_VERSION,
+          "X-OpenAI-Internal-Codex-Responses-Lite": "true",
+        }
+      : {}),
   };
 
   if (options.accountId) {
     headers["chatgpt-account-id"] = options.accountId;
   }
 
-  // The chatgpt.com codex backend routes prompt cache lookups by header, not
-  // body — `prompt_cache_key` in the body alone never produces a cache hit
-  // here (verified against gpt-5.5 with a 22k-token shared prefix). Pinning
-  // both `session_id` and `x-client-request-id` to the cache scope is what
-  // makes consecutive requests hit the same cache shard.
-  const cacheScopeId = body.prompt_cache_key as string | undefined;
-  if (cacheScopeId) {
-    headers["session_id"] = cacheScopeId;
-    headers["x-client-request-id"] = cacheScopeId;
+  // Match Codex CLI's identity split: prompt_cache_key controls cache routing,
+  // while these headers identify the conversation. Sub-agents may deliberately
+  // share a cache key when their static prefixes match, but each child keeps an
+  // independent transport identity so sticky session state cannot bleed across.
+  if (options.transportSessionId) {
+    headers["session_id"] = options.transportSessionId;
+    headers["x-client-request-id"] = options.transportSessionId;
   }
 
   const response = await fetch(url, {
@@ -169,6 +183,7 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   let inputTokens = 0;
   let outputTokens = 0;
   let cacheRead = 0;
+  let cacheWrite = 0;
 
   // ── Diagnostic: log the first occurrence of each raw SSE event type with
   // timing, so we can see what Codex sends during the pre-reasoning window
@@ -412,12 +427,13 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
       const resp = event.response as Record<string, unknown> | undefined;
       const usage = resp?.usage as
         | (Record<string, number> & {
-            input_tokens_details?: { cached_tokens?: number };
+            input_tokens_details?: { cached_tokens?: number; cache_write_tokens?: number };
           })
         | undefined;
       if (usage) {
         cacheRead = usage.input_tokens_details?.cached_tokens ?? 0;
-        inputTokens = (usage.input_tokens ?? 0) - cacheRead;
+        cacheWrite = usage.input_tokens_details?.cache_write_tokens ?? 0;
+        inputTokens = (usage.input_tokens ?? 0) - cacheRead - cacheWrite;
         outputTokens = usage.output_tokens ?? 0;
       }
     }
@@ -475,7 +491,12 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
       content: contentParts.length > 0 ? contentParts : textAccum || "",
     },
     stopReason,
-    usage: { inputTokens, outputTokens, ...(cacheRead > 0 && { cacheRead }) },
+    usage: {
+      inputTokens,
+      outputTokens,
+      ...(cacheRead > 0 && { cacheRead }),
+      ...(cacheWrite > 0 && { cacheWrite }),
+    },
   };
 
   yield { type: "done", stopReason };

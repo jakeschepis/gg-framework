@@ -1,54 +1,30 @@
 import { spawn } from "node:child_process";
 import { createInterface } from "node:readline";
-import { existsSync } from "node:fs";
-import { fileURLToPath } from "node:url";
 import { z } from "zod";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import type { Provider } from "@kenkaiiii/gg-ai";
 import type { AgentDefinition } from "../core/agents.js";
-import { getFastModel } from "../core/model-registry.js";
 import { log } from "../core/logger.js";
-import { truncateTail } from "./truncate.js";
 import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
-
-// Tools that can mutate the workspace. A named agent whose allow-list contains
-// none of these is a read-only scout (recon/research) — safe to route to the
-// provider's fast/cheap model. An agent that can write/edit keeps the parent
-// model so code changes never regress in quality.
-const MUTATING_TOOLS = new Set(["write", "edit"]);
-
-/**
- * True when the sub-agent is a read-only scout: an explicit named agent with a
- * non-empty tool allow-list that grants no mutating tool. A subagent call with
- * no `agent` (full toolset) is NOT read-only — it keeps the parent model.
- */
-function isReadOnlyAgent(agentDef: AgentDefinition | undefined): boolean {
-  if (!agentDef || agentDef.tools.length === 0) return false;
-  return !agentDef.tools.some((tool) => MUTATING_TOOLS.has(tool.toLowerCase()));
-}
+import {
+  boundSubAgentOutput,
+  childSubAgentEnv,
+  currentSubAgentDepth,
+  MAX_BLOCKING_SUBAGENT_DEPTH,
+  resolveSubAgentCliEntry,
+  selectSubAgent,
+  subAgentCacheKey,
+  SUB_AGENT_MAX_OUTPUT_CHARS,
+  SUB_AGENT_MAX_STDERR_CHARS,
+  SUB_AGENT_MAX_TURNS,
+  SUB_AGENT_TIMEOUT_MS,
+} from "./subagent-shared.js";
 
 /** Only retry errors that specifically mean the selected model cannot be used. */
 export function isModelUnavailableError(stderr: string): boolean {
   return /does not recognize the requested model|requested model[^\n]*(?:not available|no access)|model[^\n]*(?:does not exist|not found|not available)/i.test(
     stderr,
   );
-}
-
-const SUB_AGENT_MAX_TURNS = 50;
-const SUB_AGENT_MAX_OUTPUT_CHARS = 100_000; // ~25k tokens, matches other tool limits
-const SUB_AGENT_MAX_OUTPUT_LINES = 500;
-const SUB_AGENT_MAX_STDERR_CHARS = 10_000; // Cap stderr to prevent unbounded growth
-const SUB_AGENT_TIMEOUT_MS = 10 * 60 * 1000; // 10 minute hard timeout
-
-/**
- * Absolute path to the ggcoder CLI entry (dist/cli.js) that runs a sub-agent in
- * JSON mode. Resolved relative to this module so it's correct no matter how the
- * host process was launched (CLI bin, desktop app sidecar, tests). Falls back to
- * the launching script only if the sibling file is missing.
- */
-function resolveCliEntry(): string {
-  const cliPath = fileURLToPath(new URL("../cli.js", import.meta.url));
-  return existsSync(cliPath) ? cliPath : process.argv[1];
 }
 
 const SubAgentParams = z.object({
@@ -101,31 +77,26 @@ export function createSubAgentTool(
         return planModeRestriction("subagent");
       }
 
-      const startTime = Date.now();
-
-      // Resolve agent definition if specified
-      let agentDef: AgentDefinition | undefined;
-      if (args.agent) {
-        agentDef = agents.find((a) => a.name.toLowerCase() === args.agent!.toLowerCase());
-        if (!agentDef) {
-          return {
-            content: `Unknown agent: "${args.agent}". Available agents: ${agents.map((a) => a.name).join(", ") || "none"}`,
-          };
-        }
+      if (currentSubAgentDepth() >= MAX_BLOCKING_SUBAGENT_DEPTH) {
+        return {
+          content: `Sub-agent nesting limit reached (${MAX_BLOCKING_SUBAGENT_DEPTH}). Complete this task in the current agent.`,
+        };
       }
 
-      const useProvider = getParentProvider();
-      // Read-only scouts (recon/research) run on the provider's fast/cheap model
-      // — lower TTFT + spend, no quality risk since they never edit code.
-      // Agents that can write, and default (unnamed) sub-agents, keep the
-      // parent model.
+      const startTime = Date.now();
+      const useProvider = getParentProvider() as Provider;
       const parentModel = getParentModel();
-      const useModel = isReadOnlyAgent(agentDef)
-        ? getFastModel(useProvider as Provider, parentModel).id
-        : parentModel;
-
+      const selection = selectSubAgent(agents, args.agent, useProvider, parentModel);
+      const agentDef = selection.agentDef;
+      if (args.agent && !agentDef) {
+        return {
+          content: `Unknown agent: "${args.agent}". Available agents: ${agents.map((a) => a.name).join(", ") || "none"}`,
+        };
+      }
+      const useModel = selection.model;
       const parentCacheKey = getParentCacheKey?.();
-      const subCacheKey = parentCacheKey ? `${parentCacheKey}:subagent` : "(unset)";
+      const childCacheKey = subAgentCacheKey(parentCacheKey, useModel, agentDef?.name ?? "default");
+      const subCacheKey = childCacheKey ?? "(unset)";
 
       const buildCliArgs = (model: string): string[] => {
         const cliArgs: string[] = [
@@ -138,11 +109,8 @@ export function createSubAgentTool(
           String(SUB_AGENT_MAX_TURNS),
         ];
 
-        // Inherit parent's cache-routing key so all sub-agents in one parent run
-        // share the same prompt_cache_key prefix instead of each spawning with a
-        // fresh sessionId-derived key (cold cache every time).
-        if (parentCacheKey) {
-          cliArgs.push("--prompt-cache-key", `${parentCacheKey}:subagent`);
+        if (childCacheKey) {
+          cliArgs.push("--prompt-cache-key", childCacheKey);
         }
         if (agentDef?.systemPrompt) {
           cliArgs.push("--system-prompt", agentDef.systemPrompt);
@@ -189,11 +157,15 @@ export function createSubAgentTool(
         const startAttempt = (model: string, fallbackFrom?: string) => {
           // Spawn the CLI entry, not process.argv[1]: the desktop host is the
           // app sidecar and does not understand JSON-mode agent arguments.
-          const child = spawn(process.execPath, [resolveCliEntry(), ...buildCliArgs(model)], {
-            cwd,
-            stdio: ["ignore", "pipe", "pipe"],
-            env: { ...process.env },
-          });
+          const child = spawn(
+            process.execPath,
+            [resolveSubAgentCliEntry(), ...buildCliArgs(model)],
+            {
+              cwd,
+              stdio: ["ignore", "pipe", "pipe"],
+              env: childSubAgentEnv(),
+            },
+          );
           activeChild = child;
           activeChildExited = false;
 
@@ -331,15 +303,7 @@ export function createSubAgentTool(
               return;
             }
 
-            const raw = textOutput || "(no output)";
-            const result = truncateTail(
-              raw,
-              SUB_AGENT_MAX_OUTPUT_LINES,
-              SUB_AGENT_MAX_OUTPUT_CHARS,
-            );
-            const body = result.truncated
-              ? `[Sub-agent output truncated: ${result.totalLines} total lines, showing last ${result.keptLines}]\n\n${result.content}`
-              : result.content;
+            const body = boundSubAgentOutput(textOutput);
             const content = hitMaxTurns
               ? `[Sub-agent reached its ${maxTurnsLimit}-turn limit — it stopped mid-task and this output may be incomplete.]\n\n${body}`
               : body;

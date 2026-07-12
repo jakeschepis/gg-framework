@@ -1,7 +1,6 @@
 import { agentLoop, isAbortError, type AgentEvent, type AgentTool } from "@kenkaiiii/gg-agent";
 import {
   ProviderError,
-  prewarmAnthropicCache,
   type Message,
   type Provider,
   type ThinkingLevel,
@@ -47,6 +46,8 @@ import {
   type ProcessManager,
 } from "../tools/index.js";
 import type { BackgroundProcess } from "./process-manager.js";
+import type { SubAgentManager } from "./subagent-manager.js";
+import { applyAsyncSubagentPolicy } from "./subagent-policy.js";
 import { MCPClientManager, getAllMcpServers } from "./mcp/index.js";
 import { DeferredToolCatalog } from "./mcp/deferred-catalog.js";
 import { createToolSearchTool } from "../tools/tool-search.js";
@@ -96,6 +97,7 @@ export interface AgentSessionOptions {
   sessionId?: string;
   continueRecent?: boolean;
   maxTokens?: number;
+  maxTurns?: number;
   thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   /** Prefix used for provider prompt-cache routing keys. */
@@ -162,6 +164,8 @@ export interface AgentSessionOptions {
    * main build session. Default (undefined) = follow `speedProfile`.
    */
   forceLongCacheRetention?: boolean;
+  /** Hidden persistent subagent workers omit the async orchestration tool suite. */
+  subagentWorker?: boolean;
 }
 
 // ── State ──────────────────────────────────────────────────
@@ -240,9 +244,6 @@ export class AgentSession {
   private regroundingInjected = false;
   private compactionOccurred = false;
   private originalRequest = "";
-  /** True after the cache has been pre-warmed for this session. Ensures we only
-   *  fire the warm-up call once (before the first real turn). */
-  private cachePrewarmed = false;
   // Messages queued by the user while a run is in flight. Drained at the
   // mid-loop steering boundary (user steering wins over the hooks), mirroring
   // the TUI's getSteeringMessages. Each entry carries its own attachments so a
@@ -250,6 +251,11 @@ export class AgentSession {
   private userQueue: Array<{ text: string; attachments: SessionAttachment[] }> = [];
   private processManager?: ProcessManager;
   private lspManager?: LspManager;
+  private subAgentManager?: SubAgentManager;
+  private managerAbortSignal?: AbortSignal;
+  private readonly managerAbortHandler = () => {
+    void this.subAgentManager?.interruptAll();
+  };
   private mcpManager?: MCPClientManager;
   /** Deferred MCP tools awaiting discovery via tool_search (bench A win). */
   private mcpCatalog?: DeferredToolCatalog;
@@ -273,6 +279,9 @@ export class AgentSession {
   private approvedPlanPath?: string;
 
   private sessionId = "";
+  /** Runtime conversation identity for provider transport headers. Transient
+   *  children need one even though they intentionally have no persisted session. */
+  private readonly transportSessionId = crypto.randomUUID();
   private sessionPath = "";
   private lastPersistedIndex = 0;
   /** Current leaf entry ID in the session DAG — used to chain parentIds for branching. */
@@ -342,28 +351,33 @@ export class AgentSession {
       globalAgentsDir: paths.agentsDir,
       projectDir: this.cwd,
     });
-    const { tools, processManager, rebuildReadTool, lspManager } = await createTools(this.cwd, {
-      agents,
-      skills: this.skills,
-      provider: this.provider,
-      model: this.model,
-      lspDiagnostics: this.settingsManager.get("lspDiagnostics"),
-      authStorage: this.authStorage,
-      // Lazy — sessionId/model/provider can change after createTools() runs, so
-      // sub-agent spawns read the current parent state at execution time.
-      getProvider: () => this.provider,
-      getModel: () => this.model,
-      getCacheKey: () => this.getPromptCacheKey(),
-      // Plan mode: only wired when the host supplies callbacks. The ref is
-      // shared so bash/edit/write enforce read-only restrictions live.
-      ...(this.opts.onEnterPlan || this.opts.onExitPlan
-        ? {
-            planModeRef: this.planModeRef,
-            onEnterPlan: this.opts.onEnterPlan,
-            onExitPlan: this.opts.onExitPlan,
-          }
-        : {}),
-    });
+    const { tools, processManager, rebuildReadTool, lspManager, subAgentManager } =
+      await createTools(this.cwd, {
+        agents,
+        skills: this.skills,
+        provider: this.provider,
+        model: this.model,
+        lspDiagnostics: this.settingsManager.get("lspDiagnostics"),
+        authStorage: this.authStorage,
+        // Lazy — sessionId/model/provider can change after createTools() runs, so
+        // sub-agent spawns read the current parent state at execution time.
+        getProvider: () => this.provider,
+        getModel: () => this.model,
+        getThinkingLevel: () => this.thinkingLevel,
+        getBaseUrl: () => this.baseUrl,
+        getCacheKey: () => this.getPromptCacheKey(),
+        disableAsyncSubagents: this.opts.subagentWorker,
+        onSubAgentState: (snapshot) => this.eventBus.emit("subagent_state", snapshot),
+        // Plan mode: only wired when the host supplies callbacks. The ref is
+        // shared so bash/edit/write enforce read-only restrictions live.
+        ...(this.opts.onEnterPlan || this.opts.onExitPlan
+          ? {
+              planModeRef: this.planModeRef,
+              onEnterPlan: this.opts.onEnterPlan,
+              onExitPlan: this.opts.onExitPlan,
+            }
+          : {}),
+      });
     // Apply the optional tool allow-list (read-only advisory sessions). Filtering
     // here means the excluded tools are never registered with the agent loop, so
     // a hallucinated call can't mutate the repo — and buildSystemPrompt below is
@@ -372,6 +386,8 @@ export class AgentSession {
     this.rebuildReadTool = rebuildReadTool;
     this.processManager = processManager;
     this.lspManager = lspManager;
+    this.subAgentManager = subAgentManager;
+    this.bindManagerCancellation(this.opts.signal);
 
     // Connect MCP servers. The connect attempt itself can block for up to the
     // per-server connect timeout (~30s) — a slow stdio server such as a
@@ -399,6 +415,7 @@ export class AgentSession {
         this.provider,
       ));
     this.messages = [{ role: "system", content: basePrompt }];
+    this.syncUltraOrchestrationPrompt();
 
     // Load or create session. Transient sessions (subagent spawns) never
     // touch the session store — sessionPath stays empty and persistMessage
@@ -920,11 +937,13 @@ export class AgentSession {
         tools: this.tools,
         webSearch: true,
         maxTokens: this.maxTokens,
+        maxTurns: this.opts.maxTurns,
         thinking: this.thinkingLevel,
         apiKey,
         baseUrl: effectiveBaseUrl,
         signal: this.opts.signal,
         accountId,
+        transportSessionId: this.sessionId || this.transportSessionId,
         projectId,
         // Kimi For Coding gates the managed endpoint on coding-agent identity
         // headers; attach them only when the Kimi OAuth token is in use.
@@ -975,11 +994,6 @@ export class AgentSession {
     };
 
     try {
-      // Fire cache pre-warm before the first turn (Anthropic + speedProfile optimized).
-      // Runs concurrently with nothing — it must complete before runAgentLoop so
-      // the cache is warm when the real request arrives. Best-effort: swallowed
-      // inside maybePrewarmCache/prewarmAnthropicCache.
-      await this.maybePrewarmCache(creds);
       await runAgentLoop(creds.accessToken, creds.accountId, creds.projectId);
     } catch (err) {
       // Abort errors are expected (user cancellation) — don't retry or re-throw
@@ -1031,6 +1045,7 @@ export class AgentSession {
     const prevProvider = this.provider;
     if (provider) this.provider = provider as Provider;
     this.model = model;
+    this.syncUltraOrchestrationPrompt();
     setEstimatorModel(model);
     // maxTokens must follow the active model — it was frozen at the boot
     // model's `maxOutputTokens` in the constructor, so without this a session
@@ -1201,6 +1216,7 @@ export class AgentSession {
         this.provider,
       ));
     this.messages = [{ role: "system", content: basePrompt }];
+    this.syncUltraOrchestrationPrompt();
     // Fresh conversation — new entries must not chain onto the old DAG's leaf.
     this.currentLeafId = null;
     // Transient sessions (Ken chat/autopilot, subagent spawns) never touch the
@@ -1373,6 +1389,7 @@ export class AgentSession {
     } else {
       this.messages.unshift({ role: "system", content: rebuilt });
     }
+    this.syncUltraOrchestrationPrompt();
   }
 
   getMessages(): Message[] {
@@ -1621,11 +1638,34 @@ export class AgentSession {
    * effect on the next prompt, since the in-flight loop reads it at start. */
   setThinkingLevel(level: ThinkingLevel | undefined): void {
     this.thinkingLevel = level;
+    this.syncUltraOrchestrationPrompt();
+  }
+
+  /** Sol/Terra Ultra delegates proactively; lower levels require an explicit request. */
+  private syncUltraOrchestrationPrompt(): void {
+    const systemMessage = this.messages[0];
+    if (systemMessage?.role !== "system" || typeof systemMessage.content !== "string") return;
+
+    systemMessage.content = applyAsyncSubagentPolicy(
+      systemMessage.content,
+      this.provider,
+      this.model,
+      this.thinkingLevel,
+      this.tools.map((tool) => tool.name),
+    );
   }
 
   /** Replace the abort signal (e.g. after cancellation). */
   setSignal(signal: AbortSignal): void {
     this.opts = { ...this.opts, signal };
+    this.bindManagerCancellation(signal);
+  }
+
+  private bindManagerCancellation(signal: AbortSignal | undefined): void {
+    this.managerAbortSignal?.removeEventListener("abort", this.managerAbortHandler);
+    this.managerAbortSignal = signal;
+    signal?.addEventListener("abort", this.managerAbortHandler, { once: true });
+    if (signal?.aborted) this.managerAbortHandler();
   }
 
   /** True when speedProfile is "optimized" (1-h cache TTL + pre-warm), or the
@@ -1648,44 +1688,6 @@ export class AgentSession {
     return getAuthStorageKeys(this.provider, this.model);
   }
 
-  /** Fire a cache pre-warm request for Anthropic so the first real turn is a
-   *  cache read instead of a cold write. No-op for other providers and when
-   *  speedProfile is not "optimized". Entirely best-effort — any failure is
-   *  swallowed so prewarm never blocks or aborts the real prompt. */
-  private async maybePrewarmCache(creds: {
-    accessToken: string;
-    accountId?: string;
-    baseUrl?: string;
-  }): Promise<void> {
-    if (this.cachePrewarmed || !this.isSpeedOptimized() || this.provider !== "anthropic") {
-      return;
-    }
-    this.cachePrewarmed = true;
-    try {
-      const userAgent = await getClaudeCliUserAgent();
-      const systemText =
-        typeof this.messages[0]?.content === "string" ? this.messages[0].content : "";
-      if (!systemText) return;
-      await prewarmAnthropicCache({
-        apiKey: creds.accessToken,
-        model: this.model,
-        system: systemText,
-        tools: this.tools.map((t) => ({
-          name: t.name,
-          description: t.description,
-          parameters: t.parameters,
-          ...(t.rawInputSchema ? { rawInputSchema: t.rawInputSchema } : {}),
-        })),
-        baseUrl: this.baseUrl ?? creds.baseUrl,
-        userAgent,
-        cacheRetention: "long",
-        signal: this.opts.signal,
-      });
-    } catch {
-      // Best-effort — prewarm failure must never block the session.
-    }
-  }
-
   private getPromptCacheKey(): string | undefined {
     if (this.opts.promptCacheKey) return this.opts.promptCacheKey;
     if (!this.sessionId) return undefined;
@@ -1698,9 +1700,10 @@ export class AgentSession {
   }
 
   async dispose(): Promise<void> {
+    this.managerAbortSignal?.removeEventListener("abort", this.managerAbortHandler);
     this.processManager?.shutdownAll();
     this.lspManager?.shutdownAll();
-    await this.mcpManager?.dispose();
+    await Promise.all([this.subAgentManager?.shutdownAll(), this.mcpManager?.dispose()]);
     await this.extensionLoader.deactivateAll();
     this.eventBus.removeAllListeners();
     this.messages = [];

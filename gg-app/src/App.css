@@ -676,14 +676,14 @@ body {
 .home-actions {
   display: flex;
   flex-direction: column;
-  gap: 14px;
-  width: min(320px, 80vw);
+  gap: 10px;
+  width: min(280px, 80vw);
 }
-/* Home actions are the brand showcase — full-width pills, a touch taller. */
+/* Home navigation uses the same compact sizing as modal actions. */
 .home-btn {
   width: 100%;
-  font-size: 15px;
-  padding: 14px 22px;
+  font-size: 13px;
+  padding: 8px 16px;
 }
 /* Projects + its settings icon sit on one row; the pill flexes, icon is fixed. */
 .home-projects-row {
@@ -696,8 +696,8 @@ body {
 }
 .home-settings {
   flex: 0 0 auto;
-  width: 48px;
-  height: 48px;
+  width: 36px;
+  height: 36px;
 }
 /* Serve button while live: glossy green pill, so "on" reads at a glance. */
 .home-serve-active {
@@ -1105,12 +1105,115 @@ body {
   gap: 10px;
   margin-top: 26px;
 }
+
+/* Internet radio reuses the modal system, with a larger version of the title
+   usage meter as its volume control. */
+.radio-modal {
+  width: min(480px, 90vw);
+}
+.radio-station-select {
+  appearance: auto;
+  cursor: pointer;
+}
+.radio-station-description {
+  min-height: 19px;
+  word-break: normal;
+}
+.radio-player-row {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-top: 22px;
+}
+.radio-play-button {
+  min-width: 104px;
+}
+.radio-volume-heading {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  margin-top: 24px;
+  font-family: var(--mono);
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+}
+.radio-volume-heading .modal-label {
+  margin: 0;
+}
+.radio-volume-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin-top: 10px;
+}
+.radio-volume-slider {
+  position: relative;
+  height: 22px;
+  flex: 1 1 auto;
+}
+.radio-volume-track {
+  position: absolute;
+  inset: 2px 0;
+  overflow: hidden;
+  border: 1px solid #313131;
+  border-radius: var(--radius-pill);
+  background: radial-gradient(circle, #1b2735, #090a0f);
+  box-shadow: 0 2px 6px rgba(0, 0, 0, 0.45);
+}
+.radio-volume-fill {
+  height: 100%;
+  min-width: 1px;
+  border-radius: inherit;
+  background: linear-gradient(90deg, #00f260, #0575e6);
+  box-shadow:
+    0 0 5px #00f260,
+    0 0 9px #0575e6;
+}
+.radio-volume-input {
+  appearance: none;
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  height: 100%;
+  margin: 0;
+  background: transparent;
+  cursor: pointer;
+}
+.radio-volume-input::-webkit-slider-runnable-track {
+  height: 18px;
+  background: transparent;
+}
+.radio-volume-input::-webkit-slider-thumb {
+  appearance: none;
+  width: 18px;
+  height: 18px;
+  border: 2px solid rgba(255, 255, 255, 0.85);
+  border-radius: 50%;
+  background: #111820;
+  box-shadow:
+    0 0 0 2px rgba(5, 117, 230, 0.4),
+    0 2px 7px rgba(0, 0, 0, 0.65);
+  transition:
+    transform 90ms ease,
+    box-shadow 90ms ease;
+}
+
+.radio-volume-input:active::-webkit-slider-thumb {
+  transform: scale(1.08);
+  box-shadow:
+    0 0 0 3px rgba(5, 117, 230, 0.5),
+    0 2px 9px rgba(0, 0, 0, 0.72);
+}
 /* Modal actions are glossy pills: neutral by default, .primary = violet. */
 .modal-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
   background: var(--gloss-neutral);
   color: var(--text-secondary);
   border: 1px solid rgba(255, 255, 255, 0.12);
-  border-radius: var(--radius-button);
+  border-radius: var(--radius-pill);
   box-shadow: var(--gloss-shadow-neutral);
   font-family: var(--sans);
   font-size: 13px;
@@ -1226,7 +1329,17 @@ body {
 .whatsnew-section:last-child {
   margin-bottom: 0;
 }
+.whatsnew-section.latest {
+  margin-bottom: 20px;
+  padding: 16px 16px 18px;
+  border: 1px solid var(--border-strong);
+  border-radius: var(--radius-card);
+  background: var(--surface-1);
+}
 .whatsnew-version {
+  display: flex;
+  align-items: center;
+  gap: 8px;
   font-family: var(--sans);
   font-size: 12px;
   font-weight: 700;
@@ -1234,6 +1347,28 @@ body {
   text-transform: uppercase;
   color: var(--text-dim);
   margin-bottom: 12px;
+}
+.whatsnew-section.latest .whatsnew-version {
+  color: var(--text-secondary);
+}
+.whatsnew-history-divider {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  margin: 2px 0 18px;
+  color: var(--text-muted);
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+}
+.whatsnew-history-divider::before,
+.whatsnew-history-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: color-mix(in srgb, var(--border) 78%, transparent);
 }
 .whatsnew-list {
   list-style: none;
@@ -1257,6 +1392,11 @@ body {
   left: 4px;
   top: -0.5px;
   color: var(--primary);
+  font-weight: 700;
+}
+.whatsnew-highlight {
+  color: color-mix(in srgb, var(--secondary) 72%, var(--text));
+  font: inherit;
   font-weight: 700;
 }
 
@@ -1428,7 +1568,7 @@ body {
 /* Scope toggle on its own row (Global / Project). */
 .mcp-scope-toggle {
   display: flex;
-  gap: 4px;
+  gap: 10px;
   margin-top: 10px;
 }
 /* In-transcript task header row (shown at the top of a task's session). */
@@ -1501,7 +1641,7 @@ body {
 .badge {
   display: inline-flex;
   align-items: center;
-  border: 1px solid;
+  border: 1px solid rgba(255, 255, 255, 0.12);
   border-radius: var(--radius-pill);
   padding: 1px 8px;
   font-family: var(--mono);
@@ -1509,6 +1649,9 @@ body {
   font-weight: 600;
   line-height: 1.5;
   white-space: nowrap;
+  color: var(--text-secondary);
+  background: var(--gloss-neutral);
+  box-shadow: var(--gloss-shadow-neutral);
 }
 .picker-preview {
   flex: 1;

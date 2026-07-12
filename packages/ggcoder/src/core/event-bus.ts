@@ -1,4 +1,5 @@
 import type { AgentEvent } from "@kenkaiiii/gg-agent";
+import type { SubAgentSnapshot } from "./subagent-manager.js";
 
 // ── Event Map ──────────────────────────────────────────────
 
@@ -40,6 +41,9 @@ export interface BusEventMap {
   // Agent self-correction hooks (ideal review / loop-break / re-grounding).
   // Carries only the semantic kind; the presentation layer owns text + color.
   hook: { kind: "ideal" | "loop_break" | "regrounding" };
+
+  // Persistent async child lifecycle (bounded metadata/output snapshot).
+  subagent_state: SubAgentSnapshot;
 
   // Session lifecycle
   session_start: { sessionId: string };

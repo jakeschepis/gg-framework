@@ -1,5 +1,77 @@
 # @kenkaiiii/ggcoder
 
+## 5.13.3
+
+### Patch Changes
+
+- Align OpenAI prompt caching with Codex and improve cache-safe sub-agent routing.
+  - @kenkaiiii/gg-ai@5.13.3
+  - @kenkaiiii/gg-agent@5.13.3
+  - @kenkaiiii/gg-core@5.13.3
+
+## 5.13.2
+
+### Patch Changes
+
+- c0553e1: Bound historical tool-call arguments during compaction and stop retrying timed-out summary requests.
+  - @kenkaiiii/gg-ai@5.13.2
+  - @kenkaiiii/gg-agent@5.13.2
+  - @kenkaiiii/gg-core@5.13.2
+
+## 5.13.1
+
+### Patch Changes
+
+- Keep internet radio playback continuous while changing volume.
+  - @kenkaiiii/gg-ai@5.13.1
+  - @kenkaiiii/gg-agent@5.13.1
+  - @kenkaiiii/gg-core@5.13.1
+
+## 5.13.0
+
+### Minor Changes
+
+- Add parallel specialist orchestration and reliable app-exit radio cleanup.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.13.0
+- @kenkaiiii/gg-agent@5.13.0
+- @kenkaiiii/gg-core@5.13.0
+
+## 5.12.0
+
+### Minor Changes
+
+- Add concurrent async subagent orchestration with steering, follow-up, interruption, lifecycle tracking, and shared-workspace safeguards.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.12.0
+- @kenkaiiii/gg-agent@5.12.0
+- @kenkaiiii/gg-core@5.12.0
+
+## 5.11.0
+
+### Minor Changes
+
+- Add GPT-5.6 Ultra orchestration with proactive parallel subagent delegation.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.11.0
+- @kenkaiiii/gg-agent@5.11.0
+- @kenkaiiii/gg-core@5.11.0
+
+## 5.10.1
+
+### Patch Changes
+
+- Fix GPT-5.6 Sol, Terra, and Luna access through the ChatGPT Codex transport.
+  - @kenkaiiii/gg-ai@5.10.1
+  - @kenkaiiii/gg-agent@5.10.1
+  - @kenkaiiii/gg-core@5.10.1
+
 ## 5.10.0
 
 ### Minor Changes

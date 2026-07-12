@@ -1,4 +1,6 @@
 import type { AgentTool } from "@kenkaiiii/gg-agent";
+import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
+import { SubAgentManager, type SubAgentSnapshot } from "../core/subagent-manager.js";
 import { ProcessManager } from "../core/process-manager.js";
 import { LspManager } from "../core/lsp/manager.js";
 import { createReadTool } from "./read.js";
@@ -11,6 +13,7 @@ import { createGrepTool } from "./grep.js";
 import { createSearchCodeTool } from "./search-code.js";
 import { createLsTool } from "./ls.js";
 import { createSubAgentTool } from "./subagent.js";
+import { createSubAgentControlTools } from "./subagent-control.js";
 import { createWebFetchTool } from "./web-fetch.js";
 import { createWebSearchTool } from "./web-search.js";
 import { createSourcePathTool } from "./source-path.js";
@@ -31,7 +34,7 @@ import type { Skill } from "../core/skills.js";
 export interface CreateToolsOptions {
   agents?: AgentDefinition[];
   skills?: Skill[];
-  provider?: string;
+  provider?: Provider;
   model?: string;
   /** Custom I/O operations for remote execution (SSH, Docker, etc.). Defaults to local filesystem. */
   operations?: ToolOperations;
@@ -61,8 +64,13 @@ export interface CreateToolsOptions {
    */
   getCacheKey?: () => string | undefined;
   /** Current parent provider/model, evaluated lazily when spawning a sub-agent. */
-  getProvider?: () => string;
+  getProvider?: () => Provider;
   getModel?: () => string;
+  getThinkingLevel?: () => ThinkingLevel | undefined;
+  getBaseUrl?: () => string | undefined;
+  onSubAgentState?: (snapshot: SubAgentSnapshot) => void;
+  /** Persistent child workers omit async orchestration to enforce one-level fan-out. */
+  disableAsyncSubagents?: boolean;
   /**
    * Append LSP diagnostics to edit/write results (default true). Servers are
    * resolved from the project/PATH only and spawn lazily on the first edit of
@@ -97,6 +105,7 @@ export interface CreateToolsResult {
    * `shutdownAll()` into their exit/cleanup paths alongside processManager.
    */
   lspManager?: LspManager;
+  subAgentManager?: SubAgentManager;
 }
 
 export async function createTools(
@@ -162,6 +171,7 @@ export async function createTools(
     tools.push(createWebSearchTool());
   }
 
+  let subAgentManager: SubAgentManager | undefined;
   if (opts?.agents && opts.agents.length > 0 && opts.provider && opts.model) {
     tools.push(
       createSubAgentTool(
@@ -173,6 +183,19 @@ export async function createTools(
         planModeRef,
       ),
     );
+    if (!opts.disableAsyncSubagents) {
+      subAgentManager = new SubAgentManager({
+        cwd,
+        agents: opts.agents,
+        getProvider: () => opts.getProvider?.() ?? opts.provider!,
+        getModel: () => opts.getModel?.() ?? opts.model!,
+        getThinkingLevel: () => opts.getThinkingLevel?.(),
+        getCacheKey: opts.getCacheKey,
+        getBaseUrl: opts.getBaseUrl,
+        onState: opts.onSubAgentState,
+      });
+      tools.push(...createSubAgentControlTools(subAgentManager, planModeRef));
+    }
   }
 
   if (opts?.skills && opts.skills.length > 0) {
@@ -203,7 +226,7 @@ export async function createTools(
   const rebuildReadTool = (model: string): AgentTool =>
     createReadTool(cwd, readFiles, ops, opts?.onFileRead, getVideoByteLimit(model));
 
-  return { tools, processManager, rebuildReadTool, lspManager };
+  return { tools, processManager, rebuildReadTool, lspManager, subAgentManager };
 }
 
 export { createReadTool } from "./read.js";

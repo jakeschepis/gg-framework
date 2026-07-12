@@ -14,12 +14,13 @@ export function Badge({
   color?: string;
 }): React.ReactElement {
   const style = color
-    ? { color, backgroundColor: `${color}22`, borderColor: `${color}55` }
-    : {
-        color: theme.textSecondary,
-        backgroundColor: theme.surface1,
-        borderColor: theme.border,
-      };
+    ? {
+        color,
+        background: `linear-gradient(180deg, ${color}38 0%, ${color}18 100%)`,
+        borderColor: `${color}66`,
+        boxShadow: "0 1px 2px rgba(0, 0, 0, 0.3), inset 0 1px 0 rgba(255, 255, 255, 0.2)",
+      }
+    : undefined;
   return (
     <span className="badge" style={style}>
       {children}

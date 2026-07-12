@@ -8,7 +8,6 @@ import { MemeLayer } from "./MemeLayer";
 import { SettingsModal } from "./SettingsModal";
 import { TelegramSettingsModal } from "./TelegramSettingsModal";
 import { McpModal } from "./McpModal";
-import { SoundButton } from "./SoundButton";
 import {
   waitForReady,
   getSettings,
@@ -205,9 +204,8 @@ export function HomeScreen({ onProjects, onLogin }: Props): React.ReactElement {
           >
             Your Projects
           </button>
-          <SoundButton />
           <button
-            className="btn btn-ghost btn-icon home-settings"
+            className="btn btn-ghost btn-icon btn-nav-icon home-settings"
             title="Settings"
             onClick={() => setShowSettings(true)}
           >
@@ -235,7 +233,7 @@ export function HomeScreen({ onProjects, onLogin }: Props): React.ReactElement {
             {serveBusy ? "Working\u2026" : serving ? "\u25CF Remote · Stop" : "Remote"}
           </button>
           <button
-            className="btn btn-ghost btn-icon home-settings"
+            className="btn btn-ghost btn-icon btn-nav-icon home-settings"
             title="Telegram setup"
             onClick={() => setShowTelegram(true)}
           >

@@ -922,9 +922,8 @@ async fn agent_kill_task(
     res.json::<serde_json::Value>().await.map_err(|e| e.to_string())
 }
 
-/// Proxy: radio state for THIS window's sidecar — `{ stations, current }`.
-/// Playback lives in the per-window sidecar process, so each window's radio is
-/// independent (opening more windows never duplicates audio).
+/// Proxy: app-wide radio state — `{ stations, current, volume }`.
+/// All windows share the daemon's single player, preventing duplicate audio.
 #[tauri::command]
 async fn agent_radio_state(
     webview: WebviewWindow,
@@ -970,6 +969,37 @@ async fn agent_radio_set(
             .unwrap_or("radio request failed")
             .to_string();
         return Err(msg);
+    }
+    Ok(body)
+}
+
+/// Proxy: set app-wide radio volume from 0 to 100.
+#[tauri::command]
+async fn agent_radio_volume(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    volume: f64,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!("{}/radio/volume", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .json(&serde_json::json!({ "volume": volume }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body = res
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("radio volume request failed")
+            .to_string());
     }
     Ok(body)
 }
@@ -1599,7 +1629,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "anthropic",
         label: "Anthropic",
-        description: "Claude Opus 4.8, Fable 5, Sonnet 4.6, Haiku 4.5",
+        description: "Claude Fable 5, Opus 4.8, Sonnet 5, Haiku 4.5",
         methods: &["oauth"],
         api_key_label: None,
         api_key_base_url: None,
@@ -1608,7 +1638,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "openai",
         label: "OpenAI",
-        description: "GPT-5.5, GPT-5.5 Pro, GPT-5.4, GPT-5.3 Codex",
+        description: "GPT-5.6 Sol, GPT-5.6 Terra, GPT-5.6 Luna, GPT-5.5",
         methods: &["oauth"],
         api_key_label: None,
         api_key_base_url: None,
@@ -1617,7 +1647,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "gemini",
         label: "Gemini",
-        description: "Gemini 3.1 Flash Lite Preview",
+        description: "Gemini 3.1 Flash Lite, Gemini 3.5 Flash, Gemini 3.1 Pro (Preview)",
         methods: &["oauth"],
         api_key_label: None,
         api_key_base_url: None,
@@ -1635,7 +1665,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "glm",
         label: "Z.AI (GLM)",
-        description: "GLM-5.1, GLM-4.7, GLM-4.7 Flash",
+        description: "GLM-5.2, GLM-5.1, GLM-4.7, GLM-4.7 Flash",
         methods: &["apikey"],
         api_key_label: Some("Z.AI"),
         api_key_base_url: None,
@@ -1682,7 +1712,7 @@ const AUTH_PROVIDERS: &[ProviderMeta] = &[
     ProviderMeta {
         value: "openrouter",
         label: "OpenRouter",
-        description: "Qwen3.6-Plus, multi-provider gateway",
+        description: "Multi-provider gateway",
         methods: &["apikey"],
         api_key_label: Some("OpenRouter"),
         api_key_base_url: None,
@@ -3350,6 +3380,7 @@ pub fn run() {
             agent_kill_task,
             agent_radio_state,
             agent_radio_set,
+            agent_radio_volume,
             agent_tasks,
             agent_run_tasks,
             agent_delete_task,

@@ -21,6 +21,7 @@ import { parseArgs } from "node:util";
 import { formatError, type ToolResultContent } from "@kenkaiiii/gg-ai";
 import type { AddressInfo } from "node:net";
 import { runJsonMode } from "./modes/json-mode.js";
+import { runSubagentWorkerMode } from "./modes/subagent-worker-mode.js";
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { AgentSession } from "./core/agent-session.js";
 import { buildKenSystemPrompt, buildKenAutopilotSystemPrompt } from "./core/ken-prompt.js";
@@ -85,7 +86,14 @@ import {
   markTaskInProgress,
 } from "./core/tasks-store.js";
 import { initLogger, log } from "./core/logger.js";
-import { RADIO_STATIONS, getCurrentStation, playRadio, stopRadio } from "./core/radio.js";
+import {
+  RADIO_STATIONS,
+  getCurrentStation,
+  getRadioVolume,
+  playRadio,
+  setRadioVolume,
+  stopRadio,
+} from "./core/radio.js";
 import { enrichProcessPath } from "./core/shell-path.js";
 import { downscaleForPreview, validateVisionImage } from "./utils/image.js";
 import { startServeMode, type ServeController } from "./modes/serve-mode.js";
@@ -659,6 +667,11 @@ function daemonJson(res: http.ServerResponse, status: number, body: unknown): vo
 }
 
 async function main(): Promise<void> {
+  // Hidden persistent-worker dispatch must win before strict JSON/server parsing.
+  if (process.argv.includes("--subagent-worker")) {
+    await runSubagentWorkerMode();
+    return;
+  }
   // Sub-agent JSON-mode dispatch must win before any sidecar/server setup.
   if (await runJsonModeIfRequested()) return;
 
@@ -910,16 +923,38 @@ async function main(): Promise<void> {
     log("INFO", "app-sidecar", "daemon listening", { port: String(addr.port), host });
   });
 
-  const shutdown = async (): Promise<void> => {
+  const shellPid = process.ppid;
+  let shuttingDown = false;
+  async function shutdown(): Promise<void> {
+    if (shuttingDown) return;
+    shuttingDown = true;
+    clearInterval(parentWatch);
     // Radio playback is app-wide (one stream across all windows), so it stops
     // at the daemon level, not per session.
     stopRadio();
     await Promise.all([...sessions.values()].map((c) => c.dispose().catch(() => {})));
     server.close();
     process.exit(0);
-  };
+  }
   process.on("SIGINT", () => void shutdown());
   process.on("SIGTERM", () => void shutdown());
+  process.once("exit", stopRadio);
+
+  // Tauri can disappear without delivering a signal (force-quit, dev runner
+  // teardown, crash). Detect reparenting or a dead shell so the daemon and its
+  // radio player do not survive as audible orphans.
+  const parentWatch = setInterval(() => {
+    let parentAlive = process.ppid === shellPid;
+    if (parentAlive && shellPid > 1) {
+      try {
+        process.kill(shellPid, 0);
+      } catch (error) {
+        parentAlive = (error as NodeJS.ErrnoException).code === "EPERM";
+      }
+    }
+    if (!parentAlive) void shutdown();
+  }, 1_000);
+  parentWatch.unref?.();
 }
 
 /** Ken's read-only tool allow-list. Excludes every mutating tool (write/edit/
@@ -1355,6 +1390,7 @@ async function createSession(
   });
   session.eventBus.on("model_change", (d) => broadcast("model_change", d));
   session.eventBus.on("hook", (d) => broadcast("hook", d));
+  session.eventBus.on("subagent_state", (d) => broadcast("subagent_state", d));
   session.eventBus.on("compaction_start", (d) => broadcast("compaction_start", d));
   session.eventBus.on("compaction_end", (d) => broadcast("compaction_end", d));
 
@@ -2494,13 +2530,19 @@ async function createSession(
                 id: string;
                 name: string;
                 args: Record<string, unknown>;
-              } => c.type === "tool_call" && c.name === "subagent",
+              } => c.type === "tool_call" && (c.name === "subagent" || c.name === "spawn_agent"),
             );
             if (subagentCalls.length > 0) {
               const agents = subagentCalls.map((c) => {
                 const result = toolResultMap.get(c.id);
                 return {
-                  agentName: typeof c.args?.agent === "string" ? c.args.agent : undefined,
+                  agentName:
+                    c.name === "spawn_agent" && typeof c.args?.task_name === "string"
+                      ? c.args.task_name
+                      : typeof c.args?.agent === "string"
+                        ? c.args.agent
+                        : undefined,
+                  // Async workers are intentionally non-resumable; restored rows are historical.
                   status: result?.isError ? ("error" as const) : ("done" as const),
                   toolUseCount: 0,
                 };
@@ -2802,7 +2844,34 @@ async function createSession(
     // duplicate audio across windows (the original per-window goal), now for
     // free. (To restore per-window radio, key playback by sessionId.)
     if (method === "GET" && url === "/radio") {
-      json(res, 200, { stations: RADIO_STATIONS, current: getCurrentStation() });
+      json(res, 200, {
+        stations: RADIO_STATIONS,
+        current: getCurrentStation(),
+        volume: getRadioVolume(),
+      });
+      return;
+    }
+
+    if (method === "POST" && url === "/radio/volume") {
+      void readBody(req).then((raw) => {
+        let volume: number;
+        try {
+          volume = Number((JSON.parse(raw) as { volume?: number }).volume);
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        if (!Number.isFinite(volume)) {
+          json(res, 400, { error: "volume must be a number" });
+          return;
+        }
+        const result = setRadioVolume(volume);
+        if (!result.ok) {
+          json(res, 400, { error: result.error ?? "Radio volume failed to update." });
+          return;
+        }
+        json(res, 200, { current: getCurrentStation(), volume: getRadioVolume() });
+      });
       return;
     }
 
