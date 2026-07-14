@@ -22,6 +22,13 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.20.1",
+    date: "2026-07-13",
+    items: [
+      "Your coding history is back where it belongs. I fixed the `Projects` picker so moving through `Chat` no longer hides your recent coding sessions, and you can jump straight back into the work you left.",
+    ],
+  },
+  {
     version: "0.20.0",
     date: "2026-07-13",
     items: [
