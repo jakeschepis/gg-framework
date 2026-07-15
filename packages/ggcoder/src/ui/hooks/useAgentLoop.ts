@@ -12,7 +12,7 @@ import type {
 import type { IdealReviewStats } from "../../core/ideal-review.js";
 import {
   detectTextRepetition,
-  toolCallSignature,
+  ToolCallProgressTracker,
   type LoopBreakStats,
 } from "../../core/loop-breaker.js";
 import { getClaudeCliUserAgent } from "../../core/claude-code-version.js";
@@ -300,11 +300,10 @@ export function useAgentLoop(
   });
   const idealReviewInjectedRef = useRef(false);
   // ── Loop-breaker tracking ──
-  const loopSignatureCountsRef = useRef<Map<string, number>>(new Map());
+  const loopProgressTrackerRef = useRef(new ToolCallProgressTracker());
   const fileEditCountsRef = useRef<Map<string, number>>(new Map());
   const consecutiveFailuresRef = useRef(0);
-  const maxSignatureRepeatsRef = useRef(0);
-  const maxSameFileEditsRef = useRef(0);
+  const repeatedNoProgressCallsRef = useRef(0);
   const loopBreakInjectedRef = useRef(false);
   // ── Re-grounding tracking ──
   const compactionOccurredRef = useRef(false);
@@ -488,11 +487,10 @@ export function useAgentLoop(
           bashCalls: 0,
         };
         idealReviewInjectedRef.current = false;
-        loopSignatureCountsRef.current = new Map();
+        loopProgressTrackerRef.current.reset();
         fileEditCountsRef.current = new Map();
         consecutiveFailuresRef.current = 0;
-        maxSignatureRepeatsRef.current = 0;
-        maxSameFileEditsRef.current = 0;
+        repeatedNoProgressCallsRef.current = 0;
         loopBreakInjectedRef.current = false;
         compactionOccurredRef.current = false;
         regroundingInjectedRef.current = false;
@@ -634,8 +632,7 @@ export function useAgentLoop(
               if (!loopBreakInjectedRef.current && options.getLoopBreakMessage) {
                 const loopBreakMessage = options.getLoopBreakMessage({
                   consecutiveFailures: consecutiveFailuresRef.current,
-                  maxSignatureRepeats: maxSignatureRepeatsRef.current,
-                  maxSameFileEdits: maxSameFileEditsRef.current,
+                  repeatedNoProgressCalls: repeatedNoProgressCallsRef.current,
                   textRepetitionDetected: detectTextRepetition(textVisibleRef.current),
                 });
                 if (loopBreakMessage) {
@@ -828,18 +825,17 @@ export function useAgentLoop(
                 } else {
                   consecutiveFailuresRef.current = 0;
                 }
-                {
-                  const sig = toolCallSignature(toolName, tc?.args);
-                  const next = (loopSignatureCountsRef.current.get(sig) ?? 0) + 1;
-                  loopSignatureCountsRef.current.set(sig, next);
-                  if (next > maxSignatureRepeatsRef.current) maxSignatureRepeatsRef.current = next;
-                }
+                repeatedNoProgressCallsRef.current = loopProgressTrackerRef.current.record(
+                  toolName,
+                  tc?.args,
+                  event.result,
+                  event.isError,
+                );
                 if ((toolName === "edit" || toolName === "write") && tc?.args) {
                   const filePath = (tc.args as { file_path?: unknown }).file_path;
                   if (typeof filePath === "string") {
                     const next = (fileEditCountsRef.current.get(filePath) ?? 0) + 1;
                     fileEditCountsRef.current.set(filePath, next);
-                    if (next > maxSameFileEditsRef.current) maxSameFileEditsRef.current = next;
                   }
                 }
                 // Track lines changed for edit tools

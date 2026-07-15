@@ -86,6 +86,7 @@ import { Confetti } from "./Confetti";
 import { RankBadge } from "./RankBadge";
 import { ScorecardModal } from "./ScorecardModal";
 import { TitleUsageMeter } from "./TitleUsageMeter";
+import { WorkspaceHeader } from "./WorkspaceHeader";
 import { useProgress } from "./useProgress";
 import { LoginScreen } from "./LoginScreen";
 import { Markdown, PromptSendProvider } from "./Markdown";
@@ -1868,173 +1869,141 @@ function App(): React.ReactElement {
     >
       {confettiNonce && <Confetti key={confettiNonce} />}
 
-      <div className="chat-head">
-        {/* Top strip — the macOS traffic-light row. Holds the window title (where
-            the native title used to sit) and the show/hide toggle. Always
-            present, so collapsing the nav below never moves the title up into
-            the traffic lights. */}
-        <div className="chat-head-strip" data-tauri-drag-region>
-          {/* The title fills the strip (flex:1), so it must carry the drag
-              attribute itself — Tauri only drags when the element directly under
-              the cursor has it, and a bare child would otherwise block dragging
-              across the whole bar. */}
-          <span className="chat-head-title" data-tauri-drag-region>
-            {sessionTitle ?? (workspaceMode === "chat" ? "GG Chat" : "GG Coder")}
-          </span>
-          <TitleUsageMeter currentProvider={state?.provider ?? ""} />
-          {windowTotal > 1 && windowIndex !== null && (
-            <span
-              className={`window-index${isThisFocused ? "" : " dim"}`}
-              data-tauri-drag-region
-              title={`Window ${windowIndex} of ${windowTotal} · ⌘\` to cycle`}
-            >
-              {windowIndex}/{windowTotal}
-            </span>
-          )}
-          {workspaceMode === "code" && (
-            <button
-              className="nav-toggle"
-              title={navHidden ? "Show nav buttons" : "Hide nav buttons"}
-              aria-label={navHidden ? "Show nav buttons" : "Hide nav buttons"}
-              onClick={toggleNav}
-            >
-              <svg
-                width="14"
-                height="14"
-                viewBox="0 0 24 24"
-                fill="none"
-                stroke="currentColor"
-                strokeWidth="2"
-                strokeLinecap="round"
-                strokeLinejoin="round"
-                style={{ display: "block" }}
+      <WorkspaceHeader
+        workspaceMode={workspaceMode}
+        sessionTitle={sessionTitle}
+        navHidden={navHidden}
+        onToggleNav={toggleNav}
+        stripExtras={
+          <>
+            <TitleUsageMeter currentProvider={state?.provider ?? ""} />
+            {windowTotal > 1 && windowIndex !== null && (
+              <span
+                className={`window-index${isThisFocused ? "" : " dim"}`}
+                data-tauri-drag-region
+                title={`Window ${windowIndex} of ${windowTotal} · ⌘\` to cycle`}
               >
-                <polyline points={navHidden ? "6 9 12 15 18 9" : "6 15 12 9 18 15"} />
-              </svg>
-            </button>
-          )}
+                {windowIndex}/{windowTotal}
+              </span>
+            )}
+          </>
+        }
+      >
+        <BackButton
+          label={workspaceMode === "chat" ? "Back to chats" : "Back to this project's sessions"}
+          onClick={() => setShowPicker(true)}
+        />
+        <div className="rank-badge-wrap">
+          <RankBadge
+            snapshot={progress}
+            celebrateNonce={rankCelebrateNonce}
+            onClick={() => setShowScorecard(true)}
+          />
+          <div className="rank-xp-chip-layer" aria-hidden="true">
+            {xpChips.map((chip) => (
+              <span className="rank-xp-chip" key={chip.id}>
+                {chip.label}
+              </span>
+            ))}
+          </div>
         </div>
-
-        {/* Nav row — the action buttons. Collapsed away by the toggle. */}
-        {(workspaceMode === "chat" || !navHidden) && (
-          <div className="chat-head-nav" data-tauri-drag-region>
-            <BackButton
-              label={workspaceMode === "chat" ? "Back to chats" : "Back to this project's sessions"}
-              onClick={() => setShowPicker(true)}
-            />
-            <div className="rank-badge-wrap">
-              <RankBadge
-                snapshot={progress}
-                celebrateNonce={rankCelebrateNonce}
-                onClick={() => setShowScorecard(true)}
+        {workspaceMode === "chat" ? (
+          <span className="picker-head-actions">
+            <button
+              className="btn btn-primary btn-sm"
+              disabled={running}
+              title="Start a new chat"
+              onClick={() => setConfirmNewSession(true)}
+            >
+              {"+ New"}
+            </button>
+            <button
+              className="btn btn-sm btn-ghost"
+              title="View and curate chat memories and Jiwa"
+              onClick={() => setShowMemories(true)}
+            >
+              Brain
+            </button>
+            <RadioButton />
+            <WindowLayoutButton />
+          </span>
+        ) : (
+          <>
+            <span className="picker-head-actions">
+              <AutopilotToggle
+                checked={state?.autopilot ?? false}
+                disabled={running || autopilotReviewing}
+                onChange={(next) => {
+                  setState((s) => (s ? { ...s, autopilot: next } : s));
+                  void setAutopilot(next);
+                  setKenPowerBanner(next ? "on" : "off");
+                  // Dedicated cues for turning autopilot on/off (not the generic
+                  // click, suppressed via data-suppress-click-sound).
+                  playSound(next ? "autopilotOn" : "autopilotOff");
+                }}
               />
-              <div className="rank-xp-chip-layer" aria-hidden="true">
-                {xpChips.map((chip) => (
-                  <span className="rank-xp-chip" key={chip.id}>
-                    {chip.label}
-                  </span>
-                ))}
-              </div>
-            </div>
-            {workspaceMode === "chat" ? (
-              <span className="picker-head-actions">
-                <button
-                  className="btn btn-primary btn-sm"
-                  disabled={running}
-                  title="Start a new chat"
-                  onClick={() => setConfirmNewSession(true)}
-                >
-                  {"+ New"}
-                </button>
+              <button
+                className="btn btn-primary btn-sm"
+                disabled={running}
+                title="Start a new session for this project"
+                onClick={() => setConfirmNewSession(true)}
+              >
+                {"+ New"}
+              </button>
+              <button
+                className="btn btn-sm btn-ghost"
+                title="Open your notes for this project"
+                onClick={() => setShowNotes(true)}
+              >
+                Notes
+              </button>
+              <button
+                className="btn btn-sm btn-ghost"
+                title="View and run this project's tasks"
+                onClick={openTasks}
+              >
+                {projectTasks.some((t) => t.status !== "done")
+                  ? `Tasks (${projectTasks.filter((t) => t.status !== "done").length})`
+                  : "Tasks"}
+              </button>
+              <RadioButton />
+              {/* <GazeButton /> */}
+              <WindowLayoutButton
+                onArrange={() => {
+                  setNavHiddenPersisted(true);
+                  setToolsHiddenPersisted(true);
+                }}
+              />
+              {needsGitInit ? (
                 <button
                   className="btn btn-sm btn-ghost"
-                  title="View and curate durable chat memories"
-                  onClick={() => setShowMemories(true)}
+                  disabled={running}
+                  title="Initialize git + create a GitHub repository"
+                  onClick={() => setShowInitGit(true)}
                 >
-                  Memories
+                  {"Initialize Git"}
                 </button>
-                <RadioButton />
-                <WindowLayoutButton />
-              </span>
-            ) : (
-              <>
-                <span className="picker-head-actions">
-                  <AutopilotToggle
-                    checked={state?.autopilot ?? false}
-                    disabled={running || autopilotReviewing}
-                    onChange={(next) => {
-                      setState((s) => (s ? { ...s, autopilot: next } : s));
-                      void setAutopilot(next);
-                      setKenPowerBanner(next ? "on" : "off");
-                      // Dedicated cues for turning autopilot on/off (not the generic
-                      // click, suppressed via data-suppress-click-sound).
-                      playSound(next ? "autopilotOn" : "autopilotOff");
-                    }}
-                  />
+              ) : (
+                commitCommand && (
                   <button
-                    className="btn btn-primary btn-sm"
+                    className={`btn btn-sm ${hasCommit ? "btn-success" : "btn-ghost"}`}
                     disabled={running}
-                    title="Start a new session for this project"
-                    onClick={() => setConfirmNewSession(true)}
+                    title={hasCommit ? "Run /commit" : "Generate a /commit command"}
+                    onClick={() =>
+                      submitText(
+                        `/${commitCommand}`,
+                        hasCommit ? "Committing\u2026" : "Setting up commits\u2026",
+                      )
+                    }
                   >
-                    {"+ New"}
+                    {`/${commitCommand}`}
                   </button>
-                  <button
-                    className="btn btn-sm btn-ghost"
-                    title="Open your notes for this project"
-                    onClick={() => setShowNotes(true)}
-                  >
-                    Notes
-                  </button>
-                  <button
-                    className="btn btn-sm btn-ghost"
-                    title="View and run this project's tasks"
-                    onClick={openTasks}
-                  >
-                    {projectTasks.some((t) => t.status !== "done")
-                      ? `Tasks (${projectTasks.filter((t) => t.status !== "done").length})`
-                      : "Tasks"}
-                  </button>
-                  <RadioButton />
-                  {/* <GazeButton /> */}
-                  <WindowLayoutButton
-                    onArrange={() => {
-                      setNavHiddenPersisted(true);
-                      setToolsHiddenPersisted(true);
-                    }}
-                  />
-                  {needsGitInit ? (
-                    <button
-                      className="btn btn-sm btn-ghost"
-                      disabled={running}
-                      title="Initialize git + create a GitHub repository"
-                      onClick={() => setShowInitGit(true)}
-                    >
-                      {"Initialize Git"}
-                    </button>
-                  ) : (
-                    commitCommand && (
-                      <button
-                        className={`btn btn-sm ${hasCommit ? "btn-success" : "btn-ghost"}`}
-                        disabled={running}
-                        title={hasCommit ? "Run /commit" : "Generate a /commit command"}
-                        onClick={() =>
-                          submitText(
-                            `/${commitCommand}`,
-                            hasCommit ? "Committing\u2026" : "Setting up commits\u2026",
-                          )
-                        }
-                      >
-                        {`/${commitCommand}`}
-                      </button>
-                    )
-                  )}
-                </span>
-              </>
-            )}
-          </div>
+                )
+              )}
+            </span>
+          </>
         )}
-      </div>
+      </WorkspaceHeader>
 
       {/* Non-scrolling frame the same size as the chat viewport. The banner
           lives HERE, not inside `.transcript` — `.transcript` scrolls, and an
@@ -2333,7 +2302,7 @@ function App(): React.ReactElement {
               </span>
             )}
             <span className="footer-right footer-reveal">
-              {workspaceMode === "code" && contextPct > 0 && (
+              {contextPct > 0 && (
                 <>
                   <ContextMeter pct={contextPct} />
                   <FooterSep />

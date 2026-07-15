@@ -33,6 +33,7 @@ import {
   switchChatAgent,
   type ChatAgentId,
 } from "./chat-agents/index.js";
+import { buildJiwaTools, JiwaStore } from "./chat-agents/jiwa.js";
 import { buildMemoryTools, MemoryStore } from "./chat-agents/memory.js";
 import { buildKenSystemPrompt, buildKenAutopilotSystemPrompt } from "./core/ken-prompt.js";
 import {
@@ -739,6 +740,13 @@ async function main(): Promise<void> {
       }
     },
   });
+  const jiwaStore = new JiwaStore({
+    onChange: ({ jiwa }) => {
+      for (const ctx of sessions.values()) {
+        ctx.broadcast("jiwa_change", { count: jiwa.length });
+      }
+    },
+  });
 
   // XP/rank progress — loaded once per daemon; awards fan out to every window.
   // Each frame is tagged `origin: true` only for the session that earned the
@@ -872,7 +880,7 @@ async function main(): Promise<void> {
         const id = randomUUID();
         try {
           const ctx = await createSession(
-            { auth, paths, progress, memoryStore },
+            { auth, paths, progress, memoryStore, jiwaStore },
             { id, mode, chatAgent, cwd: sessionCwd, sessionPath },
           );
           sessions.set(id, ctx);
@@ -1185,6 +1193,7 @@ async function createSession(
     paths: Awaited<ReturnType<typeof ensureAppDirs>>;
     progress: ProgressManager;
     memoryStore: MemoryStore;
+    jiwaStore: JiwaStore;
   },
   opts: {
     id: string;
@@ -1194,7 +1203,7 @@ async function createSession(
     sessionPath?: string;
   },
 ): Promise<SessionContext> {
-  const { auth, progress, memoryStore } = deps;
+  const { auth, progress, memoryStore, jiwaStore } = deps;
   const paths = deps.paths;
   const mode = opts.mode;
   let chatAgent = opts.chatAgent;
@@ -1342,8 +1351,9 @@ async function createSession(
     session = createChatAgent(chatAgent, {
       ...baseSessionOptions,
       sessionsDir: paths.sessionsDir,
-      additionalTools: buildMemoryTools(memoryStore),
-      getSystemPromptTail: () => memoryStore.renderForPrompt(),
+      additionalTools: [...buildMemoryTools(memoryStore), ...buildJiwaTools(jiwaStore)],
+      getSystemPromptTail: () =>
+        `${memoryStore.renderForPrompt()}\n\n${jiwaStore.renderForPrompt()}`,
       onAgentChange: async (nextAgent) => {
         chatAgent = nextAgent;
         broadcast("chat_agent_change", { chatAgent: nextAgent });
@@ -2197,6 +2207,31 @@ async function createSession(
       return;
     }
 
+    if (method === "GET" && url === "/jiwa") {
+      void jiwaStore
+        .snapshot()
+        .then((snapshot) => json(res, 200, snapshot))
+        .catch((error) =>
+          json(res, 500, { error: error instanceof Error ? error.message : String(error) }),
+        );
+      return;
+    }
+
+    if (method === "DELETE" && url.startsWith("/jiwa/")) {
+      const id = decodeURIComponent(url.slice("/jiwa/".length));
+      if (!id) {
+        json(res, 400, { error: "Jiwa entry id is required" });
+        return;
+      }
+      void jiwaStore
+        .forget(id)
+        .then(() => jiwaStore.snapshot())
+        .then((snapshot) => json(res, 200, snapshot))
+        .catch((error) =>
+          json(res, 500, { error: error instanceof Error ? error.message : String(error) }),
+        );
+      return;
+    }
     if (method === "GET" && (url === "/events" || url.startsWith("/events?"))) {
       res.writeHead(200, {
         "content-type": "text/event-stream",

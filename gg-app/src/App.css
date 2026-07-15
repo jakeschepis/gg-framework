@@ -4745,7 +4745,43 @@ body {
 .memory-modal-title {
   display: inline-flex;
   align-items: center;
+  flex-wrap: wrap;
   gap: 8px;
+}
+.brain-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 2px;
+  padding: 2px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-1);
+}
+.brain-tabs button {
+  min-height: 24px;
+  padding: 2px 8px;
+  border: 0;
+  border-radius: var(--radius-pill);
+  background: transparent;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-family: var(--sans);
+  font-size: 10px;
+  font-weight: 600;
+  transition:
+    background-color var(--t-fast),
+    color var(--t-fast);
+}
+.brain-tabs button:hover {
+  color: var(--text);
+}
+.brain-tabs button[aria-selected="true"] {
+  background: color-mix(in srgb, var(--primary) 18%, var(--surface-2));
+  color: var(--text);
+}
+.brain-tabs button:focus-visible {
+  outline: 2px solid var(--primary);
+  outline-offset: 1px;
 }
 .memory-table-wrap {
   max-height: min(480px, 64vh);

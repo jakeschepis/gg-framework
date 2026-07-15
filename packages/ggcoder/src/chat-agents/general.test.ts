@@ -26,6 +26,11 @@ describe("General chat agent", () => {
     const options = optionsOf(agent);
 
     expect(options.systemPrompt).toContain(GENERAL_CHAT_SYSTEM_PROMPT);
+    expect(options.systemPrompt).toContain("Durable memory curation:");
+    expect(options.systemPrompt).toContain("Jiwa curation:");
+    expect(options.systemPrompt).toContain(
+      "Put facts about the user or their world in durable memory",
+    );
     expect(options.systemPrompt).toContain("- Active agent: general");
     expect(options.systemPrompt).toContain("- Workspace root: /tmp/workspace");
     expect(options.promptCacheKeyPrefix).toBe("ggchat:general");

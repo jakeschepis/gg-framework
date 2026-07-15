@@ -66,7 +66,7 @@ import {
 import {
   evaluateLoopBreak,
   buildLoopBreakMessage,
-  toolCallSignature,
+  ToolCallProgressTracker,
   detectTextRepetition,
 } from "./loop-breaker.js";
 import { buildRegroundingMessage } from "./regrounding.js";
@@ -252,9 +252,8 @@ export class AgentSession {
   };
   private hookText = "";
   private hookConsecutiveFailures = 0;
-  private hookMaxSignatureRepeats = 0;
-  private hookMaxSameFileEdits = 0;
-  private hookSignatureCounts = new Map<string, number>();
+  private hookRepeatedNoProgressCalls = 0;
+  private hookProgressTracker = new ToolCallProgressTracker();
   private hookFileEditCounts = new Map<string, number>();
   private hookToolCalls = new Map<string, { name: string; args: Record<string, unknown> }>();
   private idealReviewInjected = false;
@@ -778,9 +777,8 @@ export class AgentSession {
     };
     this.hookText = "";
     this.hookConsecutiveFailures = 0;
-    this.hookMaxSignatureRepeats = 0;
-    this.hookMaxSameFileEdits = 0;
-    this.hookSignatureCounts.clear();
+    this.hookRepeatedNoProgressCalls = 0;
+    this.hookProgressTracker.reset();
     this.hookFileEditCounts.clear();
     this.hookToolCalls.clear();
     this.idealReviewInjected = false;
@@ -813,16 +811,17 @@ export class AgentSession {
         if (name === "edit") this.hookStats.editCalls += 1;
         if (name === "bash") this.hookStats.bashCalls += 1;
         this.hookConsecutiveFailures = event.isError ? this.hookConsecutiveFailures + 1 : 0;
-        const sig = toolCallSignature(name, args);
-        const sigNext = (this.hookSignatureCounts.get(sig) ?? 0) + 1;
-        this.hookSignatureCounts.set(sig, sigNext);
-        if (sigNext > this.hookMaxSignatureRepeats) this.hookMaxSignatureRepeats = sigNext;
+        this.hookRepeatedNoProgressCalls = this.hookProgressTracker.record(
+          name,
+          args,
+          event.result,
+          event.isError,
+        );
         if ((name === "edit" || name === "write") && args) {
           const filePath = (args as { file_path?: unknown }).file_path;
           if (typeof filePath === "string") {
             const fileNext = (this.hookFileEditCounts.get(filePath) ?? 0) + 1;
             this.hookFileEditCounts.set(filePath, fileNext);
-            if (fileNext > this.hookMaxSameFileEdits) this.hookMaxSameFileEdits = fileNext;
           }
         }
         if (name === "edit" && !event.isError) {
@@ -873,12 +872,14 @@ export class AgentSession {
     if (!this.loopBreakInjected) {
       const decision = evaluateLoopBreak({
         consecutiveFailures: this.hookConsecutiveFailures,
-        maxSignatureRepeats: this.hookMaxSignatureRepeats,
-        maxSameFileEdits: this.hookMaxSameFileEdits,
+        repeatedNoProgressCalls: this.hookRepeatedNoProgressCalls,
         textRepetitionDetected: detectTextRepetition(this.hookText),
       });
       if (decision.shouldBreak) {
         this.loopBreakInjected = true;
+        log("INFO", "loop-break", "Injecting loop-break nudge", {
+          reasons: decision.reasons.join(", "),
+        });
         this.eventBus.emit("hook", { kind: "loop_break" });
         return [buildLoopBreakMessage(decision.reasons)];
       }

@@ -59,6 +59,20 @@ export function isMemoryChangeEvent(event: SidecarEvent): event is MemoryChangeE
   );
 }
 
+export interface JiwaChangeEvent extends SidecarEvent {
+  type: "jiwa_change";
+  data: { count: number };
+}
+
+export function isJiwaChangeEvent(event: SidecarEvent): event is JiwaChangeEvent {
+  return (
+    event.type === "jiwa_change" &&
+    typeof event.data === "object" &&
+    event.data !== null &&
+    typeof (event.data as { count?: unknown }).count === "number"
+  );
+}
+
 /** A background process (bash run_in_background), mirrored from the sidecar. */
 export interface BackgroundTask {
   id: string;
@@ -91,6 +105,29 @@ export interface Memory {
 
 export interface MemorySnapshot {
   memories: Memory[];
+  softLimit: number;
+  hardLimit: number;
+}
+
+export type JiwaCategory =
+  | "identity"
+  | "voice"
+  | "interaction"
+  | "boundaries"
+  | "workflow"
+  | "other";
+
+export interface JiwaEntry {
+  id: string;
+  text: string;
+  category: JiwaCategory;
+  importance: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface JiwaSnapshot {
+  jiwa: JiwaEntry[];
   softLimit: number;
   hardLimit: number;
 }
@@ -180,6 +217,16 @@ export async function listMemories(): Promise<MemorySnapshot> {
 export async function deleteMemory(id: string): Promise<MemorySnapshot> {
   await waitForReady();
   return invoke<MemorySnapshot>("agent_delete_memory", { id });
+}
+
+export async function listJiwa(): Promise<JiwaSnapshot> {
+  await waitForReady();
+  return invoke<JiwaSnapshot>("agent_jiwa");
+}
+
+export async function deleteJiwa(id: string): Promise<JiwaSnapshot> {
+  await waitForReady();
+  return invoke<JiwaSnapshot>("agent_delete_jiwa", { id });
 }
 
 export interface ThinkingState {

@@ -3,6 +3,7 @@ import {
   buildLoopBreakMessage,
   detectTextRepetition,
   evaluateLoopBreak,
+  ToolCallProgressTracker,
   toolCallSignature,
 } from "./loop-breaker.js";
 
@@ -54,12 +55,49 @@ describe("detectTextRepetition", () => {
   });
 });
 
+describe("ToolCallProgressTracker", () => {
+  it("counts only consecutive identical calls with unchanged results", () => {
+    const tracker = new ToolCallProgressTracker();
+    expect(tracker.record("read", { file_path: "a.ts" }, "one", false)).toBe(1);
+    expect(tracker.record("read", { file_path: "a.ts" }, "one", false)).toBe(2);
+    expect(tracker.record("read", { file_path: "a.ts" }, "two", false)).toBe(1);
+    expect(tracker.record("read", { file_path: "b.ts" }, "two", false)).toBe(1);
+  });
+
+  it("treats successful iterative edits to one file as progress", () => {
+    const tracker = new ToolCallProgressTracker();
+    for (let i = 0; i < 6; i++) {
+      expect(
+        tracker.record(
+          "edit",
+          { file_path: "a.ts", old_text: `before-${i}`, new_text: `after-${i}` },
+          `diff-${i}`,
+          false,
+        ),
+      ).toBe(1);
+    }
+  });
+
+  it("does not count background polling as a stuck loop", () => {
+    const tracker = new ToolCallProgressTracker();
+    for (let i = 0; i < 5; i++) {
+      expect(tracker.record("task_output", { id: "job-1" }, "still running", false)).toBe(0);
+    }
+  });
+
+  it("does not count passive sleep commands as a stuck loop", () => {
+    const tracker = new ToolCallProgressTracker();
+    for (let i = 0; i < 3; i++) {
+      expect(tracker.record("bash", { command: "sleep 30" }, "", false)).toBe(0);
+    }
+  });
+});
+
 describe("evaluateLoopBreak", () => {
   it("does not break on healthy progress", () => {
     const decision = evaluateLoopBreak({
       consecutiveFailures: 1,
-      maxSignatureRepeats: 1,
-      maxSameFileEdits: 2,
+      repeatedNoProgressCalls: 1,
       textRepetitionDetected: false,
     });
     expect(decision.shouldBreak).toBe(false);
@@ -69,41 +107,36 @@ describe("evaluateLoopBreak", () => {
   it("breaks after repeated consecutive tool failures", () => {
     const decision = evaluateLoopBreak({
       consecutiveFailures: 3,
-      maxSignatureRepeats: 1,
-      maxSameFileEdits: 1,
+      repeatedNoProgressCalls: 1,
       textRepetitionDetected: false,
     });
     expect(decision.shouldBreak).toBe(true);
     expect(decision.reasons.join(" ")).toContain("3 consecutive failed tool calls");
   });
 
-  it("breaks when the identical tool call is repeated", () => {
+  it("breaks when an identical call repeatedly returns the same result", () => {
     const decision = evaluateLoopBreak({
       consecutiveFailures: 0,
-      maxSignatureRepeats: 3,
-      maxSameFileEdits: 1,
+      repeatedNoProgressCalls: 3,
       textRepetitionDetected: false,
     });
     expect(decision.shouldBreak).toBe(true);
-    expect(decision.reasons.join(" ")).toContain("identical tool call");
+    expect(decision.reasons.join(" ")).toContain("same result");
   });
 
-  it("breaks when one file is edited many times in a run", () => {
+  it("does not treat successful same-file edits as a loop", () => {
     const decision = evaluateLoopBreak({
       consecutiveFailures: 0,
-      maxSignatureRepeats: 1,
-      maxSameFileEdits: 5,
+      repeatedNoProgressCalls: 1,
       textRepetitionDetected: false,
     });
-    expect(decision.shouldBreak).toBe(true);
-    expect(decision.reasons.join(" ")).toContain("5 edits to the same file");
+    expect(decision.shouldBreak).toBe(false);
   });
 
   it("breaks when streaming text degenerates into repetition", () => {
     const decision = evaluateLoopBreak({
       consecutiveFailures: 0,
-      maxSignatureRepeats: 1,
-      maxSameFileEdits: 1,
+      repeatedNoProgressCalls: 1,
       textRepetitionDetected: true,
     });
     expect(decision.shouldBreak).toBe(true);

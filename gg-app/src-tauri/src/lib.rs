@@ -831,6 +831,65 @@ async fn agent_delete_memory(
     Ok(body)
 }
 
+/// Proxy: shared chat behavior instructions (Jiwa).
+#[tauri::command]
+async fn agent_jiwa(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .get(format!("{}/jiwa", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body = res
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("failed to load Jiwa")
+            .to_string());
+    }
+    Ok(body)
+}
+
+/// Proxy: delete exactly one shared Jiwa instruction.
+#[tauri::command]
+async fn agent_delete_jiwa(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    id: String,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .delete(format!("{}/jiwa/{}", sidecar_base(port), urlencoding(&id)))
+        .header("x-gg-session", &gg_sid)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body = res
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        return Err(body
+            .get("error")
+            .and_then(|value| value.as_str())
+            .unwrap_or("failed to delete Jiwa entry")
+            .to_string());
+    }
+    Ok(body)
+}
+
 /// Proxy: current XP/rank progress snapshot (Ranks system).
 #[tauri::command]
 async fn agent_progress(
@@ -3712,6 +3771,8 @@ pub fn run() {
             agent_state,
             agent_memories,
             agent_delete_memory,
+            agent_jiwa,
+            agent_delete_jiwa,
             agent_progress,
             agent_usage,
             agent_prompt,
