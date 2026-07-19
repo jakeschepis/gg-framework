@@ -78,7 +78,6 @@ function setup(
     setThinkingAccumMs: noop as unknown as AgentEventsDeps["setThinkingAccumMs"],
     setPlanTotal: noop as unknown as AgentEventsDeps["setPlanTotal"],
     setPlanDone: noop as unknown as AgentEventsDeps["setPlanDone"],
-    setSessionTitle: noop as unknown as AgentEventsDeps["setSessionTitle"],
     setPlanReview: ((u: string | null | ((p: string | null) => string | null)) => {
       planReview = typeof u === "function" ? u(planReview) : u;
     }) as AgentEventsDeps["setPlanReview"],
@@ -139,6 +138,22 @@ describe("useAgentEvents", () => {
     expect(setRunning).toHaveBeenLastCalledWith(false);
   });
 
+  it("refreshes branch and uncommitted-file count from workspace extras", () => {
+    const { hook, getState } = setup();
+
+    act(() => {
+      hook.result.current.handleEvent(
+        ev("extras", { gitBranch: "feature/dirty", isGitRepo: true, gitDirtyFileCount: 4 }),
+      );
+    });
+
+    expect(getState()).toMatchObject({
+      gitBranch: "feature/dirty",
+      isGitRepo: true,
+      gitDirtyFileCount: 4,
+    });
+  });
+
   it("text_delta streams assistant text into a single item", () => {
     const { hook, getItems } = setup();
     act(() => {
@@ -158,6 +173,26 @@ describe("useAgentEvents", () => {
     items = getItems();
     expect(items).toHaveLength(1);
     expect(items[0]).toMatchObject({ kind: "assistant", text: "Hello world" });
+  });
+
+  it("discards the candidate draft before showing the Ideal hook and reviewed final", () => {
+    const { hook, getItems } = setup();
+
+    act(() => {
+      hook.result.current.handleEvent(ev("text_delta", { text: "Unreviewed draft" }));
+      hook.result.current.handleEvent(ev("text_delta", { text: " tail" }));
+      hook.result.current.handleEvent(ev("hook", { kind: "ideal" }));
+    });
+    expect(getItems()).toEqual([expect.objectContaining({ kind: "hook", hook: "ideal" })]);
+
+    act(() => {
+      hook.result.current.handleEvent(ev("text_delta", { text: "Reviewed final" }));
+      hook.result.current.endStreamingText();
+    });
+    expect(getItems()).toEqual([
+      expect.objectContaining({ kind: "hook", hook: "ideal" }),
+      expect.objectContaining({ kind: "assistant", text: "Reviewed final" }),
+    ]);
   });
 
   it("error with a structured payload (headline/message/guidance) pushes a structured error item", () => {
@@ -318,6 +353,34 @@ describe("useAgentEvents", () => {
     expect(marker).toMatchObject({ kind: "autopilot", phase: "plan_approved" });
   });
 
+  it("uses sidecar plan progress as the authoritative live-file snapshot", () => {
+    const { hook, deps } = setup();
+    deps.planTotalRef.current = 2;
+    deps.planDoneRef.current = new Set([1]);
+
+    act(() => {
+      hook.result.current.handleEvent(
+        ev("plan_progress", { total: 4, completed: [1, 2, 4, 99, "3"] }),
+      );
+    });
+
+    expect(deps.planTotalRef.current).toBe(4);
+    expect([...deps.planDoneRef.current]).toEqual([1, 2, 4]);
+  });
+
+  it("seeds an accepted plan from the canonical total on session reset", () => {
+    const { hook, deps } = setup();
+    deps.pendingPlanTotalRef.current = 2;
+
+    act(() => {
+      hook.result.current.handleEvent(ev("session_reset", { planTotal: 5 }));
+    });
+
+    expect(deps.pendingPlanTotalRef.current).toBeNull();
+    expect(deps.planTotalRef.current).toBe(5);
+    expect(deps.planDoneRef.current.size).toBe(0);
+  });
+
   it("autopilot_prompted closes the stale plan modal after Ken asks for revision", () => {
     const { hook, getPlanReview } = setup();
     act(() => {
@@ -334,16 +397,19 @@ describe("useAgentEvents", () => {
     expect(getPlanReview()).toBeNull();
   });
 
-  it("run_end clears running state", () => {
-    const { hook, setRunning } = setup();
+  it("run_end clears completed plan progress and running state", () => {
+    const { hook, deps, setRunning } = setup();
+    deps.planTotalRef.current = 3;
+    deps.planDoneRef.current = new Set([1, 2, 3]);
+
     act(() => {
       hook.result.current.handleEvent(ev("run_start"));
-    });
-    expect(setRunning).toHaveBeenLastCalledWith(true);
-    act(() => {
       hook.result.current.handleEvent(ev("run_end", { cancelled: false }));
     });
+
     expect(setRunning).toHaveBeenLastCalledWith(false);
+    expect(deps.planTotalRef.current).toBe(0);
+    expect(deps.planDoneRef.current.size).toBe(0);
   });
 
   it("upserts persistent async agents by agent_id through idle and interrupted states", () => {
@@ -368,7 +434,7 @@ describe("useAgentEvents", () => {
           state: "completed",
           elapsed_ms: 30,
           tool_use_count: 2,
-          token_usage: { input: 10, output: 3 },
+          token_usage: { input: 10, output: 3, cacheRead: 20, cacheWrite: 5 },
         }),
       ),
     );
@@ -376,7 +442,13 @@ describe("useAgentEvents", () => {
     expect(groups).toHaveLength(1);
     const group = groups[0];
     expect(group?.kind === "subagent_group" ? group.agents : []).toMatchObject([
-      { toolCallId: "abcd1234", status: "idle", async: true, toolUseCount: 2 },
+      {
+        toolCallId: "abcd1234",
+        status: "idle",
+        async: true,
+        toolUseCount: 2,
+        tokenUsage: { input: 10, output: 3, cacheRead: 20, cacheWrite: 5 },
+      },
     ]);
   });
 

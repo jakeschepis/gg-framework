@@ -35,7 +35,12 @@ export interface SubAgentStatePayload {
   current_activity?: string;
   turn_count: number;
   tool_use_count: number;
-  token_usage: { input: number; output: number };
+  token_usage: {
+    input: number;
+    output: number;
+    cacheRead?: number;
+    cacheWrite?: number;
+  };
   output?: string;
   error?: string;
 }
@@ -153,6 +158,8 @@ export interface AgentState {
   gitBranch?: string | null;
   /** True when the project cwd is inside a git work tree. */
   isGitRepo?: boolean;
+  /** Tracked, staged, and untracked files not yet committed. */
+  gitDirtyFileCount?: number;
   /** True when the active model can accept native video input. */
   supportsVideo?: boolean;
   /** Autopilot (auto-review) toggle for this window's project. Per-window,

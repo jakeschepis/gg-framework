@@ -68,6 +68,7 @@ import {
   autopilotMarkerCopySeed,
 } from "./core/session-history.js";
 import { AuthStorage } from "./core/auth-storage.js";
+import { cleanupToolOutputs } from "./tools/overflow.js";
 import {
   fetchSubscriptionUsage,
   MOONSHOT_OAUTH_KEY,
@@ -86,7 +87,8 @@ import { ensureAppDirs, loadSavedSettings } from "./config.js";
 import { SettingsManager, type Settings } from "./core/settings-manager.js";
 import { getModel, getMaxThinkingLevel, getContextWindow, MODELS } from "./core/model-registry.js";
 import { resolveStartOrFallback } from "./core/resolve-start.js";
-import { getGitBranch, isGitRepo } from "./utils/git.js";
+import { getGitBranch, getGitDirtyFileCount, isGitRepo } from "./utils/git.js";
+import { extractPlanSteps } from "./utils/plan-steps.js";
 import {
   getNextThinkingLevel,
   getSupportedThinkingLevels,
@@ -112,7 +114,7 @@ import {
   stopRadio,
 } from "./core/radio.js";
 import { enrichProcessPath } from "./core/shell-path.js";
-import { downscaleForPreview, validateVisionImage } from "./utils/image.js";
+import { downscaleForPreview, shrinkToFit, validateVisionImage } from "./utils/image.js";
 import { startServeMode, type ServeController } from "./modes/serve-mode.js";
 import { loadTelegramConfig, saveTelegramConfig, verifyBotToken } from "./core/telegram-config.js";
 import {
@@ -134,16 +136,20 @@ import { rebuildFromSessions } from "./core/progress/rebuild.js";
 import type { ProgressFile, ProgressSnapshot } from "./core/progress/types.js";
 
 const ALL_PROVIDERS: Provider[] = [
+  // US
   "anthropic",
-  "xiaomi",
   "openai",
   "gemini",
-  "glm",
+  "xai",
+  // China
   "moonshot",
+  "glm",
   "minimax",
+  "xiaomi",
   "deepseek",
-  "openrouter",
+  // Japan, then provider-agnostic gateway last
   "sakana",
+  "openrouter",
 ];
 
 // ── gg-app settings (~/.gg/gg-app.json) ────────────────────
@@ -383,17 +389,27 @@ async function prepareAttachments(
     const fileName = `${Date.now().toString(36)}-${safe}`;
     const filePath = path.join(dir, fileName);
     const buf = Buffer.from(a.data, "base64");
-    // Validate image attachments before they become native image content blocks.
-    // A corrupt or unsupported-format image (e.g. a malformed .ico, or a .png
-    // with a bad IDAT) makes the provider reject the ENTIRE turn ("image data
-    // ... not a valid image") before the agent can respond. Downgrade such files
-    // to a plain "file" attachment so the model gets a path note and inspects
-    // them with its tools instead of the request 400ing.
+    // Validate and cap image attachments before they become native image content
+    // blocks. Anthropic applies a 2000 px per-dimension cap once conversation
+    // history contains more than 20 images, so every attachment must be safe for
+    // later turns too. Keep the original on disk, but send the resized bytes.
+    // Corrupt or unsupported images become plain files so they cannot reject the
+    // entire provider request.
     let prepared: PreparedAttachment = { ...a };
     if (a.kind === "image") {
-      const validatedType = await validateVisionImage(buf).catch(() => null);
-      if (validatedType) prepared = { ...a, mediaType: validatedType };
-      else prepared = { ...a, kind: "file" };
+      try {
+        const resized = await shrinkToFit(buf, a.mediaType);
+        const validatedType = await validateVisionImage(resized.buffer);
+        prepared = validatedType
+          ? {
+              ...a,
+              mediaType: validatedType,
+              data: resized.buffer.toString("base64"),
+            }
+          : { ...a, kind: "file" };
+      } catch {
+        prepared = { ...a, kind: "file" };
+      }
     }
     try {
       await fs.writeFile(filePath, buf);
@@ -731,6 +747,10 @@ async function main(): Promise<void> {
   // inherit it). Best-effort — never blocks startup beyond its internal cap.
   await enrichProcessPath();
 
+  // Sweep recoverable full tool outputs (~/.gg/tool-output/) older than 48h.
+  // Fire-and-forget: cleanup must never delay or break startup.
+  void cleanupToolOutputs().catch(() => {});
+
   const auth = new AuthStorage(paths.authFile);
   await auth.load();
 
@@ -777,6 +797,11 @@ async function main(): Promise<void> {
     { expiresAt: number; result: UsageResult }
   >();
   const usageRequests = new Map<SubscriptionUsageProvider, Promise<UsageResult>>();
+  // 429 backoff: when the provider rate-limits the usage endpoint, hold the
+  // error result until this timestamp instead of re-polling (and re-logging a
+  // WARN) every 60s — the old cadence hammered a limited endpoint for hours.
+  const usageRateLimitedUntil = new Map<SubscriptionUsageProvider, number>();
+  const USAGE_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
 
   async function fetchUsageProvider(provider: SubscriptionUsageProvider): Promise<UsageResult> {
     const displayName = provider === "anthropic" ? "Anthropic" : "Codex";
@@ -786,19 +811,32 @@ async function main(): Promise<void> {
     try {
       let credentials = await auth.resolveCredentials(provider);
       try {
-        return { ...(await fetchSubscriptionUsage(provider, credentials)), connected: true };
+        const snapshot = {
+          ...(await fetchSubscriptionUsage(provider, credentials)),
+          connected: true as const,
+        };
+        usageRateLimitedUntil.delete(provider);
+        return snapshot;
       } catch (error) {
         // A provider can revoke an access token before its stored expiry. Refresh
         // once on 401, matching inference auth recovery, then retry the usage call.
         if (error instanceof SubscriptionUsageError && error.status === 401) {
           credentials = await auth.resolveCredentials(provider, { forceRefresh: true });
-          return { ...(await fetchSubscriptionUsage(provider, credentials)), connected: true };
+          const snapshot = {
+            ...(await fetchSubscriptionUsage(provider, credentials)),
+            connected: true as const,
+          };
+          usageRateLimitedUntil.delete(provider);
+          return snapshot;
         }
         throw error;
       }
     } catch (error) {
       const message = error instanceof Error ? error.message : String(error);
       log("WARN", "app-sidecar", "subscription usage fetch failed", { provider, message });
+      if (error instanceof SubscriptionUsageError && error.status === 429) {
+        usageRateLimitedUntil.set(provider, Date.now() + USAGE_RATE_LIMIT_BACKOFF_MS);
+      }
       const connected = await auth.hasProviderAuth(provider);
       return {
         provider,
@@ -827,9 +865,13 @@ async function main(): Promise<void> {
         result.connected &&
         result.windows.length > 0 &&
         result.windows.some((window) => window.resetsAt === undefined);
+      const rateLimitedUntil = usageRateLimitedUntil.get(provider) ?? 0;
       usageCache.set(provider, {
         result,
-        expiresAt: Date.now() + (missingReset ? 10_000 : 60_000),
+        expiresAt:
+          rateLimitedUntil > Date.now()
+            ? rateLimitedUntil
+            : Date.now() + (missingReset ? 10_000 : 60_000),
       });
       return result;
     } finally {
@@ -1352,6 +1394,11 @@ async function createSession(
     signal: abort.signal,
     // Keep MCP startup off the readiness path in both modes.
     backgroundMcpConnect: true,
+    // Keep restore-time auto-compaction off the readiness path too: its summary
+    // LLM call (30s timeout) used to freeze waitForReady — and with it the whole
+    // window (project picker, session list) — whenever a resumed session was
+    // over the context threshold. First prompt compacts instead, with UI events.
+    deferLoadCompaction: true,
   };
   let session!: AgentSession;
   if (mode === "chat") {
@@ -1376,7 +1423,9 @@ async function createSession(
       ...baseSessionOptions,
       // Plan mode belongs only to the coding agent.
       onEnterPlan: async (reason) => {
+        deactivateApprovedPlan();
         await session.setPlanMode(true);
+        broadcast("plan_progress", { total: 0, completed: [] });
         broadcast("plan_enter", { reason: reason ?? "" });
         void session.persistAppMarker("plan", { reason: reason ?? "" }).catch(() => {});
       },
@@ -1406,11 +1455,17 @@ async function createSession(
   }
   log("INFO", "app-sidecar", "session ready", { provider, model, mode, chatAgent, cwd });
 
-  // Footer extras (context window, git branch, background tasks). The git
-  // branch is resolved once at startup and refreshed lazily; the context
+  // Workspace extras (context window, git status, background tasks). Git state
+  // is resolved once at startup and refreshed after every run; the context
   // window follows the active model.
-  let gitBranch: string | null = await getGitBranch(cwd).catch(() => null);
-  let gitIsRepo: boolean = await isGitRepo(cwd).catch(() => false);
+  const [initialGitBranch, initialGitIsRepo, initialDirtyFileCount] = await Promise.all([
+    getGitBranch(cwd).catch(() => null),
+    isGitRepo(cwd).catch(() => false),
+    getGitDirtyFileCount(cwd).catch(() => 0),
+  ]);
+  let gitBranch: string | null = initialGitBranch;
+  let gitIsRepo: boolean = initialGitIsRepo;
+  let gitDirtyFileCount = initialDirtyFileCount;
   function currentContextWindow(): number {
     const st = session.getState();
     return getContextWindow(st.model, { provider: st.provider, accountId: st.accountId });
@@ -1421,12 +1476,14 @@ async function createSession(
     contextWindow: number;
     gitBranch: string | null;
     isGitRepo: boolean;
+    gitDirtyFileCount: number;
     tasks: ReturnType<typeof session.listBackgroundProcesses>;
   } {
     return {
       contextWindow: currentContextWindow(),
       gitBranch,
       isGitRepo: gitIsRepo,
+      gitDirtyFileCount,
       tasks: session.listBackgroundProcesses(),
     };
   }
@@ -1438,8 +1495,98 @@ async function createSession(
   // fatal-abort path with no forensic trail.
   const toolCallNames = new Map<string, string>();
 
+  // Approved-plan progress belongs beside the plan file, not in the webview.
+  // The implementation can rewrite/expand that file mid-run, so a step count
+  // frozen at approval time becomes dishonest (the exact stale-total bug the
+  // CLI already fixed). Re-read the live file after tools/markers, retain the
+  // last valid step section during transient edits, and send one authoritative
+  // snapshot to the app.
+  let approvedPlanPath: string | null = null;
+  let approvedPlanTotal = 0;
+  let approvedPlanMarkers = new Set<number>();
+  let approvedPlanGeneration = 0;
+  let planMarkerTail = "";
+  let planProgressSync: Promise<boolean> = Promise.resolve(false);
+
+  function planProgressPayload(): { total: number; completed: number[] } {
+    const completed = [...approvedPlanMarkers]
+      .filter((step) => step >= 1 && step <= approvedPlanTotal)
+      .sort((a, b) => a - b);
+    return { total: approvedPlanTotal, completed };
+  }
+
+  async function syncApprovedPlanProgress(generation: number): Promise<boolean> {
+    const planPath = approvedPlanPath;
+    if (planPath === null || generation !== approvedPlanGeneration) return false;
+    const content = await fs.readFile(planPath, "utf-8").catch(() => null);
+    if (approvedPlanPath !== planPath || generation !== approvedPlanGeneration) return false;
+    if (content !== null) {
+      const freshTotal = extractPlanSteps(content).length;
+      // During an in-place rewrite the step section can briefly disappear.
+      // Keep the last real total instead of flashing 0 or declaring completion.
+      if (freshTotal > 0 || approvedPlanTotal === 0) approvedPlanTotal = freshTotal;
+    }
+    broadcast("plan_progress", planProgressPayload());
+    return (
+      approvedPlanTotal > 0 &&
+      Array.from({ length: approvedPlanTotal }, (_, index) => index + 1).every((step) =>
+        approvedPlanMarkers.has(step),
+      )
+    );
+  }
+
+  function queueApprovedPlanProgressSync(): Promise<boolean> {
+    const generation = approvedPlanGeneration;
+    planProgressSync = planProgressSync
+      .catch(() => false)
+      .then(() => syncApprovedPlanProgress(generation))
+      .catch((error) => {
+        log("WARN", "app-sidecar", "plan progress refresh failed", {
+          message: error instanceof Error ? error.message : String(error),
+        });
+        return false;
+      });
+    return planProgressSync;
+  }
+
+  async function activateApprovedPlan(planPath: string | undefined): Promise<number> {
+    deactivateApprovedPlan();
+    await session.setApprovedPlan(planPath);
+    if (!planPath) return 0;
+    approvedPlanPath = planPath;
+    await queueApprovedPlanProgressSync();
+    return approvedPlanTotal;
+  }
+
+  function deactivateApprovedPlan(): void {
+    approvedPlanGeneration++;
+    approvedPlanPath = null;
+    approvedPlanTotal = 0;
+    approvedPlanMarkers = new Set();
+    planMarkerTail = "";
+    planProgressSync = Promise.resolve(false);
+  }
+
+  function recordApprovedPlanMarkers(text: string): void {
+    if (approvedPlanPath === null || !text) return;
+    const candidate = planMarkerTail + text;
+    let changed = false;
+    for (const match of candidate.matchAll(/\[DONE:(\d+)\]/gi)) {
+      const step = Number.parseInt(match[1], 10);
+      if (step >= 1 && !approvedPlanMarkers.has(step)) {
+        approvedPlanMarkers.add(step);
+        changed = true;
+      }
+    }
+    planMarkerTail = candidate.slice(-32);
+    if (changed) void queueApprovedPlanProgressSync();
+  }
+
   // Forward every relevant bus event to the webview.
-  session.eventBus.on("text_delta", (d) => broadcast("text_delta", d));
+  session.eventBus.on("text_delta", (d) => {
+    broadcast("text_delta", d);
+    recordApprovedPlanMarkers(d.text);
+  });
   session.eventBus.on("thinking_delta", (d) => broadcast("thinking_delta", d));
   session.eventBus.on("tool_call_start", (d) => {
     toolCallNames.set(d.toolCallId, d.name);
@@ -1456,6 +1603,10 @@ async function createSession(
       ...(d.isError ? { result: d.result.slice(0, 500) } : {}),
     });
     broadcast("tool_call_end", d);
+    // Any tool can mutate the approved plan (including bash), so refresh after
+    // every completed call while tracking is active. The file is tiny and this
+    // keeps the displayed total aligned before the next completion marker.
+    if (approvedPlanPath !== null) void queueApprovedPlanProgressSync();
   });
   // Native server tools (e.g. Anthropic web_search) do NOT end the turn — text
   // streams before and after them in the SAME turn. The webview must reset its
@@ -1480,15 +1631,16 @@ async function createSession(
   });
   const cancelledRunEndGenerations = new Set<number>();
   let pendingCancelDrain: { generation: number; text: string } | null = null;
-  let titleGenerated = false;
   // Bumped by /cancel — a run whose cancel generation changed mid-flight was
   // canceled and earns no XP.
   let cancelGeneration = 0;
   // Autopilot (auto-review) toggle for THIS window's project. Loaded from
   // gg-app.json on boot; flipped via POST /autopilot. When on, POST /prompt runs
   // runAutopilotCycle after the user's turn settles — Ken auto-reviews the work
-  // and drives the review→prompt→review loop.
+  // and drives the review→prompt→review loop. Ken is the sole verification
+  // owner in this mode, so suppress the build session's redundant Ideal hook.
   let autopilot = mode === "code" && (await loadAutopilot(cwd));
+  session.setIdealReviewSuppressed(autopilot);
   // True while an autopilot review is in flight (used to defer kenAuto model
   // switches, like kenRunning does for chat Ken, and to drive the spinner).
   let autopilotReviewing = false;
@@ -1690,6 +1842,9 @@ async function createSession(
       // (often >5 min) regardless of the user's global speedProfile pick.
       forceLongCacheRetention: true,
     });
+    // Ken is already the independent autopilot reviewer; recursively running
+    // his own Ideal self-review adds latency and can corrupt the verdict shape.
+    ken.setIdealReviewSuppressed(true);
     await ken.initialize();
     // Deliberately no bus bridge: the review is silent. Errors surface via the
     // runAutopilotReview try/catch as autopilot_error frames.
@@ -1699,20 +1854,6 @@ async function createSession(
       model: target.model,
     });
     return ken;
-  }
-
-  // Resumed session: if it already has a conversation, generate its title now so
-  // the title bar shows it immediately on load (not just after the next prompt).
-  {
-    const hasHistory = session
-      .getMessages()
-      .some((m) => m.role === "user" || m.role === "assistant");
-    if (hasHistory) {
-      titleGenerated = true;
-      void session.generateTitle().then((title) => {
-        if (title) broadcast("session_title", { title });
-      });
-    }
   }
 
   function abortOwnedWork(): void {
@@ -1777,10 +1918,35 @@ async function createSession(
         // Fire-and-forget — XP must never delay or break run teardown.
         void progress.awardRun(cwd, runStartedAt, opts.id);
       }
-      // A run may have switched branches (git checkout) or spawned/finished
-      // background tasks — refresh the footer extras once it settles.
-      gitBranch = await getGitBranch(cwd).catch(() => gitBranch);
-      gitIsRepo = await isGitRepo(cwd).catch(() => gitIsRepo);
+      // A run may have switched branches, changed files, or spawned/finished
+      // background tasks. Refresh the workspace extras once it settles.
+      [gitBranch, gitIsRepo, gitDirtyFileCount] = await Promise.all([
+        getGitBranch(cwd).catch(() => gitBranch),
+        isGitRepo(cwd).catch(() => gitIsRepo),
+        getGitDirtyFileCount(cwd).catch(() => gitDirtyFileCount),
+      ]);
+      // Serialize behind any marker/tool-triggered refresh so the terminal
+      // progress snapshot uses the live plan file. Once every canonical step
+      // is complete, remove the approved plan from future system prompts and
+      // clear the widget before run_end paints the idle activity bar.
+      if (
+        runSucceeded &&
+        !cancelled &&
+        approvedPlanPath !== null &&
+        (await queueApprovedPlanProgressSync())
+      ) {
+        try {
+          await session.setApprovedPlan(undefined);
+          deactivateApprovedPlan();
+          broadcast("plan_progress", { total: 0, completed: [] });
+        } catch (error) {
+          // Keep tracking when prompt cleanup fails; hiding the widget here
+          // would claim completion while the approved-plan contract remained.
+          log("WARN", "app-sidecar", "completed plan cleanup failed", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        }
+      }
       if (ownsGeneration) finishOwnedGeneration(generation, false);
       // A cancelled injected run is still owned by the surrounding autopilot
       // cycle; its outer finalizer emits the one terminal cancelled run_end.
@@ -1797,12 +1963,6 @@ async function createSession(
       broadcast("tasks_list", { tasks: pruneDoneTasksSync(cwd) });
       broadcast("queued", { count: session.getQueuedCount() });
       broadcast("extras", footerExtras());
-      if (!titleGenerated) {
-        titleGenerated = true;
-        void session.generateTitle().then((title) => {
-          if (title) broadcast("session_title", { title });
-        });
-      }
     }
   }
 
@@ -1901,6 +2061,7 @@ async function createSession(
     const generation = runLifecycle.begin(abortOwnedWork).generation;
     pendingCancelDrain = null;
     autopilotActive = true;
+    session.setIdealReviewSuppressed(true);
     // Generation captured by the last plan review; acceptPlan re-checks it so
     // a user Accept/Reject landing mid-review always wins.
     let planGenAtReview = -1;
@@ -1926,21 +2087,21 @@ async function createSession(
         acceptPlan: async () => {
           if (pendingPlanPath === null || planGeneration !== planGenAtReview) return false;
           const planPath = pendingPlanPath;
+          let planTotal: number;
           try {
-            await session.newSession();
+            await session.newSession(true);
             injectedAutopilotPrompts = [];
-            titleGenerated = false;
-            await session.setApprovedPlan(planPath);
+            planTotal = await activateApprovedPlan(planPath);
           } catch (err) {
             broadcastError("autopilot_error", "autopilot plan accept failed", err);
             return false;
           }
           clearPendingPlan();
-          // Ordering is load-bearing: the webview reads its still-open plan
-          // modal state (step count) on autopilot_plan_accepted, and
-          // session_reset clears it — accepted must land first.
+          // Keep the approval marker ahead of the reset, then seed the reset
+          // with the sidecar's canonical count from the actual plan file.
           broadcast("autopilot_plan_accepted", {});
-          broadcast("session_reset", {});
+          broadcast("session_reset", { planTotal });
+          broadcast("plan_progress", planProgressPayload());
           // Persisted into the NEW session so a resume shows the marker.
           void session.persistAutopilotMarker("plan_approved");
           return true;
@@ -2010,6 +2171,7 @@ async function createSession(
       });
     } finally {
       autopilotActive = false;
+      session.setIdealReviewSuppressed(autopilot);
       finishOwnedGeneration(generation, true);
       queueMicrotask(() => void runStrandedQueue());
     }
@@ -2094,9 +2256,9 @@ async function createSession(
     if (!task) return false;
     // Fresh session per task so one task's context never bleeds into the next.
     await session.newSession();
+    deactivateApprovedPlan();
     injectedAutopilotPrompts = [];
     clearPendingPlan();
-    titleGenerated = false;
     broadcast("session_reset", {});
     markTaskInProgress(cwd, task.id);
     broadcast("tasks_list", { tasks: loadTasksSync(cwd) });
@@ -2185,6 +2347,29 @@ async function createSession(
     tasksPoll.unref?.();
   };
   scheduleTasksPoll(1500);
+
+  // Files can change outside the agent (editor saves, terminal commits), so keep
+  // the dirty count current while idle. Branch/repo state already refreshes after
+  // agent runs; polling only the count avoids spawning three git processes per tick.
+  let gitPoll: NodeJS.Timeout | undefined;
+  let gitPollStopped = false;
+  const scheduleGitPoll = (delay: number): void => {
+    if (gitPollStopped) return;
+    gitPoll = setTimeout(() => {
+      void getGitDirtyFileCount(cwd)
+        .catch(() => gitDirtyFileCount)
+        .then((nextDirtyFileCount) => {
+          if (gitPollStopped) return;
+          if (nextDirtyFileCount !== gitDirtyFileCount) {
+            gitDirtyFileCount = nextDirtyFileCount;
+            broadcast("extras", footerExtras());
+          }
+          scheduleGitPoll(5000);
+        });
+    }, delay);
+    gitPoll.unref?.();
+  };
+  scheduleGitPoll(5000);
 
   function readBody(req: http.IncomingMessage): Promise<string> {
     return new Promise((resolve, reject) => {
@@ -2495,6 +2680,19 @@ async function createSession(
         const commandCandidates = [...PROMPT_COMMANDS, ...(await loadCustomCommands(cwd))];
         const messages = session.getMessages();
 
+        // An Ideal hook is injected immediately after the assistant's candidate
+        // no-tool response. That response is review scratch, not a user-visible
+        // final answer. Live SSE drops it when the hook event arrives; mark the
+        // same assistant message here so resumed history stays identical.
+        const hiddenIdealDrafts = new Set<(typeof messages)[number]>();
+        for (let i = 0; i < messages.length - 1; i++) {
+          const draft = messages[i];
+          const hookPrompt = messages[i + 1];
+          if (draft?.role !== "assistant" || hookPrompt?.role !== "user") continue;
+          const restored = restoreUserRow(hookPrompt.content);
+          if (detectHookKind(restored.text) === "ideal") hiddenIdealDrafts.add(draft);
+        }
+
         // Pre-index tool results by toolCallId so we can pair tool calls with
         // their results (for sub-agent status + image extraction).
         const toolResultMap = new Map<string, { content: ToolResultContent; isError: boolean }>();
@@ -2723,10 +2921,11 @@ async function createSession(
                 history.push({ role: "assistant", text: "", infoKind: "video_warning" });
               }
             }
-          } else {
+          } else if (!hiddenIdealDrafts.has(msg)) {
             // Assistant: one wire row per persisted text block — live streaming
             // splits bubbles at server_tool_call boundaries, and the persisted
-            // content keeps those blocks separate.
+            // content keeps those blocks separate. Ideal-review candidate drafts
+            // are intentionally omitted to match the live pre-final hook flow.
             for (const blockText of restoreAssistantTexts(msg.content)) {
               history.push({
                 role: "assistant",
@@ -3032,6 +3231,9 @@ async function createSession(
           return;
         }
         autopilot = enabled;
+        // A toggle-off during an active cycle takes effect after Ken finishes;
+        // until then, injected build runs must not re-enable Ideal self-review.
+        session.setIdealReviewSuppressed(enabled || autopilotActive);
         await saveAutopilot(cwd, enabled);
         log("INFO", "app-sidecar", "autopilot toggled", { enabled: String(enabled) });
         broadcast("autopilot", { autopilot: enabled });
@@ -3409,6 +3611,7 @@ async function createSession(
           if (mode === "chat") {
             await session.persistAppMarker("agent_handoff", { chatAgent });
           }
+          deactivateApprovedPlan();
           injectedAutopilotPrompts = [];
           clearPendingPlan();
           broadcast("session_reset", {});
@@ -3461,12 +3664,12 @@ async function createSession(
           broadcast("autopilot_ignored", {});
         }
         try {
-          await session.newSession();
+          await session.newSession(true);
           injectedAutopilotPrompts = [];
-          titleGenerated = false;
-          await session.setApprovedPlan(planPath);
-          broadcast("session_reset", {});
-          json(res, 200, { ok: true });
+          const planTotal = await activateApprovedPlan(planPath);
+          broadcast("session_reset", { planTotal });
+          broadcast("plan_progress", planProgressPayload());
+          json(res, 200, { ok: true, planTotal });
         } catch (err) {
           json(res, 500, { error: err instanceof Error ? err.message : String(err) });
         }
@@ -3898,6 +4101,8 @@ async function createSession(
   async function dispose(): Promise<void> {
     tasksPollStopped = true;
     if (tasksPoll) clearTimeout(tasksPoll);
+    gitPollStopped = true;
+    if (gitPoll) clearTimeout(gitPoll);
     // Stop the Telegram serve loop + dispose its per-chat sessions.
     if (serveController) await serveController.stop().catch(() => {});
     for (const c of clients) c.res.end();

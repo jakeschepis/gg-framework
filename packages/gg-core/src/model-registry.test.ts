@@ -8,6 +8,7 @@ import {
   getDefaultModel,
   getFastModel,
   getModelsForProvider,
+  getToolResultCharLimit,
   usesOpenAICodexTransport,
 } from "./model-registry.js";
 
@@ -22,6 +23,7 @@ const PROVIDERS = [
   "deepseek",
   "openrouter",
   "sakana",
+  "xai",
 ] as const;
 const THINKING_LEVELS = ["low", "medium", "high", "xhigh", "max", "ultra"] as const;
 const COST_TIERS = ["low", "medium", "high"] as const;
@@ -124,6 +126,26 @@ describe("model registry context windows", () => {
     const options = { provider: "openai" as const, accountId: "acct_123" };
     expect(usesOpenAICodexTransport(options)).toBe(true);
     expect(getContextWindow(model, options)).toBe(limit);
+    expect(getToolResultCharLimit(model, options)).toBe(40_000);
+  });
+
+  it("caps custom OpenAI model IDs on Codex transport", () => {
+    expect(
+      getToolResultCharLimit("custom-codex-model", {
+        provider: "openai",
+        accountId: "acct_123",
+      }),
+    ).toBe(40_000);
+  });
+
+  it("keeps the generic tool-output allowance outside Codex OAuth", () => {
+    expect(getToolResultCharLimit("gpt-5.6-sol", { provider: "openai" })).toBeUndefined();
+    expect(
+      getToolResultCharLimit("claude-sonnet-5", {
+        provider: "anthropic",
+        accountId: "acct_123",
+      }),
+    ).toBeUndefined();
   });
 
   it("keeps non-OpenAI providers on their model context windows", () => {
@@ -131,6 +153,25 @@ describe("model registry context windows", () => {
     expect(
       getContextWindow("claude-sonnet-5", { provider: "anthropic", accountId: "acct_123" }),
     ).toBe(1_000_000);
+  });
+
+  it("defaults Moonshot to multimodal K3 while retaining K2.7 Code", () => {
+    expect(getDefaultModel("moonshot")).toMatchObject({
+      id: "kimi-k3",
+      name: "Kimi K3",
+      provider: "moonshot",
+      contextWindow: 1_048_576,
+      maxOutputTokens: 131_072,
+      supportsThinking: true,
+      supportsImages: true,
+      supportsVideo: true,
+      maxThinkingLevel: "max",
+    });
+    expect(getModelsForProvider("moonshot").map((model) => model.id)).toEqual([
+      "kimi-k3",
+      "kimi-k2.7-code",
+    ]);
+    expect(getContextWindow("kimi-k3", { provider: "moonshot" })).toBe(1_048_576);
   });
 
   it("defaults MiniMax to the multimodal M3 with a 1M context window", () => {

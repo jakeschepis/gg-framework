@@ -202,6 +202,15 @@ export type AgentEvent =
 
 // ── Agent Options ───────────────────────────────────────────
 
+export interface TransformContextOptions {
+  /** Force a transform after the provider reports context overflow. */
+  force?: boolean;
+  /** Latest successful provider usage, anchored at its assistant message. */
+  usage?: Usage;
+  /** Messages appended after that usage sample and not yet seen by the provider. */
+  pendingMessages: Message[];
+}
+
 export interface AgentOptions {
   provider: StreamOptions["provider"];
   model: string;
@@ -246,6 +255,10 @@ export interface AgentOptions {
   clearToolUses?: boolean;
   /** Max characters for a single tool result. Results exceeding this are truncated with a notice. */
   maxToolResultChars?: number;
+  /** Aggregate budget for ALL tool results in one assistant turn. Protects
+   *  against parallel fan-outs injecting huge uncached context in one turn;
+   *  the largest results are trimmed (water-filling) with a re-run notice. */
+  maxTurnToolResultChars?: number;
   /** Max consecutive pause_turn continuations before stopping (default: 5).
    *  Prevents infinite loops when server-side tools keep pausing. */
   maxContinuations?: number;
@@ -254,12 +267,14 @@ export interface AgentOptions {
    * the messages array (e.g. compaction, truncation). Return the same array
    * for no-op, or a new array to replace the conversation context.
    *
+   * The latest provider usage is authoritative for the history through its
+   * assistant response. `pendingMessages` contains context appended afterward.
    * When `options.force` is true, the caller should compact unconditionally
    * (e.g. after a context overflow error from the API).
    */
   transformContext?: (
     messages: Message[],
-    options?: { force?: boolean },
+    options: TransformContextOptions,
   ) => Message[] | Promise<Message[]>;
   /**
    * Polled after tool execution completes each turn. Returns user messages

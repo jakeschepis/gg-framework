@@ -77,6 +77,7 @@ import { setProviderDiagnostic } from "@kenkaiiii/gg-ai";
 import { buildSystemPrompt } from "./system-prompt.js";
 import { PROMPT_COMMANDS } from "./core/prompt-commands.js";
 import { createTools } from "./tools/index.js";
+import { cleanupToolOutputs } from "./tools/overflow.js";
 import { CheckpointStore } from "./core/checkpoint-store.js";
 import { ReviewCoverageTracker } from "./core/ideal-review.js";
 import { shouldCompact, compact } from "./core/compaction/compactor.js";
@@ -86,6 +87,7 @@ import {
   getRestoredMessagesForDisplay,
 } from "./core/session-compaction.js";
 import { setEstimatorModel } from "./core/compaction/token-estimator.js";
+import { findUserSessionPrompt } from "./core/session-preview.js";
 import {
   getAuthStorageKeys,
   getContextWindow,
@@ -172,7 +174,7 @@ function printHelp(): void {
     ["-v, --version", "Show version number"],
     [
       "--provider <name>",
-      "AI provider (anthropic, xiaomi, openai, gemini, glm, moonshot, minimax, deepseek, openrouter, sakana)",
+      "AI provider (anthropic, xiaomi, openai, gemini, glm, moonshot, minimax, deepseek, openrouter, sakana, xai)",
     ],
     ["--model <name>", "Model to use (e.g. claude-sonnet-5, gpt-5.5)"],
     ["--max-turns <n>", "Maximum agent turns per prompt"],
@@ -373,11 +375,12 @@ function main(): void {
     if (p === "openai") return "gpt-5.5";
     if (p === "gemini") return "gemini-3.1-flash-lite";
     if (p === "glm") return "glm-5.2";
-    if (p === "moonshot") return "kimi-k2.7-code";
+    if (p === "moonshot") return "kimi-k3";
     if (p === "minimax") return "MiniMax-M3";
     if (p === "deepseek") return "deepseek-v4-pro";
     if (p === "openrouter") return "qwen/qwen3.6-plus";
     if (p === "sakana") return "fugu";
+    if (p === "xai") return "grok-4.5";
     return "claude-opus-4-8";
   }
 
@@ -718,6 +721,12 @@ async function runInkTUI(opts: {
               provider,
               model,
               messages: compacted.messages,
+              conversationId: loaded.header.conversationId ?? loaded.header.id,
+              preview: loaded.header.preview ?? findUserSessionPrompt(messages),
+              title: [...loaded.entries]
+                .reverse()
+                .find((entry) => entry.type === "label")
+                ?.label.trim(),
             });
             sessionPath = compactedSession.path;
             sessionId = compactedSession.id;
@@ -792,6 +801,8 @@ async function runInkTUI(opts: {
         })
         .catch(() => {});
     }
+    // Sweep recoverable full tool outputs (~/.gg/tool-output/) older than 48h.
+    void cleanupToolOutputs().catch(() => {});
   }
 
   await renderApp({
@@ -866,10 +877,11 @@ async function runSessions(): Promise<void> {
     if (p === "openai") return "gpt-5.5";
     if (p === "gemini") return "gemini-3.1-flash-lite";
     if (p === "glm") return "glm-5.2";
-    if (p === "moonshot") return "kimi-k2.7-code";
+    if (p === "moonshot") return "kimi-k3";
     if (p === "minimax") return "MiniMax-M3";
     if (p === "deepseek") return "deepseek-v4-pro";
     if (p === "sakana") return "fugu";
+    if (p === "xai") return "grok-4.5";
     return "claude-opus-4-8";
   }
 
@@ -1276,6 +1288,7 @@ async function resolveActiveProvider(
     "deepseek",
     "openrouter",
     "sakana",
+    "xai",
   ];
   const loggedInProviders: Provider[] = [];
   for (const p of allProviders) {

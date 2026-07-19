@@ -55,7 +55,6 @@ import {
   startPeriodicUpdateCheck,
   stopPeriodicUpdateCheck,
 } from "../core/auto-update.js";
-import { generateSessionTitle } from "../utils/session-title.js";
 import { SettingsManager, type Settings } from "../core/settings-manager.js";
 import { PROMPT_COMMANDS, getPromptCommand } from "../core/prompt-commands.js";
 import {
@@ -325,8 +324,6 @@ export interface AppProps {
     planSteps: PlanStep[];
     sessionPath?: string;
     sessionId?: string;
-    sessionTitle?: string;
-    sessionTitleGenerated: boolean;
     overlay?: "model" | "skills" | "plan" | "theme" | null;
     planAutoExpand?: boolean;
     pendingAction?: {
@@ -375,7 +372,6 @@ export function App(props: AppProps) {
   // oversized-item flush below.
   const liveLayoutRef = useRef({ columns, liveAreaRows: 0 });
 
-  // Hoisted before terminal title hook so it can reference them
   const [lastUserMessage, setLastUserMessage] = useState("");
   // Bumped on every prompt submit; the fullscreen transcript scroll controller
   // watches this to snap back to the bottom so the newest output is visible.
@@ -384,17 +380,8 @@ export function App(props: AppProps) {
   const [quittingSummary, setQuittingSummary] = useState<SessionSummaryItem["summary"] | null>(
     null,
   );
-  // Terminal title — updated later after agentLoop is created
-  // (hoisted here so the hook is always called in the same order)
+  // Native terminal title keeps the active project visible outside the app frame.
   const [titleRunning, setTitleRunning] = useState(false);
-  const [sessionTitle, setSessionTitle] = useState<string | undefined>(
-    () => props.sessionStore?.sessionTitle,
-  );
-  const sessionTitleGeneratedRef = useRef(props.sessionStore?.sessionTitleGenerated ?? false);
-  useTerminalTitle({
-    isRunning: titleRunning,
-    sessionTitle,
-  });
 
   // Completed transcript rows are kept as durable session data but are no longer
   // rendered through Ink history. They are serialized once into real terminal
@@ -505,6 +492,7 @@ export function App(props: AppProps) {
   // Suppress "done" status when a plan overlay is about to open
   const planOverlayPendingRef = useRef(false);
   const [gitBranch, setGitBranch] = useState<string | null>(null);
+  useTerminalTitle({ isRunning: titleRunning, cwd: displayedCwd, gitBranch });
   const [currentModel, setCurrentModel] = useState(props.model);
   const [currentProvider, setCurrentProvider] = useState(props.provider);
   const currentProviderRef = useRef(props.provider);
@@ -552,10 +540,6 @@ export function App(props: AppProps) {
     props.sessionStore?.idealReviewEnabled ?? props.idealReviewEnabled ?? true,
   );
   const idealReviewEnabledRef = useRef(idealReviewEnabled);
-  /** Last actual API-reported input token count (from turn_end). */
-  const lastActualTokensRef = useRef(0);
-  /** Timestamp (ms) when lastActualTokensRef was last updated by turn_end. */
-  const lastActualTokensTimestampRef = useRef(0);
   /**
    * Languages whose style packs are currently injected into the system prompt.
    * Grown by `maybeInjectLanguagePacks` after `write`/`bash` tool results when
@@ -693,9 +677,6 @@ export function App(props: AppProps) {
   useEffect(() => {
     if (sessionStore) sessionStore.planSteps = planSteps;
   }, [planSteps, sessionStore]);
-  useEffect(() => {
-    if (sessionStore) sessionStore.sessionTitle = sessionTitle;
-  }, [sessionTitle, sessionStore]);
   useEffect(() => {
     if (sessionStore) sessionStore.overlay = overlay;
   }, [overlay, sessionStore]);
@@ -924,25 +905,23 @@ export function App(props: AppProps) {
     }
   }, [props.settingsFile]);
 
-  const { compactionAbortRef, compactConversation, transformContext } = useContextCompaction({
-    currentModel,
-    currentProvider,
-    maxTokens: props.maxTokens,
-    authStorage: props.authStorage,
-    contextWindowOptions,
-    activeApiKey,
-    activeAccountId,
-    activeProjectId,
-    activeBaseUrl,
-    setLiveItems,
-    getId,
-    approvedPlanPathRef,
-    settingsRef,
-    messagesRef,
-    lastActualTokensRef,
-    lastActualTokensTimestampRef,
-    persistCompactedSession,
-  });
+  const { compactionAbortRef, compactConversation, transformContext, recordProviderUsage } =
+    useContextCompaction({
+      currentModel,
+      currentProvider,
+      authStorage: props.authStorage,
+      contextWindowOptions,
+      activeApiKey,
+      activeAccountId,
+      activeProjectId,
+      activeBaseUrl,
+      setLiveItems,
+      getId,
+      approvedPlanPathRef,
+      settingsRef,
+      messagesRef,
+      persistCompactedSession,
+    });
 
   // ── Background task bar state (external store) ──────────
   const {
@@ -1064,62 +1043,7 @@ export function App(props: AppProps) {
           // Rebuild system prompt to remove the completed plan from context
           void replaceSystemPrompt({ clearApprovedPlan: true });
         }
-
-        // Generate session title after the first turn (background, best-effort)
-        if (!sessionTitleGeneratedRef.current) {
-          sessionTitleGeneratedRef.current = true;
-          const msgs = messagesRef.current;
-          // Find the first user message and first assistant text
-          const userMsg = msgs.find((m) => m.role === "user");
-          const assistantMsg = msgs.find((m) => m.role === "assistant");
-          const userText =
-            typeof userMsg?.content === "string"
-              ? userMsg.content
-              : Array.isArray(userMsg?.content)
-                ? userMsg.content
-                    .filter((c): c is { type: "text"; text: string } => c.type === "text")
-                    .map((c) => c.text)
-                    .join(" ")
-                : "";
-          const assistantText =
-            typeof assistantMsg?.content === "string"
-              ? assistantMsg.content
-              : Array.isArray(assistantMsg?.content)
-                ? assistantMsg.content
-                    .filter((c): c is { type: "text"; text: string } => c.type === "text")
-                    .map((c) => c.text)
-                    .join(" ")
-                : "";
-          if (userText) {
-            generateSessionTitle({
-              provider: currentProvider,
-              userMessage: userText,
-              assistantPreview: assistantText.slice(0, 200),
-              apiKey: activeApiKey,
-              baseUrl: activeBaseUrl,
-              accountId: activeAccountId,
-              resolveCredentials,
-            }).then(
-              (title) => {
-                setSessionTitle(title);
-                log("INFO", "title", `Session title generated: ${title}`);
-              },
-              () => {
-                // Best-effort — silently ignore failures
-              },
-            );
-          }
-        }
-      }, [
-        persistNewMessages,
-        props.cwd,
-        props.skills,
-        currentProvider,
-        activeApiKey,
-        activeAccountId,
-        activeBaseUrl,
-        resolveCredentials,
-      ]),
+      }, [persistNewMessages, props.cwd, props.skills]),
       onTurnText: useCallback(
         (text: string, thinking: string, thinkingMs: number) => {
           const hadStreamedAssistantFlush = streamedAssistantFlushRef.current.flushedChars > 0;
@@ -1674,6 +1598,7 @@ export function App(props: AppProps) {
           },
           timing: AgentTurnTiming,
         ) => {
+          recordProviderUsage(usage, messagesRef.current);
           recordTurnEnd(sessionStatsRef.current, usage);
           const metric: TurnMetricPayload = {
             version: 1,
@@ -1704,13 +1629,6 @@ export function App(props: AppProps) {
             providerDurationMs: String(timing.providerDurationMs),
             ...(timing.ttftMs != null && { ttftMs: String(timing.ttftMs) }),
           });
-          // Track actual token count for compaction decisions.
-          // Anthropic has separate input/output limits — only count input.
-          // All other providers share the context window — count both.
-          const inputContext = usage.inputTokens + (usage.cacheRead ?? 0) + (usage.cacheWrite ?? 0);
-          lastActualTokensRef.current =
-            currentProvider === "anthropic" ? inputContext : inputContext + usage.outputTokens;
-          lastActualTokensTimestampRef.current = Date.now();
           // For tool-only turns (no text), flush completed items to finalized
           // history so liveItems doesn't grow unbounded across consecutive turns.
           setLiveItems((prev) => {
@@ -1721,7 +1639,7 @@ export function App(props: AppProps) {
             return remaining;
           });
         },
-        [currentModel, currentProvider, queueFlush, sessionStore],
+        [currentModel, currentProvider, queueFlush, recordProviderUsage, sessionStore],
       ),
       onDone: useCallback(
         (
@@ -2143,8 +2061,6 @@ export function App(props: AppProps) {
               persistedIndexRef.current = messagesRef.current.length;
             })();
             agentLoop.reset();
-            setSessionTitle(undefined);
-            sessionTitleGeneratedRef.current = false;
             setLiveItems([{ kind: "info", text: "Session cleared.", id: getId() }]);
           },
           openThemeSelector: () => setOverlay("theme"),
@@ -2515,7 +2431,8 @@ export function App(props: AppProps) {
               | "xiaomi"
               | "deepseek"
               | "openrouter"
-              | "sakana",
+              | "sakana"
+              | "xai",
           );
           await sm.set("defaultModel", newModelId);
         });

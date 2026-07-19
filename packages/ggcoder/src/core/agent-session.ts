@@ -1,6 +1,7 @@
 import {
   agentLoop,
   isAbortError,
+  isUsageLimitError,
   type AgentEvent,
   type AgentTool,
   type AgentTurnEndEvent,
@@ -9,6 +10,7 @@ import {
   ProviderError,
   type Message,
   type Provider,
+  type Usage,
   type ThinkingLevel,
   type TextContent,
   type ImageContent,
@@ -24,6 +26,7 @@ import { PROMPT_COMMANDS, getPromptCommand } from "./prompt-commands.js";
 import { loadCustomCommands } from "./custom-commands.js";
 import { SettingsManager } from "./settings-manager.js";
 import { AuthStorage } from "./auth-storage.js";
+import { MOONSHOT_OAUTH_KEY } from "@kenkaiiii/gg-core";
 import { getClaudeCliUserAgent } from "./claude-code-version.js";
 import { kimiCodingHeaders, isKimiCodingEndpoint } from "./oauth/kimi.js";
 import {
@@ -41,8 +44,14 @@ import {
 } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
-import { shouldCompact, compact, getCompactionReserveTokens } from "./compaction/compactor.js";
-import { getAuthStorageKeys, getContextWindow, getModel, MODELS } from "./model-registry.js";
+import { shouldCompact, compact } from "./compaction/compactor.js";
+import {
+  getAuthStorageKeys,
+  getContextWindow,
+  getModel,
+  getToolResultCharLimit,
+  MODELS,
+} from "./model-registry.js";
 import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
 import { buildSystemPrompt } from "../system-prompt.js";
@@ -59,9 +68,10 @@ import { MCPClientManager, getAllMcpServers } from "./mcp/index.js";
 import { DeferredToolCatalog } from "./mcp/deferred-catalog.js";
 import { createToolSearchTool } from "../tools/tool-search.js";
 import { log } from "./logger.js";
-import { setEstimatorModel } from "./compaction/token-estimator.js";
+import { setEstimatorModel, calibrateEstimatorFromUsage } from "./compaction/token-estimator.js";
+import { calculateActiveContextTokens } from "./compaction/active-context.js";
+import { pruneStaleToolResults } from "./compaction/tool-result-pruner.js";
 import { discoverAgents } from "./agents.js";
-import { generateSessionTitle } from "../utils/session-title.js";
 import { enhancePrompt, type EnhanceResult } from "../utils/prompt-enhancer.js";
 import { detectProjectStack } from "./language-detector.js";
 import {
@@ -69,6 +79,7 @@ import {
   evaluateIdealReview,
   buildIdealReviewMessage,
   buildReviewCoverageMessage,
+  withReviewCoverageRequirements,
   detectTestDrift,
   ReviewCoverageTracker,
 } from "./ideal-review.js";
@@ -80,6 +91,8 @@ import {
 } from "./loop-breaker.js";
 import { buildRegroundingMessage } from "./regrounding.js";
 import { wrapSteeringText, STEERING_PREFIX } from "./steering.js";
+import { findUserSessionPrompt, getUserSessionPrompt } from "./session-preview.js";
+import { normalizeMessageImages } from "./message-images.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -139,6 +152,17 @@ export interface AgentSessionOptions {
    */
   backgroundMcpConnect?: boolean;
   /**
+   * If true, an over-context restored session is NOT compacted inline during
+   * `loadExistingSession()` — the existing pre-run auto-compaction in
+   * `runLoop()` handles it on the first prompt instead (with proper
+   * compaction_start/_end events). The inline load compaction makes a summary
+   * LLM call with a 30s timeout, and hosts whose readiness is gated on
+   * `initialize()` (the gg-app sidecar: waitForReady blocks the whole webview)
+   * would freeze the UI for that entire call. Default (false) keeps the
+   * compact-on-load behavior for CLI resume/`ggcoder continue`.
+   */
+  deferLoadCompaction?: boolean;
+  /**
    * Plan-mode callbacks. When provided, the `enter_plan`/`exit_plan` tools are
    * registered and the session manages plan-mode restrictions + system-prompt
    * rebuilds. Hosts (e.g. the gg-app sidecar) use these to surface plan-mode
@@ -193,6 +217,37 @@ export interface AgentSessionOptions {
   orchestrationPrompt?: boolean;
   /** Host-provided tools appended to this session only (for example, chat delegation). */
   additionalTools?: AgentTool[];
+}
+
+// ── Tool-result policy ─────────────────────────────────────
+
+/** Resolve the per-result cap passed to the agent loop for the active transport. */
+export function resolveSessionToolResultCharLimit(
+  model: string,
+  provider: Provider,
+  accountId?: string,
+): number {
+  return (
+    getToolResultCharLimit(model, { provider, accountId }) ??
+    Math.floor(getContextWindow(model, { provider, accountId }) * 3.5 * 0.3)
+  );
+}
+
+/**
+ * Aggregate budget for ALL tool results produced in one assistant turn.
+ * Individual results are already capped, but wide parallel fan-outs (GPT-5.6's
+ * signature behavior) were observed injecting 100k+ uncached tokens in a single
+ * turn. ~15% of the context window in chars (1 token ≈ 3.5 chars), floored at
+ * 100KB so small windows still fit two full-size reads, ceilinged at 240KB so
+ * 1M-context models don't waive the budget entirely.
+ */
+export function resolveSessionTurnToolResultCharLimit(
+  model: string,
+  provider: Provider,
+  accountId?: string,
+): number {
+  const contextChars = getContextWindow(model, { provider, accountId }) * 3.5;
+  return Math.max(100_000, Math.min(Math.floor(contextChars * 0.15), 240_000));
 }
 
 // ── State ──────────────────────────────────────────────────
@@ -267,10 +322,16 @@ export class AgentSession {
   private hookFileEditCounts = new Map<string, number>();
   private hookToolCalls = new Map<string, { name: string; args: Record<string, unknown> }>();
   private idealReviewPhase: "idle" | "reviewing" | "complete" = "idle";
+  /** Runtime-only suppression while Ken owns verification in autopilot mode. */
+  private idealReviewSuppressed = false;
   private readonly reviewCoverage: ReviewCoverageTracker;
   private loopBreakInjected = false;
   private regroundingInjected = false;
   private compactionOccurred = false;
+  private lastCompactionCompacted = false;
+  private compactionRetryAfter = 0;
+  /** Latest provider count, anchored to the assistant response it measured. */
+  private providerContext: { usage: Usage; anchor: Message } | null = null;
   private originalRequest = "";
   // Messages queued by the user while a run is in flight. Drained at the
   // mid-loop steering boundary (user steering wins over the hooks), mirroring
@@ -309,6 +370,10 @@ export class AgentSession {
   private approvedPlanPath?: string;
 
   private sessionId = "";
+  /** Stable identity shared by compaction and approved-plan checkpoint files. */
+  private conversationId = "";
+  /** Original user-authored prompt, retained when internal messages replace history. */
+  private sessionPreview = "";
   /** Runtime conversation identity for provider transport headers. Transient
    *  children need one even though they intentionally have no persisted session. */
   private readonly transportSessionId = crypto.randomUUID();
@@ -847,6 +912,13 @@ export class AgentSession {
       }
       case "turn_end":
         this.hookStats.turns = event.turn;
+        for (let index = this.messages.length - 1; index >= 0; index--) {
+          const anchor = this.messages[index];
+          if (anchor?.role === "assistant") {
+            this.providerContext = { usage: { ...event.usage }, anchor };
+            break;
+          }
+        }
         await this.persistTurnMetric(event);
         break;
     }
@@ -913,7 +985,7 @@ export class AgentSession {
   private getHookFollowUpMessages(): Message[] | null {
     const childCompletionFollowUp = buildSubAgentCompletionFollowUp(this.subAgentManager);
     if (childCompletionFollowUp) return childCompletionFollowUp;
-    if (this.opts.selfCorrectionHooks === false) return null;
+    if (this.opts.selfCorrectionHooks === false || this.idealReviewSuppressed) return null;
 
     if (this.idealReviewPhase === "reviewing") {
       const coverage = this.reviewCoverage.evidence();
@@ -958,7 +1030,10 @@ export class AgentSession {
     });
     return [
       this.withReviewLspEvidence(
-        buildIdealReviewMessage(decision.reasons, driftedFiles),
+        withReviewCoverageRequirements(
+          buildIdealReviewMessage(decision.reasons, driftedFiles),
+          coverage.missing,
+        ),
         lspEvidence,
       ),
     ];
@@ -1029,24 +1104,47 @@ export class AgentSession {
 
     // Auto-compact if needed. This must happen after credential resolution so
     // OpenAI OAuth/Codex sessions use the Codex product context window instead
-    // of the public API model window.
-    if (this.settingsManager.get("autoCompact")) {
+    // of the public API model window. Failed/no-op attempts cool down across
+    // prompts; provider overflow recovery still bypasses this path entirely.
+    if (this.settingsManager.get("autoCompact") && Date.now() >= this.compactionRetryAfter) {
       const contextWindow = getContextWindow(this.model, {
         provider: this.provider,
         accountId: creds.accountId,
       });
       const threshold = this.settingsManager.get("compactThreshold");
-      // Reserve headroom for this model's real output budget (e.g. GPT-5.5 over
-      // Codex OAuth: 272K window but up to 128K max output) — without this the
-      // default 16K reserve lets compaction skip until input alone is near the
-      // window, then `input + max_tokens` exceeds it and the provider rejects
-      // the turn outright with "exceeds the context window". Mirrors the TUI's
-      // useContextCompaction hook.
-      const reserveTokens = getCompactionReserveTokens(this.maxTokens);
-      if (shouldCompact(this.messages, contextWindow, threshold, undefined, reserveTokens)) {
-        await this.compact(creds);
-        // Re-grounding hook keys off this — the context was just summarized.
-        this.compactionOccurred = true;
+      let activeTokens: number | undefined;
+      if (this.providerContext) {
+        const anchorIndex = this.messages.lastIndexOf(this.providerContext.anchor);
+        if (anchorIndex >= 0) {
+          activeTokens = calculateActiveContextTokens(this.messages, {
+            usage: this.providerContext.usage,
+            pendingMessages: this.messages.slice(anchorIndex + 1),
+          });
+        } else {
+          this.providerContext = null;
+        }
+      }
+      if (shouldCompact(this.messages, contextWindow, threshold, activeTokens)) {
+        try {
+          await this.compact(creds);
+          if (this.lastCompactionCompacted) {
+            // Re-grounding hook keys off this — the context was just summarized.
+            this.compactionOccurred = true;
+            this.compactionRetryAfter = 0;
+          } else {
+            this.compactionRetryAfter = Date.now() + 30_000;
+          }
+        } catch (error) {
+          this.compactionRetryAfter = Date.now() + 30_000;
+          if (isAbortError(error) || this.opts.signal?.aborted) throw error;
+          log(
+            "WARN",
+            "compaction",
+            `Pre-run compaction failed; cooling down for 30s: ${
+              error instanceof Error ? error.message : String(error)
+            }`,
+          );
+        }
       }
     }
 
@@ -1084,30 +1182,111 @@ export class AgentSession {
         supportsImages: modelInfo?.supportsImages,
         supportsVideo: modelInfo?.supportsVideo,
         userAgent,
-        // clearToolUses disabled — causes model to output unsolicited context summaries
-        // Single tool result shouldn't exceed 30% of context window (in chars)
-        maxToolResultChars: Math.floor(
-          getContextWindow(this.model, { provider: this.provider, accountId }) * 3.5 * 0.3,
+        // Codex caps each tool output at 10K tokens. Other transports retain the
+        // generic 30%-of-context allowance used before this provider policy.
+        maxToolResultChars: resolveSessionToolResultCharLimit(this.model, this.provider, accountId),
+        // Aggregate per-turn budget across parallel tool results (fan-out guard).
+        maxTurnToolResultChars: resolveSessionTurnToolResultCharLimit(
+          this.model,
+          this.provider,
+          accountId,
         ),
         // Self-correction hooks (same as the TUI): loop-break + re-grounding are
         // polled mid-loop; the ideal review is polled when the agent would stop.
         getSteeringMessages: () => this.getHookSteeringMessages(),
         getFollowUpMessages: () => this.getHookFollowUpMessages(),
-        // Overflow recovery: the loop calls this with { force: true } when the
-        // provider rejects a turn as too large (request_too_large / context
-        // overflow). Force-compact the in-flight history and hand it back so the
-        // loop retries with a smaller request, instead of surfacing the error.
-        // Without this the desktop app (which drives the loop through
-        // AgentSession, not the TUI's useContextCompaction hook) had NO auto
-        // recovery on 413 — the error went straight to the user. The non-force
-        // pre-call invocations pass through untouched: pre-turn compaction is
-        // already handled above, so we only act on the overflow force path.
-        // `loopMessages === this.messages` (prepareDynamicContext returns it by
-        // reference) and the post-loop `this.messages = loopMessages` re-sync
-        // keeps persistence correct after compact() swaps the array.
+        // Check authoritative provider usage before every model/tool step.
+        // Forced overflow recovery bypasses settings and cooldown; proactive
+        // checks honor both and estimate only messages unseen by the provider.
         transformContext: async (messages, transformOpts) => {
-          if (!transformOpts?.force) return messages;
-          await this.compact();
+          if (transformOpts.usage) {
+            const anchorIndex = messages.length - transformOpts.pendingMessages.length - 1;
+            const anchor = messages[anchorIndex];
+            if (anchor?.role === "assistant") {
+              this.providerContext = { usage: { ...transformOpts.usage }, anchor };
+              // Feed the authoritative usage back into the token estimator so
+              // char-based estimates track this session's real tokenizer.
+              calibrateEstimatorFromUsage(messages.slice(0, anchorIndex), transformOpts.usage);
+            }
+          }
+
+          const force = transformOpts.force === true;
+          if (!force) {
+            if (!this.settingsManager.get("autoCompact")) return messages;
+
+            // Cheap stale-tool-output pruning before the expensive LLM
+            // compaction check. In-place mutation preserves anchors; drop the
+            // retained usage afterwards since it counted the pruned content.
+            const pruneResult = pruneStaleToolResults(messages);
+            if (pruneResult.pruned) {
+              this.providerContext = null;
+              log("INFO", "compaction", "Pruned stale tool outputs", {
+                prunedResults: String(pruneResult.prunedResults),
+                freedTokens: String(pruneResult.freedTokens),
+              });
+            }
+
+            if (Date.now() < this.compactionRetryAfter) return messages;
+
+            // The turn's own usage also counted the pruned content — after a
+            // prune, fall back to estimating the (now smaller) history so the
+            // freed tokens actually defer the LLM compaction.
+            let usage = pruneResult.pruned ? undefined : transformOpts.usage;
+            let pendingMessages = transformOpts.pendingMessages;
+            if (!usage && this.providerContext) {
+              const anchorIndex = messages.lastIndexOf(this.providerContext.anchor);
+              if (anchorIndex >= 0) {
+                usage = this.providerContext.usage;
+                pendingMessages = messages.slice(anchorIndex + 1);
+              } else {
+                this.providerContext = null;
+              }
+            }
+
+            const contextWindow = getContextWindow(this.model, {
+              provider: this.provider,
+              accountId,
+            });
+            const threshold = this.settingsManager.get("compactThreshold");
+            const activeTokens = calculateActiveContextTokens(messages, {
+              usage,
+              pendingMessages,
+            });
+            if (!shouldCompact(messages, contextWindow, threshold, activeTokens)) return messages;
+          }
+
+          // compact() operates on this.messages, while an earlier transform may
+          // have replaced the loop's in-flight array. Rebind before every attempt
+          // so the current tool results are included in the summary.
+          this.messages = messages;
+          try {
+            await this.compact({
+              accessToken: apiKey,
+              accountId,
+              projectId,
+              baseUrl: effectiveBaseUrl,
+            });
+          } catch (error) {
+            this.messages = messages;
+            this.compactionRetryAfter = Date.now() + 30_000;
+            if (force || isAbortError(error) || this.opts.signal?.aborted) throw error;
+            log(
+              "WARN",
+              "compaction",
+              `In-flight compaction failed; cooling down for 30s: ${
+                error instanceof Error ? error.message : String(error)
+              }`,
+            );
+            return messages;
+          }
+
+          if (!this.lastCompactionCompacted) {
+            this.messages = messages;
+            this.compactionRetryAfter = Date.now() + 30_000;
+            return messages;
+          }
+
+          this.compactionRetryAfter = 0;
           this.compactionOccurred = true;
           return this.messages;
         },
@@ -1119,6 +1298,24 @@ export class AgentSession {
       }
     };
 
+    const clearInvalidStaticApiKey = async (error: unknown): Promise<boolean> => {
+      if (!(error instanceof ProviderError) || error.statusCode !== 401) return false;
+      if (!(await this.authStorage.isStaticApiKey(this.provider))) return false;
+
+      // Clear whichever key actually resolved (the request may have used a
+      // fallback key, not the model's first preference).
+      const badKey =
+        (await this.authStorage.pickStorageKey(this.currentAuthStorageKeys())) ??
+        this.currentAuthStorageKeys()[0]!;
+      log(
+        "WARN",
+        "auth",
+        `Got 401 for ${this.provider} (${badKey}) — API key is invalid or revoked`,
+      );
+      await this.authStorage.clearCredentials(badKey);
+      return true;
+    };
+
     try {
       await runAgentLoop(creds.accessToken, creds.accountId, creds.projectId);
     } catch (err) {
@@ -1126,26 +1323,53 @@ export class AgentSession {
       if (isAbortError(err) || this.opts.signal?.aborted) {
         return;
       }
-      if (err instanceof ProviderError && err.statusCode === 401) {
+      // Kimi OAuth plan ran out of usage (hard usage-limit stop, or an HTTP 402
+      // billing stop). If the user ALSO configured a Moonshot API key, mark
+      // the OAuth credential usage-exhausted (honoring the provider-stated
+      // reset time when present) and retry this turn on the API key — OAuth
+      // stays the preferred credential and resumes automatically once the mark
+      // lapses. A generic 429 is deliberately excluded: it may be a transient
+      // rate limit and must not silently switch the user to a billed API key.
+      // Guarded on the Kimi managed endpoint actually being in use: if the API
+      // key was already active, the same error means BOTH are out and must surface.
+      if (
+        this.provider === "moonshot" &&
+        !this.baseUrl &&
+        isKimiCodingEndpoint(creds.baseUrl) &&
+        (isUsageLimitError(err) || (err instanceof ProviderError && err.statusCode === 402)) &&
+        (await this.authStorage.hasCredentials("moonshot"))
+      ) {
+        const resetsAt = err instanceof ProviderError ? err.resetsAt : undefined;
+        await this.authStorage.markUsageExhausted(MOONSHOT_OAUTH_KEY, resetsAt);
+        log(
+          "WARN",
+          "auth",
+          "Kimi OAuth usage limit reached — retrying this turn on the Moonshot API key",
+          { resetsAt: resetsAt !== undefined ? String(resetsAt) : "unknown" },
+        );
+        creds = await this.authStorage.resolveCredentials(this.provider, {
+          storageKeys: this.currentAuthStorageKeys(),
+        });
+        this.lastAccountId = creds.accountId;
+        // The runAgentLoop closure re-reads `creds`, so the retry picks up the
+        // API key's baseUrl (api.moonshot.ai) and drops the Kimi coding headers.
+        try {
+          await runAgentLoop(creds.accessToken, creds.accountId, creds.projectId);
+        } catch (fallbackErr) {
+          // The fallback is inside this catch branch, so its errors do not pass
+          // through the outer 401 handler. Clear a rejected API key explicitly
+          // before surfacing the error and prompting the user to log in again.
+          await clearInvalidStaticApiKey(fallbackErr);
+          throw fallbackErr;
+        }
+      } else if (err instanceof ProviderError && err.statusCode === 401) {
         // Static API-key providers (GLM, Moonshot API key, etc.) have no refresh
         // mechanism — retrying with the same key is pointless. Clear the
         // credential and surface the error so the user re-logins. Kimi OAuth
         // (active for `moonshot` when present) is refreshable, so it falls
         // through to the force-refresh path below.
-        if (await this.authStorage.isStaticApiKey(this.provider)) {
-          // Clear whichever key actually resolved (the request may have used
-          // a fallback key, not the model's first preference).
-          const badKey =
-            (await this.authStorage.pickStorageKey(this.currentAuthStorageKeys())) ??
-            this.currentAuthStorageKeys()[0]!;
-          log(
-            "WARN",
-            "auth",
-            `Got 401 for ${this.provider} (${badKey}) — API key is invalid or revoked`,
-          );
-          await this.authStorage.clearCredentials(badKey);
-          throw err;
-        }
+        if (await clearInvalidStaticApiKey(err)) throw err;
+
         log("INFO", "auth", "Got 401, force-refreshing token and retrying");
         creds = await this.authStorage.resolveCredentials(this.provider, {
           forceRefresh: true,
@@ -1171,6 +1395,7 @@ export class AgentSession {
     const prevProvider = this.provider;
     if (provider) this.provider = provider as Provider;
     this.model = model;
+    this.providerContext = null;
     // Keep host-provided option closures (notably chat delegation) aligned with
     // the live selection after an in-session model switch.
     this.opts.provider = this.provider;
@@ -1260,6 +1485,7 @@ export class AgentSession {
     projectId?: string;
     baseUrl?: string;
   }): Promise<void> {
+    this.lastCompactionCompacted = false;
     const creds =
       existingCredentials ??
       (await this.authStorage.resolveCredentials(this.provider, {
@@ -1283,6 +1509,17 @@ export class AgentSession {
     });
 
     this.messages = result.messages;
+    this.lastCompactionCompacted = result.result.compacted;
+
+    if (!result.result.compacted) {
+      this.eventBus.emit("compaction_end", {
+        originalCount: result.result.originalCount,
+        newCount: result.result.newCount,
+      });
+      return;
+    }
+
+    this.providerContext = null;
 
     // Transient sessions (Ken chat/autopilot, subagent spawns) must NEVER touch
     // the session store: without this guard, the first auto-compaction called
@@ -1295,8 +1532,12 @@ export class AgentSession {
     } else {
       // Persist compacted messages to a new session file so `ggcoder continue`
       // picks up the compacted state instead of the full original history.
-      const session = await this.sessionManager.create(this.cwd, this.provider, this.model);
+      const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
+        conversationId: this.conversationId || undefined,
+        preview: this.sessionPreview || undefined,
+      });
       this.sessionId = session.id;
+      this.conversationId = session.header.conversationId ?? session.id;
       this.sessionPath = session.path;
       await this.subAgentManager?.rebindParentSession(this.sessionId);
 
@@ -1325,7 +1566,13 @@ export class AgentSession {
     });
   }
 
-  async newSession(): Promise<void> {
+  async newSession(preserveConversation = false): Promise<void> {
+    // Approved-plan execution is a clean checkpoint of the same conversation;
+    // explicit new sessions reset the conversation identity.
+    if (!preserveConversation) {
+      this.conversationId = "";
+      this.sessionPreview = "";
+    }
     // A fresh session drops any in-flight plan state so its prompt is clean.
     this.planModeRef.current = false;
     this.approvedPlanPath = undefined;
@@ -1360,6 +1607,8 @@ export class AgentSession {
     // polluted the project's session list.
     if (this.opts.transient) {
       this.sessionId = "";
+      this.conversationId = "";
+      this.sessionPreview = "";
       this.sessionPath = "";
       this.lastPersistedIndex = this.messages.length;
     } else {
@@ -1440,6 +1689,19 @@ export class AgentSession {
 
   getPlanMode(): boolean {
     return this.planModeRef.current;
+  }
+
+  /**
+   * Suppress only the pre-final Ideal self-review for this live session.
+   * Autopilot uses this while Ken independently owns verification; loop-break
+   * and post-compaction re-grounding remain active.
+   */
+  setIdealReviewSuppressed(suppressed: boolean): void {
+    this.idealReviewSuppressed = suppressed;
+    if (suppressed) {
+      this.idealReviewPhase = "idle";
+      this.reviewCoverage.reset();
+    }
   }
 
   /** Queue a user message (optionally with attachments) to be injected mid-run
@@ -1764,47 +2026,11 @@ export class AgentSession {
   }
 
   /**
-   * Generate a short LLM session title from the conversation so far (first user
-   * message + first assistant reply). Best-effort; returns null on failure or
-   * when there's no user message yet. Uses the cheapest model for the provider.
-   */
-  async generateTitle(): Promise<string | null> {
-    const extractText = (content: Message["content"]): string =>
-      typeof content === "string"
-        ? content
-        : content
-            .map((c) =>
-              c.type === "text" && "text" in c && typeof c.text === "string" ? c.text : "",
-            )
-            .join(" ");
-    const userMsg = this.messages.find((m) => m.role === "user");
-    const assistantMsg = this.messages.find((m) => m.role === "assistant");
-    const userText = userMsg ? extractText(userMsg.content) : "";
-    if (!userText.trim()) return null;
-    try {
-      const creds = await this.authStorage.resolveCredentials(this.provider, {
-        storageKeys: this.currentAuthStorageKeys(),
-      });
-      const title = await generateSessionTitle({
-        provider: this.provider,
-        userMessage: userText,
-        assistantPreview: assistantMsg ? extractText(assistantMsg.content).slice(0, 200) : "",
-        apiKey: creds.accessToken,
-        baseUrl: this.baseUrl ?? creds.baseUrl,
-        accountId: creds.accountId,
-      });
-      return title || null;
-    } catch {
-      return null;
-    }
-  }
-
-  /**
    * Rewrite a draft prompt into a tighter, terminology-correct version using
    * the ACTIVE provider/model. A stateless one-off LLM call (no agent loop, no
    * tools, no session mutation) — safe to run even mid-run. Returns the plain
    * enhanced text plus typed segments marking each corrected term. Errors throw
-   * so the caller can surface them (unlike best-effort title generation).
+   * so the caller can surface them.
    */
   async enhancePrompt(text: string): Promise<EnhanceResult> {
     if (!text.trim()) return { enhanced: text, segments: [{ kind: "text", text }] };
@@ -1916,8 +2142,12 @@ export class AgentSession {
   // ── Private ────────────────────────────────────────────
 
   private async createNewSession(): Promise<void> {
-    const session = await this.sessionManager.create(this.cwd, this.provider, this.model);
+    const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
+      conversationId: this.conversationId || undefined,
+      preview: this.sessionPreview || undefined,
+    });
     this.sessionId = session.id;
+    this.conversationId = session.header.conversationId ?? session.id;
     this.sessionPath = session.path;
     this.lastPersistedIndex = this.messages.length;
   }
@@ -1926,6 +2156,15 @@ export class AgentSession {
     const loaded = await this.sessionManager.load(sessionPath);
     // Use the leaf from the header to walk the correct branch
     const loadedMessages = this.sessionManager.getMessages(loaded.entries, loaded.header.leafId);
+    this.conversationId = loaded.header.conversationId ?? loaded.header.id;
+    const legacyLabel = [...loaded.entries]
+      .reverse()
+      .find((entry) => entry.type === "label")
+      ?.label.replace(/\s+/g, " ")
+      .trim()
+      .slice(0, 80);
+    this.sessionPreview =
+      legacyLabel || loaded.header.preview || findUserSessionPrompt(loadedMessages);
     // Restore Ken's advisory turns (custom entries, not on the message branch) so
     // they reappear in the transcript and survive into the continuation file.
     this.kenTurns = this.sessionManager.getKenTurns(loaded.entries);
@@ -1938,10 +2177,15 @@ export class AgentSession {
     // Track the current leaf for subsequent entries
     this.currentLeafId = loaded.header.leafId;
 
-    // Rebuild messages: keep system, add loaded
+    // Rebuild messages: keep system, add loaded. Older gg-app sessions may
+    // contain full-resolution attachments; repair them once on load so they do
+    // not fail when Anthropic's stricter many-image limit activates later.
     const systemMsg = this.messages[0]; // Already built
     this.messages = [systemMsg, ...loadedMessages];
-
+    const normalizedImageCount = await normalizeMessageImages(this.messages);
+    if (normalizedImageCount > 0) {
+      log("INFO", "session", `Resized ${normalizedImageCount} restored session image(s)`);
+    }
     // Auto-compact on load if the restored session exceeds the context window.
     // Without this, huge sessions (1M+ tokens) get loaded into memory and OOM.
     const creds = await this.authStorage.resolveCredentials(this.provider, {
@@ -1955,15 +2199,19 @@ export class AgentSession {
       provider: this.provider,
       accountId: creds.accountId,
     });
-    if (
-      shouldCompact(
-        this.messages,
-        contextWindow,
-        0.8,
-        undefined,
-        getCompactionReserveTokens(this.maxTokens),
-      )
-    ) {
+    const needsLoadCompaction =
+      this.settingsManager.get("autoCompact") &&
+      shouldCompact(this.messages, contextWindow, this.settingsManager.get("compactThreshold"));
+    if (needsLoadCompaction && this.opts.deferLoadCompaction) {
+      // Host readiness is gated on initialize() — don't block it on a summary
+      // LLM call (up to 30s). runLoop()'s pre-run auto-compaction picks this
+      // up on the first prompt and emits compaction_start/_end for the UI.
+      log(
+        "INFO",
+        "session",
+        "Restored session exceeds context — deferring compaction to first prompt",
+      );
+    } else if (needsLoadCompaction) {
       await this.subAgentManager?.hydrate(loaded.header.id);
       log("INFO", "session", `Restored session exceeds context — auto-compacting`);
       const compacted = await compact(this.messages, {
@@ -1986,8 +2234,12 @@ export class AgentSession {
       // what's in memory — fork a fresh session file for the compacted state
       // (mirrors compact()'s own persistence) so `ggcoder continue` picks up
       // the summary instead of the full original transcript.
-      const session = await this.sessionManager.create(this.cwd, this.provider, this.model);
+      const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
+        conversationId: this.conversationId || undefined,
+        preview: this.sessionPreview || undefined,
+      });
       this.sessionId = session.id;
+      this.conversationId = session.header.conversationId ?? session.id;
       this.sessionPath = session.path;
       await this.subAgentManager?.rebindParentSession(this.sessionId);
       this.currentLeafId = null;
@@ -2026,6 +2278,9 @@ export class AgentSession {
   }
 
   private async persistMessage(message: Message): Promise<void> {
+    if (!this.sessionPreview && message.role === "user") {
+      this.sessionPreview = getUserSessionPrompt(message.content) ?? "";
+    }
     // Transient sessions (subagent spawns) have no session file — skip.
     if (!this.sessionPath) return;
     const entryId = crypto.randomUUID();

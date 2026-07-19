@@ -257,12 +257,14 @@ export function classifyOverload(
     statusCode === 502 ||
     statusCode === 503 ||
     statusCode === 504 ||
+    statusCode === 507 ||
     msg.includes("api_error") ||
     msg.includes("server_error") ||
     msg.includes("internal server error") ||
     msg.includes("bad gateway") ||
     msg.includes("service unavailable") ||
-    msg.includes("gateway timeout")
+    msg.includes("gateway timeout") ||
+    msg.includes("exceeded request buffer limit while retrying upstream")
   ) {
     return "provider_error";
   }
@@ -376,6 +378,8 @@ export async function* agentLoop(
   let toolMap = new Map<string, AgentTool>((options.tools ?? []).map((t) => [t.name, t]));
 
   const totalUsage: Usage = { inputTokens: 0, outputTokens: 0 };
+  let latestProviderUsage: Usage | undefined;
+  let usageAnchorIndex: number | undefined;
   let turn = 0;
   // Set when a turn executes tools and completes but the turn budget is now
   // exhausted — the loop is about to stop mid-task. Drives the terminal
@@ -520,7 +524,12 @@ export async function* agentLoop(
       // ── Mid-loop context transform (compaction / truncation) ──
       if (options.transformContext) {
         diag("transform_start");
-        const transformed = await options.transformContext(messages);
+        const pendingMessages =
+          usageAnchorIndex === undefined ? [] : messages.slice(usageAnchorIndex + 1);
+        const transformed = await options.transformContext(messages, {
+          usage: latestProviderUsage,
+          pendingMessages,
+        });
         if (transformed !== messages) {
           diag("transform_compacted", {
             before: messages.length,
@@ -528,6 +537,8 @@ export async function* agentLoop(
           });
           messages.length = 0;
           messages.push(...transformed);
+          latestProviderUsage = undefined;
+          usageAnchorIndex = undefined;
         }
         diag("transform_end");
       }
@@ -885,10 +896,18 @@ export async function* agentLoop(
               ...overflowDetails,
             });
             try {
-              const compacted = await options.transformContext(messages, { force: true });
+              const pendingMessages =
+                usageAnchorIndex === undefined ? [] : messages.slice(usageAnchorIndex + 1);
+              const compacted = await options.transformContext(messages, {
+                force: true,
+                usage: latestProviderUsage,
+                pendingMessages,
+              });
               if (compacted !== messages && compacted.length < messages.length) {
                 messages.length = 0;
                 messages.push(...compacted);
+                latestProviderUsage = undefined;
+                usageAnchorIndex = undefined;
                 diag("overflow_compact_success", {
                   attempt: overflowCompactionAttempts,
                   messages: messages.length,
@@ -1158,8 +1177,12 @@ export async function* agentLoop(
         totalUsage.cacheWrite = (totalUsage.cacheWrite ?? 0) + response.usage.cacheWrite;
       }
 
-      // Append assistant message to conversation
+      // Append assistant message and anchor the provider's authoritative usage
+      // at that exact history position. Later tool/user messages stay pending
+      // until the next provider request observes them.
       messages.push(response.message);
+      latestProviderUsage = response.usage;
+      usageAnchorIndex = messages.length - 1;
 
       const completedAt = Date.now();
       const outputTokensPerSecond =
@@ -1275,6 +1298,7 @@ export async function* agentLoop(
       const executionOptions: ToolBatchExecutionOptions = {
         signal: options.signal,
         maxToolResultChars: options.maxToolResultChars,
+        maxTurnToolResultChars: options.maxTurnToolResultChars,
         toolMap,
         invalidToolArgumentCounts,
         markFatalToolArgumentError,
@@ -1392,6 +1416,7 @@ interface ToolExecutionRecord {
 interface ToolBatchExecutionOptions {
   signal?: AbortSignal;
   maxToolResultChars?: number;
+  maxTurnToolResultChars?: number;
   toolMap: Map<string, AgentTool>;
   invalidToolArgumentCounts: Map<string, number>;
   /**
@@ -1637,6 +1662,7 @@ async function* executeToolCallsMixed(
 
   const toolResults = buildToolResults(initialToolResults, toolCalls, resultsById);
   capToolResults(toolResults, options.maxToolResultChars);
+  capTurnToolResults(toolResults, options.maxTurnToolResultChars);
   return { toolResults, aborted };
 }
 
@@ -1684,6 +1710,7 @@ async function* executeToolCallsParallel(
 
   const toolResults = buildToolResults(initialToolResults, toolCalls, resultsById);
   capToolResults(toolResults, options.maxToolResultChars);
+  capTurnToolResults(toolResults, options.maxTurnToolResultChars);
   return { toolResults, aborted };
 }
 
@@ -1727,6 +1754,52 @@ function capToolResults(toolResults: ToolResult[], maxToolResultChars: number | 
     const tail = toolResult.content.slice(-tailChars);
     const omitted = toolResult.content.length - headChars - tailChars;
     toolResult.content = head + `\n\n[... ${omitted} characters omitted ...]\n\n` + tail;
+  }
+}
+
+/**
+ * Aggregate per-turn budget across every tool result in one assistant turn.
+ * A single result is bounded by per-tool truncation and `maxToolResultChars`,
+ * but a wide parallel fan-out (8+ reads/bash calls) can still inject 100k+
+ * uncached tokens in one turn. Water-filling: small results keep their full
+ * size; only the largest results share what remains of the budget.
+ */
+export function capTurnToolResults(
+  toolResults: ToolResult[],
+  maxTurnToolResultChars: number | undefined,
+): void {
+  if (!maxTurnToolResultChars) return;
+  const textResults = toolResults.filter(
+    (toolResult): toolResult is ToolResult & { content: string } =>
+      typeof toolResult.content === "string",
+  );
+  const total = textResults.reduce((sum, toolResult) => sum + toolResult.content.length, 0);
+  if (total <= maxTurnToolResultChars) return;
+
+  // Water-filling allocation: process results smallest-first; each takes
+  // min(own size, fair share of what's left), releasing unused budget to the
+  // larger results behind it.
+  const bySize = [...textResults].sort((a, b) => a.content.length - b.content.length);
+  let remaining = maxTurnToolResultChars;
+  let left = bySize.length;
+  for (const toolResult of bySize) {
+    const fairShare = Math.floor(remaining / left);
+    left--;
+    if (toolResult.content.length <= fairShare) {
+      remaining -= toolResult.content.length;
+      continue;
+    }
+    remaining -= fairShare;
+    // Keep 70% head + 30% tail so errors/diagnostics at the end survive.
+    const headChars = Math.floor(fairShare * 0.7);
+    const tailChars = fairShare - headChars;
+    const omitted = toolResult.content.length - fairShare;
+    toolResult.content =
+      toolResult.content.slice(0, headChars) +
+      `\n\n[... ${omitted} characters trimmed: this turn's combined tool results exceeded the ` +
+      `per-turn budget. Re-run this call alone with narrower filters or offset/limit if you ` +
+      `need the omitted content ...]\n\n` +
+      (tailChars > 0 ? toolResult.content.slice(-tailChars) : "");
   }
 }
 

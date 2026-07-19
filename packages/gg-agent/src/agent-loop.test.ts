@@ -3,6 +3,7 @@ import { z } from "zod";
 import { ProviderError } from "@kenkaiiii/gg-ai";
 import {
   agentLoop,
+  capTurnToolResults,
   classifyOverload,
   extractContextOverflowDetails,
   isBillingError,
@@ -11,8 +12,8 @@ import {
   isUsageLimitError,
   serverResetDelayMs,
 } from "./agent-loop.js";
-import type { AgentEvent, AgentResult, AgentTool } from "./types.js";
-import type { Message, StreamOptions } from "@kenkaiiii/gg-ai";
+import type { AgentEvent, AgentResult, AgentTool, TransformContextOptions } from "./types.js";
+import type { Message, StreamOptions, Usage } from "@kenkaiiii/gg-ai";
 
 // ── Mock stream ────────────────────────────────────────────
 
@@ -45,6 +46,22 @@ function mockOkResult(text: string) {
       for (const e of events) yield e;
     },
     response: Promise.resolve(resp),
+  };
+}
+
+function mockToolCallResult(name: string, usage: Usage, id = "t1") {
+  return {
+    [Symbol.asyncIterator]: async function* () {
+      yield* [];
+    },
+    response: Promise.resolve({
+      message: {
+        role: "assistant" as const,
+        content: [{ type: "tool_call" as const, id, name, args: {} }],
+      },
+      stopReason: "tool_use" as const,
+      usage,
+    }),
   };
 }
 
@@ -175,17 +192,29 @@ describe("isContextOverflow", () => {
 });
 
 describe("classifyOverload", () => {
-  it("classifies provider 5xx and api_error as transient provider errors", () => {
+  it("classifies transient provider 5xx and api_error as provider errors", () => {
     const cases = [
       new ProviderError("anthropic", "api_error: Internal server error", { statusCode: undefined }),
       new ProviderError("anthropic", "Internal server error", { statusCode: 500 }),
       new ProviderError("anthropic", "Bad Gateway", { statusCode: 502 }),
       new ProviderError("anthropic", "Service Unavailable", { statusCode: 503 }),
       new ProviderError("anthropic", "Gateway Timeout", { statusCode: 504 }),
+      new ProviderError("openai", "exceeded request buffer limit while retrying upstream", {
+        statusCode: 507,
+      }),
+      new ProviderError("openai", "exceeded request buffer limit while retrying upstream"),
     ];
 
     for (const error of cases) {
       expect(classifyOverload(error)).toBe("provider_error");
+    }
+  });
+
+  it("does not retry permanent 5xx responses", () => {
+    for (const statusCode of [501, 505, 511]) {
+      expect(
+        classifyOverload(new ProviderError("openai", "Permanent server response", { statusCode })),
+      ).toBeNull();
     }
   });
 
@@ -361,7 +390,155 @@ describe("agentLoop", () => {
     });
 
     expect(transformContext).toHaveBeenCalledTimes(1);
-    expect(transformContext).toHaveBeenCalledWith(messages);
+    expect(transformContext).toHaveBeenCalledWith(messages, {
+      usage: undefined,
+      pendingMessages: [],
+    });
+  });
+
+  it("passes provider usage and pending tool results to the next transform", async () => {
+    const usage: Usage = {
+      inputTokens: 70,
+      outputTokens: 30,
+      cacheRead: 11,
+      cacheWrite: 7,
+    };
+    mockStream
+      .mockReturnValueOnce(
+        mockToolCallResult("context_probe", usage) as unknown as ReturnType<typeof stream>,
+      )
+      .mockReturnValueOnce(mockOkResult("done") as unknown as ReturnType<typeof stream>);
+
+    const transformContext = vi.fn((msgs: Message[], _options: TransformContextOptions) => msgs);
+    await collectLoop(
+      [
+        { role: "system", content: "sys" },
+        { role: "user", content: "run the tool" },
+      ],
+      {
+        provider: "anthropic",
+        model: "test",
+        tools: [
+          {
+            name: "context_probe",
+            description: "returns pending context",
+            parameters: emptyParams,
+            execute: () => "pending tool output",
+          },
+        ],
+        transformContext,
+      },
+    );
+
+    expect(transformContext).toHaveBeenCalledTimes(2);
+    const secondOptions = transformContext.mock.calls[1]![1] as TransformContextOptions;
+    expect(secondOptions.usage).toEqual(usage);
+    expect(secondOptions.pendingMessages).toHaveLength(1);
+    expect(secondOptions.pendingMessages[0]).toMatchObject({ role: "tool" });
+    expect(JSON.stringify(secondOptions.pendingMessages[0]?.content)).toContain(
+      "pending tool output",
+    );
+  });
+
+  it("uses transformed history for the next provider call", async () => {
+    const providerPrompts: Message[][] = [];
+    mockStream
+      .mockImplementationOnce((options: StreamOptions) => {
+        providerPrompts.push(structuredClone(options.messages));
+        return mockToolCallResult("context_probe", {
+          inputTokens: 70,
+          outputTokens: 30,
+        }) as unknown as ReturnType<typeof stream>;
+      })
+      .mockImplementationOnce((options: StreamOptions) => {
+        providerPrompts.push(structuredClone(options.messages));
+        return mockOkResult("done") as unknown as ReturnType<typeof stream>;
+      });
+
+    const compacted: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "compacted history" },
+    ];
+    let transformCall = 0;
+    const transformContext = vi.fn((msgs: Message[]) => {
+      transformCall++;
+      return transformCall === 2 ? compacted : msgs;
+    });
+
+    await collectLoop(
+      [
+        { role: "system", content: "sys" },
+        { role: "user", content: "old history" },
+      ],
+      {
+        provider: "anthropic",
+        model: "test",
+        tools: [
+          {
+            name: "context_probe",
+            description: "returns context",
+            parameters: emptyParams,
+            execute: () => "large pending result",
+          },
+        ],
+        transformContext,
+      },
+    );
+
+    expect(providerPrompts).toHaveLength(2);
+    expect(providerPrompts[1]).toEqual(compacted);
+  });
+
+  it("clears the usage anchor when a transform replaces history", async () => {
+    const firstUsage: Usage = { inputTokens: 80, outputTokens: 20, cacheRead: 5 };
+    const overflow = new Error("prompt is too long: 250000 tokens > 200000 maximum");
+    mockStream
+      .mockReturnValueOnce(
+        mockToolCallResult("context_probe", firstUsage) as unknown as ReturnType<typeof stream>,
+      )
+      .mockReturnValueOnce(mockErrorResult(overflow) as unknown as ReturnType<typeof stream>)
+      .mockReturnValueOnce(mockOkResult("recovered") as unknown as ReturnType<typeof stream>);
+
+    let transformCall = 0;
+    const transformContext = vi.fn((msgs: Message[], options: TransformContextOptions) => {
+      transformCall++;
+      if (transformCall === 2) {
+        return [
+          { role: "system" as const, content: "sys" },
+          { role: "user" as const, content: "compacted history" },
+        ];
+      }
+      if (options.force) return msgs.slice(0, 1);
+      return msgs;
+    });
+
+    await collectLoop(
+      [
+        { role: "system", content: "sys" },
+        { role: "user", content: "old history" },
+      ],
+      {
+        provider: "anthropic",
+        model: "test",
+        tools: [
+          {
+            name: "context_probe",
+            description: "returns context",
+            parameters: emptyParams,
+            execute: () => "pending result",
+          },
+        ],
+        transformContext,
+      },
+    );
+
+    expect((transformContext.mock.calls[1]![1] as TransformContextOptions).usage).toEqual(
+      firstUsage,
+    );
+    const forcedOptions = transformContext.mock.calls.find(
+      (call) => (call[1] as TransformContextOptions).force,
+    )?.[1] as TransformContextOptions;
+    expect(forcedOptions).toEqual({ force: true, usage: undefined, pendingMessages: [] });
   });
 
   it("replaces messages when transformContext returns a new array", async () => {
@@ -1368,5 +1545,74 @@ describe("agentLoop", () => {
 
     expect(events.some((e) => e.type === "max_turns")).toBe(false);
     expect(events.some((e) => e.type === "agent_done")).toBe(true);
+  });
+});
+
+describe("capTurnToolResults", () => {
+  const result = (id: string, content: string) => ({
+    type: "tool_result" as const,
+    toolCallId: id,
+    content,
+  });
+
+  it("leaves results untouched when the turn total fits the budget", () => {
+    const toolResults = [result("a", "x".repeat(400)), result("b", "y".repeat(500))];
+    capTurnToolResults(toolResults, 1_000);
+    expect(toolResults[0].content).toBe("x".repeat(400));
+    expect(toolResults[1].content).toBe("y".repeat(500));
+  });
+
+  it("is a no-op when no budget is configured", () => {
+    const toolResults = [result("a", "x".repeat(5_000))];
+    capTurnToolResults(toolResults, undefined);
+    expect(toolResults[0].content).toBe("x".repeat(5_000));
+  });
+
+  it("trims only the largest results and preserves small ones (water-filling)", () => {
+    const small = result("small", "s".repeat(200));
+    const medium = result("medium", "m".repeat(2_000));
+    const large = result("large", "l".repeat(20_000));
+    const toolResults = [large, small, medium];
+    capTurnToolResults(toolResults, 6_000);
+
+    expect(small.content).toBe("s".repeat(200));
+    expect(medium.content).toBe("m".repeat(2_000));
+    expect(large.content).not.toBe("l".repeat(20_000));
+    expect(large.content).toContain("characters trimmed");
+    expect(large.content).toContain("offset/limit");
+    // Trimmed large result keeps head and tail around the notice.
+    expect(large.content.startsWith("l")).toBe(true);
+    expect(large.content.endsWith("l")).toBe(true);
+    // Total payload (minus notices) respects the budget.
+    const kept = toolResults.reduce(
+      (sum, r) => sum + (r.content as string).replace(/\n\n\[\.\.\..*\.\.\.\]\n\n/s, "").length,
+      0,
+    );
+    expect(kept).toBeLessThanOrEqual(6_000);
+  });
+
+  it("splits the budget across several oversized parallel results", () => {
+    const toolResults = [
+      result("a", "a".repeat(50_000)),
+      result("b", "b".repeat(50_000)),
+      result("c", "c".repeat(50_000)),
+    ];
+    capTurnToolResults(toolResults, 30_000);
+    for (const r of toolResults) {
+      expect((r.content as string).length).toBeLessThan(50_000);
+      expect(r.content).toContain("characters trimmed");
+    }
+  });
+
+  it("ignores structured (non-string) results", () => {
+    const structured = {
+      type: "tool_result" as const,
+      toolCallId: "img",
+      content: [{ type: "text" as const, text: "t".repeat(10_000) }],
+    };
+    const text = result("txt", "x".repeat(10_000));
+    capTurnToolResults([structured, text], 5_000);
+    expect(structured.content[0].text).toBe("t".repeat(10_000));
+    expect(text.content).toContain("characters trimmed");
   });
 });

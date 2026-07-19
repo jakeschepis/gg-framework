@@ -22,6 +22,58 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.23.4",
+    date: "2026-07-18",
+    items: [
+      "`Anthropic` image-heavy chats are rock-solid now. I automatically resize oversized screenshots to the safe `2000px` limit, including images already buried in restored conversations, so long visual sessions keep rolling instead of dying on a surprise error.",
+    ],
+  },
+  {
+    version: "0.23.3",
+    date: "2026-07-18",
+    items: [
+      "`GPT-5.6` long chats just got dramatically tougher. I squeeze huge conversations down before sending them and recover automatically when `OpenAI` briefly stumbles, so massive prompts, images, and tool-heavy sessions keep moving instead of crashing into that request buffer error.",
+    ],
+  },
+  {
+    version: "0.23.2",
+    date: "2026-07-17",
+    items: [
+      "Long chats just got another serious efficiency boost. I taught GG Coder to learn each model's real token footprint, wait until `85%` before compacting, then carry a leaner `8K` recent tail forward. In my live torture test, total input fell `31%` with the answer intact.",
+      "Monster command output is no longer a dead end. I save the full result for `48 hours` and point GG Coder straight to the missing slice, so it can recover one buried line without rerunning the whole command or stuffing your context twice.",
+    ],
+  },
+  {
+    version: "0.23.1",
+    date: "2026-07-17",
+    items: [
+      "Your token bill on OpenAI models just took a serious haircut. I capped how much raw tool output a single turn can dump into context, so those runaway `400K` token spikes from parallel file reads are gone for good.",
+      "Long sessions now clean up after themselves. I quietly drop stale file reads and ancient command output the moment newer versions exist, keeping conversations lean, cutting rebilled context by up to `60%`, and pushing full compaction much further away.",
+      "`Autopilot` stopped double-checking itself. When Ken reviews your work he now owns the whole verification, so runs finish faster with one clean verdict instead of two overlapping reviews.",
+    ],
+  },
+  {
+    version: "0.23.0",
+    date: "2026-07-17",
+    items: [
+      "`Grok 4.5` just joined the lineup. I wired in xAI's new flagship with a huge `500K` context window, image vision, and adjustable reasoning, so you can throw serious coding and knowledge work at it from day one.",
+      "`Kimi` sign-in finally knows which wallet to use. I make OAuth your first choice, switch to your API key only when plan usage runs dry, then move you back automatically when it resets. No more crossed wires or fake dead-end limits.",
+      "Huge sessions wake up fast now. I stopped `resume` from freezing the app for up to `30 seconds`, and long compactions keep going while the provider is still working instead of collapsing into a rough fallback.",
+      "`Ideal review` now lands exactly where it belongs, before the answer you keep. I hide the scratch draft, show the review, then leave you with one clean final response.",
+    ],
+  },
+  {
+    version: "0.22.0",
+    date: "2026-07-16",
+    items: [
+      "`Kimi K3` is here, and I made Moonshot's new flagship your default from day one. You get maximum reasoning, a massive `1M-token` brain, and native image plus video understanding, while `Kimi K2.7 Code` stays ready when you want the lean coding specialist.",
+      "Your workspace tells you the truth at a glance now. I moved the project, `branch`, and live `uncommitted` file count into the title bar, so every window shows exactly where you are without stealing space from your tools.",
+      "Your recent sessions stop multiplying and losing their names after long chats. I made titles and conversation identity survive `compaction`, then collapsed old checkpoints into one clean, resumable session.",
+      "`Plan Steps` finally stays locked to the real plan while GG Coder works. I made it follow live edits, count completed steps honestly, and disappear the instant the run ends, so stale progress never hangs around pretending work is still moving.",
+      "Your specialist crew now shows where every token really went, including fresh input, cached input, and output. I also tightened `Codex` tool results so oversized reads stop devouring the context your agents need to finish strong.",
+    ],
+  },
+  {
     version: "0.21.1",
     date: "2026-07-15",
     items: [

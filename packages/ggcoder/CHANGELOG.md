@@ -1,5 +1,66 @@
 # @kenkaiiii/ggcoder
 
+## 5.19.4
+
+### Patch Changes
+
+- Prevent Anthropic many-image requests from failing by resizing new and restored images to provider-safe dimensions.
+  - @kenkaiiii/gg-ai@5.19.4
+  - @kenkaiiii/gg-agent@5.19.4
+  - @kenkaiiii/gg-core@5.19.4
+
+## 5.19.3
+
+### Patch Changes
+
+- Updated dependencies [b6e7562]
+  - @kenkaiiii/gg-ai@5.19.3
+  - @kenkaiiii/gg-agent@5.19.3
+  - @kenkaiiii/gg-core@5.19.3
+
+## 5.19.2
+
+### Patch Changes
+
+- Reduce long-session token usage with calibrated context estimates and preserve full oversized command output for targeted recovery.
+  - @kenkaiiii/gg-ai@5.19.2
+  - @kenkaiiii/gg-agent@5.19.2
+  - @kenkaiiii/gg-core@5.19.2
+
+## 5.19.1
+
+### Patch Changes
+
+- Cut OpenAI token burn: percentage-only compaction thresholds on authoritative provider usage, a per-turn aggregate tool-result budget that trims parallel fan-out context bombs, cheap stale tool-output pruning (superseded reads and old outputs stubbed before compaction), and autopilot now suppresses the redundant Ideal self-review while Ken owns verification.
+  - @kenkaiiii/gg-ai@5.19.1
+  - @kenkaiiii/gg-agent@5.19.1
+  - @kenkaiiii/gg-core@5.19.1
+
+## 5.19.0
+
+### Minor Changes
+
+- Add Grok 4.5 support and make Kimi prefer OAuth with automatic API-key fallback when plan usage is exhausted.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.19.0
+- @kenkaiiii/gg-agent@5.19.0
+- @kenkaiiii/gg-core@5.19.0
+
+## 5.18.0
+
+### Minor Changes
+
+- e00de5b: Add Kimi K3 as Moonshot's default model with its 1M-token multimodal registry metadata and endpoint-specific max-effort request handling for both the public API and Kimi Code OAuth. Keep Kimi K2.7 Code available as the dedicated coding alternative.
+
+### Patch Changes
+
+- Updated dependencies [e00de5b]
+  - @kenkaiiii/gg-ai@5.18.0
+  - @kenkaiiii/gg-core@5.18.0
+  - @kenkaiiii/gg-agent@5.18.0
+
 ## 5.17.0
 
 ### Minor Changes

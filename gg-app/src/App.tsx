@@ -86,7 +86,7 @@ import { Confetti } from "./Confetti";
 import { RankBadge } from "./RankBadge";
 import { ScorecardModal } from "./ScorecardModal";
 import { TitleUsageMeter } from "./TitleUsageMeter";
-import { WorkspaceHeader } from "./WorkspaceHeader";
+import { formatWorkspaceTitle, WorkspaceHeader } from "./WorkspaceHeader";
 import { useProgress } from "./useProgress";
 import { LoginScreen } from "./LoginScreen";
 import { Markdown, PromptSendProvider } from "./Markdown";
@@ -267,13 +267,6 @@ export interface TranscriptImage {
 let idSeq = 0;
 const nextId = (): number => ++idSeq;
 
-// Last path segment of a cwd (the project folder name), mirroring the TUI footer
-// which shows only the current directory rather than the full path.
-function basename(p: string): string {
-  const parts = p.split("/").filter(Boolean);
-  return parts[parts.length - 1] ?? p;
-}
-
 // Vertical divider between footer segments (mirrors the TUI's ` \u2502 ` in
 // border color). Rendered between adjacent groups, never leading/trailing.
 function FooterSep(): React.ReactElement {
@@ -412,8 +405,6 @@ function App(): React.ReactElement {
   const [liveToolFeed, setLiveToolFeed] = useState<LiveToolEntry[]>([]);
   const [tokens, setTokens] = useState(0);
   const [doneStatus, setDoneStatus] = useState<string | null>(null);
-  // LLM-generated session title shown in the titlebar ("GG Coder" until set).
-  const [sessionTitle, setSessionTitle] = useState<string | null>(null);
   // Pending plan awaiting review (the markdown). Non-null opens the review modal.
   const [planReview, setPlanReview] = useState<string | null>(null);
   // Path of the plan awaiting review, captured from `plan_exit`. Needed on accept
@@ -427,10 +418,8 @@ function App(): React.ReactElement {
   // which intentionally does not re-capture React state on every render.
   const planTotalRef = useRef(0);
   const planDoneRef = useRef<Set<number>>(new Set());
-  // Plan step count to (re)apply right after an accept-driven session_reset.
-  // Accepting a plan starts a fresh session whose session_reset clears the
-  // counters; this carries the approved plan's step total across that reset so
-  // the Plan Steps widget doesn't get stuck at 0. Null when no accept is pending.
+  // Approval-time count kept only as a compatibility fallback for an older
+  // sidecar whose session_reset has no canonical live-file total.
   const pendingPlanTotalRef = useRef<number | null>(null);
   const [isThinking, setIsThinking] = useState(false);
   const [thinkingStartTs, setThinkingStartTs] = useState<number | null>(null);
@@ -756,12 +745,27 @@ function App(): React.ReactElement {
     };
   }, [insertDroppedFolderPaths]);
 
-  // Drive the native OS title bar with the session title or mode-specific app name.
+  // Keep the native window title aligned with the visible title-bar context.
   useEffect(() => {
-    const inWorkspace = !needsProject && !showPicker;
     const fallbackTitle = workspaceMode === "chat" ? "GG Chat" : "GG Coder";
-    setWindowTitle(inWorkspace && sessionTitle ? sessionTitle : fallbackTitle);
-  }, [needsProject, showPicker, sessionTitle, workspaceMode]);
+    const title =
+      !needsProject && !showPicker
+        ? formatWorkspaceTitle(
+            state?.cwd,
+            state?.gitBranch,
+            fallbackTitle,
+            state?.gitDirtyFileCount,
+          )
+        : fallbackTitle;
+    setWindowTitle(title);
+  }, [
+    needsProject,
+    showPicker,
+    state?.cwd,
+    state?.gitBranch,
+    state?.gitDirtyFileCount,
+    workspaceMode,
+  ]);
 
   // Auto-grow the chat textarea to fit its content (up to a CSS max-height,
   // after which it scrolls). Runs whenever the input value changes.
@@ -932,7 +936,6 @@ function App(): React.ReactElement {
     setThinkingAccumMs,
     setPlanTotal,
     setPlanDone,
-    setSessionTitle,
     setPlanReview,
     setQueuedCount,
     setAttachments,
@@ -1734,21 +1737,15 @@ function App(): React.ReactElement {
     // fresh session on the sidecar, whose session_reset broadcast nulls
     // planReview (and clears the transcript + counters) here.
     const nextPlanTotal = planReview ? countPlanSteps(planReview) : 0;
-    // Stash it so the accept-driven session_reset restores the count instead of
-    // zeroing it (session_reset arrives over SSE — a different channel than the
-    // acceptPlanIPC response — so it may land before OR after the await resolves).
+    // Stash a fallback for older sidecars. The current sidecar puts its canonical
+    // live-file count directly on session_reset, which wins over this snapshot.
     pendingPlanTotalRef.current = nextPlanTotal;
     // Accept the plan: the sidecar wipes the planning conversation into a FRESH
-    // session (so the build doesn't carry all the plan-mode research) and bakes
-    // the approved plan into the new system prompt, so the model emits `[DONE:n]`
-    // markers the Plan Steps widget reads.
+    // session (so the build doesn't carry all the plan-mode research), bakes the
+    // approved plan into the new system prompt, and broadcasts authoritative
+    // progress before this request resolves. Do not re-seed from stale modal
+    // content after the await: the plan file may already have changed.
     await acceptPlanIPC(planReviewPathRef.current);
-    // Fallback seed for the case session_reset hasn't been processed yet (it
-    // consumes pendingPlanTotalRef, so whichever runs second is a no-op).
-    planTotalRef.current = nextPlanTotal;
-    planDoneRef.current = new Set();
-    setPlanTotal(nextPlanTotal);
-    setPlanDone(new Set());
     runPlanPrompt(
       "The plan has been approved. Implement it now, following each step in order.",
       "\u2713 Plan accepted. Implementing.",
@@ -1796,7 +1793,6 @@ function App(): React.ReactElement {
     setState(null);
     setTasks([]);
     setContextTokens(0);
-    setSessionTitle(null);
     setPlanReview(null);
     planTotalRef.current = 0;
     planDoneRef.current = new Set();
@@ -1885,7 +1881,9 @@ function App(): React.ReactElement {
 
       <WorkspaceHeader
         workspaceMode={workspaceMode}
-        sessionTitle={sessionTitle}
+        cwd={state?.cwd}
+        gitBranch={state?.gitBranch}
+        gitDirtyFileCount={state?.gitDirtyFileCount}
         navHidden={navHidden}
         onToggleNav={toggleNav}
         stripExtras={
@@ -2287,26 +2285,10 @@ function App(): React.ReactElement {
               </span>
             ) : (
               <span className="footer-left footer-reveal" style={{ fontFamily: "var(--mono)" }}>
-                {state?.cwd && (
-                  <span className="footer-cwd" style={{ color: theme.textDim }}>
-                    {basename(state.cwd)}
-                  </span>
-                )}
-                {state?.gitBranch && (
-                  <>
-                    {state?.cwd && <FooterSep />}
-                    <span style={{ color: theme.secondary }}>{`\u2387 ${state.gitBranch}`}</span>
-                  </>
-                )}
-                {runningTaskCount > 0 && (
-                  <>
-                    {(state?.cwd || state?.gitBranch) && <FooterSep />}
-                    <BackgroundTasksButton tasks={tasks} />
-                  </>
-                )}
+                {runningTaskCount > 0 && <BackgroundTasksButton tasks={tasks} />}
                 {state?.planMode && (
                   <>
-                    {(state?.cwd || state?.gitBranch || runningTaskCount > 0) && <FooterSep />}
+                    {runningTaskCount > 0 && <FooterSep />}
                     <span className="footer-plan">
                       <ShimmerText base={theme.secondary} bright="#ddd6fe">
                         {"\u25C6 plan mode"}
