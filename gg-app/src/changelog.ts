@@ -22,6 +22,37 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.24.0",
+    date: "2026-07-20",
+    items: [
+      "Long answers no longer vanish at the finish line. When a model hits its output limit, I now resume it automatically up to `2 times` and warn you plainly if anything is still incomplete.",
+      "GG Coder knows when it is stuck now. I taught it to spot repeating tool cycles up to `5 steps` long, break the pattern once, then stop cleanly and tell you exactly what is blocking it instead of burning time on endless retries.",
+      "Your workspace has a real safety rail. I now block writes outside your project by default and stop catastrophic commands like `rm -rf /` before they run, while keeping normal cleanup commands flowing.",
+      "Project rules land in the right order every time. I added `AGENTS.override.md`, nearest-folder precedence, a smart `32 KiB` budget, and tougher plan checks so GG Coder follows the instructions you actually meant without silently losing them.",
+    ],
+  },
+  {
+    version: "0.23.7",
+    date: "2026-07-19",
+    items: [
+      "`Error Mom` got a sharper nose. I taught it to ignore routine `429` checks, cancelled requests, and harmless edit retries, so real failures stand out instantly and I can fix what actually interrupted you.",
+    ],
+  },
+  {
+    version: "0.23.6",
+    date: "2026-07-19",
+    items: [
+      "When an `LLM`, tool, or specialist agent stumbles, I now get the full story automatically. I expanded `Error Mom` across every conversation path so I can trace those mystery `502` errors and squash them faster without asking you to reconstruct the crash.",
+    ],
+  },
+  {
+    version: "0.23.5",
+    date: "2026-07-19",
+    items: [
+      "When GG Coder hits a snag, I can see it faster now. I wired in `Error Mom` monitoring so startup failures and unexpected crashes reach me automatically, helping me squash problems before they derail you again.",
+    ],
+  },
+  {
     version: "0.23.4",
     date: "2026-07-18",
     items: [

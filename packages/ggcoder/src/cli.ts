@@ -400,6 +400,8 @@ function main(): void {
     thinkingLevel,
     idealReviewEnabled: saved.idealReviewEnabled,
     lspDiagnostics: saved.lspDiagnostics,
+    allowOutsideWorkspaceWrites: saved.allowOutsideWorkspaceWrites,
+    subagentMaxPerModel: saved.subagentMaxPerModel,
     continueRecent,
     resumeSessionPath: values.resume,
     theme: savedTheme,
@@ -423,6 +425,8 @@ async function runInkTUI(opts: {
   theme?: "auto" | ThemeName;
   idealReviewEnabled?: boolean;
   lspDiagnostics?: boolean;
+  allowOutsideWorkspaceWrites?: boolean;
+  subagentMaxPerModel?: number;
 }): Promise<void> {
   requireInteractiveTTY();
 
@@ -610,6 +614,9 @@ async function runInkTUI(opts: {
       onFileRead: (filePath) => reviewCoverageTracker.recordRead(filePath),
       onFileMutated: (filePath) => reviewCoverageTracker.recordChanged(filePath),
       lspDiagnostics: opts.lspDiagnostics,
+      getWriteGuardSettings: () => ({
+        allowOutsideWorkspaceWrites: opts.allowOutsideWorkspaceWrites ?? false,
+      }),
       authStorage,
       onEnterPlan: (reason) => planToolCallbacks.onEnterPlan?.(reason),
       onExitPlan: (planPath) =>
@@ -617,6 +624,7 @@ async function runInkTUI(opts: {
       getProvider: () => activeProvider,
       getModel: () => activeModel,
       getThinkingLevel: () => activeThinking,
+      getMaxPerModel: () => opts.subagentMaxPerModel,
     },
   );
 
@@ -899,6 +907,8 @@ async function runSessions(): Promise<void> {
     thinkingLevel,
     idealReviewEnabled: saved2.idealReviewEnabled,
     lspDiagnostics: saved2.lspDiagnostics,
+    allowOutsideWorkspaceWrites: saved2.allowOutsideWorkspaceWrites,
+    subagentMaxPerModel: saved2.subagentMaxPerModel,
     resumeSessionPath: selectedPath,
     theme: saved2.theme,
   });

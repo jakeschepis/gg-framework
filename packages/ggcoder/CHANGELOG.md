@@ -1,5 +1,35 @@
 # @kenkaiiii/ggcoder
 
+## 5.20.0
+
+### Minor Changes
+
+- Harden agent completion, loop recovery, workspace writes, project instructions, and subagent concurrency.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.20.0
+- @kenkaiiii/gg-agent@5.20.0
+- @kenkaiiii/gg-core@5.20.0
+
+## 5.19.6
+
+### Patch Changes
+
+- Filter expected usage polling, cancellation, and tool validation failures from desktop error reports.
+  - @kenkaiiii/gg-ai@5.19.6
+  - @kenkaiiii/gg-agent@5.19.6
+  - @kenkaiiii/gg-core@5.19.6
+
+## 5.19.5
+
+### Patch Changes
+
+- Report sidecar, provider, tool, and subagent failures through the desktop Error Mom integration.
+  - @kenkaiiii/gg-ai@5.19.5
+  - @kenkaiiii/gg-agent@5.19.5
+  - @kenkaiiii/gg-core@5.19.5
+
 ## 5.19.4
 
 ### Patch Changes

@@ -1,6 +1,11 @@
 import { describe, expect, it } from "vitest";
 import type { AgentDefinition } from "../core/agents.js";
-import { selectSubAgent, subAgentCacheKey } from "./subagent-shared.js";
+import {
+  resolveAgentDefinition,
+  resolveSubAgentCliEntry,
+  selectSubAgent,
+  subAgentCacheKey,
+} from "./subagent-shared.js";
 
 describe("selectSubAgent", () => {
   it("keeps shell-capable agents on the parent model", () => {
@@ -15,6 +20,23 @@ describe("selectSubAgent", () => {
     expect(selectSubAgent([shellAgent], "worker", "openai", "gpt-5.6-sol").model).toBe(
       "gpt-5.6-sol",
     );
+  });
+});
+
+describe("resolveAgentDefinition", () => {
+  it("stays case-insensitive (regression)", () => {
+    const agent: AgentDefinition = {
+      name: "Scout",
+      description: "Recon",
+      tools: ["read"],
+      systemPrompt: "Scout it.",
+      source: "bundled",
+    };
+
+    expect(resolveAgentDefinition([agent], "scout")).toBe(agent);
+    expect(resolveAgentDefinition([agent], "SCOUT")).toBe(agent);
+    expect(resolveAgentDefinition([agent], "Scout")).toBe(agent);
+    expect(resolveAgentDefinition([agent], "missing")).toBeUndefined();
   });
 });
 
@@ -36,5 +58,13 @@ describe("subAgentCacheKey", () => {
 
   it("stays unset when the parent has no stable cache identity", () => {
     expect(subAgentCacheKey(undefined, "gpt-5.6-luna", "owl")).toBeUndefined();
+  });
+});
+
+describe("resolveSubAgentCliEntry", () => {
+  it("keeps app subagent workers behind the monitored sidecar entry", () => {
+    expect(
+      resolveSubAgentCliEntry({ GG_SUBAGENT_WORKER_ENTRY: "/app/error-mom-sidecar.mjs" }),
+    ).toBe("/app/error-mom-sidecar.mjs");
   });
 });
