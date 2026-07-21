@@ -563,6 +563,34 @@ export class AgentSession {
     }
     if (this.sessionId) await this.subAgentManager?.hydrate(this.sessionId);
 
+    // Maintenance is deliberately queued after initialization work and never
+    // awaited, so retention/compression cannot delay sidecar or CLI readiness.
+    if (!this.opts.transient) {
+      const retentionDays = this.settingsManager.get("sessionRetentionDays");
+      void Promise.resolve()
+        .then(() =>
+          this.sessionManager.runMaintenance({
+            retentionDays,
+            keepPaths: this.sessionPath ? [this.sessionPath] : [],
+          }),
+        )
+        .then((metrics) => {
+          if (metrics.deletedFiles > 0 || metrics.archivedFiles > 0 || metrics.failures > 0) {
+            log("INFO", "session", "Session maintenance complete", {
+              deletedFiles: String(metrics.deletedFiles),
+              deletedMB: (metrics.deletedBytes / 1024 / 1024).toFixed(1),
+              archivedFiles: String(metrics.archivedFiles),
+              savedMB: (metrics.bytesSaved / 1024 / 1024).toFixed(1),
+              failures: String(metrics.failures),
+            });
+          }
+        })
+        .catch((error) => {
+          log("WARN", "session", "Session maintenance failed", {
+            message: error instanceof Error ? error.message : String(error),
+          });
+        });
+    }
     // GG Coder owns its command registry. Other agents start with an isolated
     // empty registry and can register their own commands in their own file.
     if (this.opts.coderSlashCommands !== false) {
@@ -1545,6 +1573,7 @@ export class AgentSession {
 
     if (!result.result.compacted) {
       this.eventBus.emit("compaction_end", {
+        compacted: false,
         originalCount: result.result.originalCount,
         newCount: result.result.newCount,
       });
@@ -1570,7 +1599,7 @@ export class AgentSession {
       });
       this.sessionId = session.id;
       this.conversationId = session.header.conversationId ?? session.id;
-      this.sessionPath = session.path;
+      this.setSessionPath(session.path);
       await this.subAgentManager?.rebindParentSession(this.sessionId);
 
       // Write compacted messages (skip system — it's rebuilt on load)
@@ -1593,6 +1622,7 @@ export class AgentSession {
     }
 
     this.eventBus.emit("compaction_end", {
+      compacted: true,
       originalCount: result.result.originalCount,
       newCount: result.result.newCount,
     });
@@ -1641,7 +1671,7 @@ export class AgentSession {
       this.sessionId = "";
       this.conversationId = "";
       this.sessionPreview = "";
-      this.sessionPath = "";
+      this.setSessionPath("");
       this.lastPersistedIndex = this.messages.length;
     } else {
       await this.createNewSession();
@@ -1666,6 +1696,7 @@ export class AgentSession {
   async branch(stepsBack = 2): Promise<{ branchedFrom: number; messagesKept: number }> {
     // Load the full session to access the DAG
     const loaded = await this.sessionManager.load(this.sessionPath);
+    this.setSessionPath(loaded.path);
     const branch = this.sessionManager.getBranch(loaded.entries, this.currentLeafId);
 
     // Walk back stepsBack message entries
@@ -1703,6 +1734,7 @@ export class AgentSession {
    */
   async listBranches(): Promise<BranchInfo[]> {
     const loaded = await this.sessionManager.load(this.sessionPath);
+    this.setSessionPath(loaded.path);
     return this.sessionManager.listBranches(loaded.entries);
   }
 
@@ -2166,12 +2198,20 @@ export class AgentSession {
     this.lspManager?.shutdownAll();
     await Promise.all([this.subAgentManager?.shutdownAll(), this.mcpManager?.dispose()]);
     await this.extensionLoader.deactivateAll();
+    this.setSessionPath("");
     this.eventBus.removeAllListeners();
     this.messages = [];
     this.tools = [];
   }
 
   // ── Private ────────────────────────────────────────────
+
+  private setSessionPath(nextPath: string): void {
+    if (this.sessionPath === nextPath) return;
+    if (this.sessionPath) this.sessionManager.unregisterActivePath(this.sessionPath);
+    this.sessionPath = nextPath;
+    if (nextPath) this.sessionManager.registerActivePath(nextPath);
+  }
 
   private async createNewSession(): Promise<void> {
     const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
@@ -2180,7 +2220,7 @@ export class AgentSession {
     });
     this.sessionId = session.id;
     this.conversationId = session.header.conversationId ?? session.id;
-    this.sessionPath = session.path;
+    this.setSessionPath(session.path);
     this.lastPersistedIndex = this.messages.length;
   }
 
@@ -2272,7 +2312,7 @@ export class AgentSession {
       });
       this.sessionId = session.id;
       this.conversationId = session.header.conversationId ?? session.id;
-      this.sessionPath = session.path;
+      this.setSessionPath(session.path);
       await this.subAgentManager?.rebindParentSession(this.sessionId);
       this.currentLeafId = null;
 
@@ -2301,7 +2341,7 @@ export class AgentSession {
     // session was merely reopened (e.g. app/window restart) with zero new
     // messages in between — the duplicate entries seen in the session list.
     this.sessionId = loaded.header.id;
-    this.sessionPath = sessionPath;
+    this.setSessionPath(loaded.path);
     this.lastPersistedIndex = this.messages.length;
   }
 

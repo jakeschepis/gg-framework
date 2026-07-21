@@ -21,11 +21,17 @@ Apply these on every UI task. Read `references/craft-rulings.md` when implementi
 
 - **No emoji UI:** Never use emoji as icons, bullets, status marks, or decoration unless explicitly requested. Reuse the project icon system; otherwise use one coherent icon package.
 - **Uniform geometry:** Align containers, columns, section edges, baselines, dividers, control heights, and repeated component anatomy. Break alignment only for a clear content reason.
+- **One shared content rail:** Default navigation, header, main content, footer, and adjacent sections to the same max-width, inline gutters, and breakpoint padding. Full-bleed backgrounds may differ, but their inner content edges must align. Any different width or offset needs an explicit user or content reason, never one-off margin or padding.
+- **No edge-hugging control icons:** Select, dropdown, and combobox chevrons and other trailing icons need a deliberate inline-end inset plus enough reserved text padding for the icon and gap. They must never touch the control edge or overlap content; use logical properties so the anatomy also works in RTL.
 - **Reuse first:** Search for existing components, variants, tokens, utilities, icon wrappers, focus rings, and motion curves before creating new ones.
 - **Purposeful feedback:** Relevant hover, focus, press, selected, expanded, loading, success, and error states need clear feedback. Avoid abrupt changes when a short transition improves continuity.
+- **No soft semantic tint-on-tint:** Do not default badges, buttons, toasts, cards, selected states, or icon medallions to a low-opacity semantic-color background with saturated same-hue text or icons, with or without a matching border. Unless the user explicitly requests that treatment or an established system must be preserved, choose a product-specific alternative rather than imposing one universal replacement style.
+- **No sticky pointer focus:** Clicking or tapping must not leave a focus ring, highlighted border, shadow, background, or container `:focus-within` treatment stuck after the interaction ends, a native popup closes, or the user clicks elsewhere. Preserve immediate, visible keyboard focus by distinguishing input modality instead of suppressing focus globally.
 - **No generic hover lift:** Do not default to `translateY`, bobbing, floating, or scale-up on hover. Prefer color, border, underline, icon fill, opacity, or restrained shadow changes.
 - **No `transition: all`:** Name transition properties, reuse duration/easing tokens, and provide a reduced-motion path.
 - **Intentional type:** Reuse the existing type system. For net-new web work, select an appropriate modern family or pairing; do not use Arial, Helvetica, or bare `system-ui` as the aesthetic direction.
+- **WCAG 2.2 Level AA is the accessibility floor:** Every web UI and complete user flow must meet every applicable Level A and Level AA success criterion, not a hand-picked subset. Native apps apply WCAG2ICT where relevant plus current platform accessibility requirements. Stricter project, contract, platform, or jurisdiction rules win; accessibility cannot be traded for aesthetics, scope, delivery speed, or a higher rubric score.
+- **No unsupported accessibility claims:** Treat ADA as an equal-access legal obligation, not a badge earned by Lighthouse, axe, or another scanner. Never label a UI `ADA compliant` or `WCAG conformant` from source review or automated checks alone; a claim requires a defined scope, per-criterion evidence, manual keyboard and assistive-technology testing, and qualified legal or product-owner review when legal compliance is asserted.
 - **Measured contrast:** Meet WCAG 2.2 contrast for text, controls, icons, focus, and meaningful graphics. Muted text must remain readable.
 - **Consistent flow:** Repeated navigation and actions keep the same order, labels, icons, placement, and behavior across sections and pages.
 - **No generated em dashes:** Do not write em dashes in user-facing UI copy unless explicitly requested or exact supplied source text must remain unchanged.
@@ -35,7 +41,7 @@ Apply these on every UI task. Read `references/craft-rulings.md` when implementi
 Resolve every path from the installed skill root. Load only what the task needs:
 
 - `references/craft-rulings.md`: implementation detail for the binding defaults above.
-- `references/production-contract.md`: pass/fail semantics, forms, accessibility, performance, resilience, platform, trust, AI, media, theme, and release checks. Read it for broad features, behavior changes, forms, navigation, data/AI interfaces, native work, performance work, or release review.
+- `references/production-contract.md`: binding pass/fail semantics, WCAG/ADA accessibility, forms, performance, resilience, platform, trust, AI, media, theme, and release checks. Read its accessibility sections for every implemented or reviewed UI; read the full contract for broad features, behavior changes, forms, navigation, data/AI interfaces, native work, performance work, or release review.
 - `references/archetypes.md`: surface-specific direction and relevant source slugs. Read for net-new UI, redesigns, or unresolved visual direction.
 - `references/observed-patterns.md`: measured corpus observations. Read only sections that answer a real design question.
 - `references/anti-defaults.md`: transferable AI-generated patterns to challenge. Read for broad visual work or generic-looking output.
@@ -90,7 +96,7 @@ One thesis leads. Do not combine several aesthetic directions into a mood-board 
 
 ### 5. Run the anti-default check
 
-For broad visual work, read `references/anti-defaults.md`. Flag emoji UI, mixed icon families, arbitrary misalignment, duplicated local styling, abrupt interaction, generic hover lift, generic type, generated em dashes, centered gradient heroes, glass cards, equal card grids, decorative eyebrows, random metric blocks, ubiquitous pills, dark-premium assumptions, fake terminals, floating screenshots, bento layouts, ambient motion, icon medallions, and invented proof.
+For broad visual work, read `references/anti-defaults.md`. Flag emoji UI, mixed icon families, arbitrary misalignment, duplicated local styling, abrupt interaction, generic hover lift, soft semantic tint-on-tint treatments, generic type, generated em dashes, centered gradient heroes, glass cards, equal card grids, decorative eyebrows, random metric blocks, ubiquitous pills, dark-premium assumptions, fake terminals, floating screenshots, bento layouts, ambient motion, icon medallions, and invented proof.
 
 Keep a flagged pattern only after completing: **“This belongs because…”** with a product-specific reason. Replace choices that could survive unchanged in an unrelated product.
 
@@ -101,10 +107,12 @@ Plan only relevant states, but include the complete primary path and recovery:
 - loading, empty, error, retry, offline, success, disabled, and destructive outcomes;
 - hover, focus-visible, press, selected, expanded, and pending feedback;
 - keyboard order, accessible names/status, overlay focus, and drag alternatives;
+- pointer-versus-keyboard focus behavior, including native popup dismissal and clicks onto non-focusable space;
 - narrow, intermediate, desktop, wide/resizable, pointer, touch, and no-hover behavior;
-- reduced motion, forced colors, zoom/reflow, long/localized/RTL text, missing media, and realistic data extremes.
+- reduced motion, forced colors, zoom/reflow, long/localized/RTL text, missing media, and realistic data extremes;
+- text alternatives and media equivalents, landmarks/headings, language, labels/instructions/errors, status announcements, timing, flashing, and sensory-independent instructions where applicable.
 
-For broad behavior, forms, navigation, native, data/AI, performance, or release work, read and apply `references/production-contract.md`. A visual score cannot compensate for a relevant contract failure.
+For every UI, read and apply the accessibility sections of `references/production-contract.md`. For broad behavior, forms, navigation, native, data/AI, performance, or release work, apply the full contract. A visual score cannot compensate for a relevant contract failure.
 
 ### 7. Document broad work
 
@@ -114,7 +122,7 @@ For a broad page, multi-screen feature, or redesign, create or update `DESIGN.md
 
 Use real project content and data. Label fixtures honestly. Never invent testimonials, customer logos, ratings, metrics, or claims as fact.
 
-Reuse dependencies and primitives. Use one coherent icon system. Maintain semantic controls, visible focus, keyboard operation, measured contrast, readable line lengths, stable adaptive layout, and reduced-motion support. Implement the complete planned flow, not only its first screenshot.
+Reuse dependencies and primitives. Use one coherent icon system. Meet every applicable WCAG 2.2 Level A and AA criterion across the complete flow, including its states and responsive variants. Maintain semantic controls, visible keyboard focus, keyboard operation, assistive-technology output, measured contrast, readable line lengths, stable adaptive layout, and reduced-motion support. Pointer interaction must not leave a false focus, active, or selected-looking highlight behind. Implement the complete planned flow, not only its first screenshot.
 
 The representative initial state must keep decision-critical information and the primary action visible or one obvious action away on desktop and mobile. Preserve selected context through master-detail recomposition. Keep demo, debug, and state-switching controls subordinate and non-obscuring.
 
@@ -124,7 +132,7 @@ Capture representative desktop and narrow/mobile output. Score broad work with `
 
 Default to one critique-and-revision cycle. Run another only when evidence still fails the score or production gate. If a check is unavailable, report it as unverified instead of looping or substituting more polish.
 
-Broad work is complete at **20/24 or higher**, with no zero in accessibility, consistency and flow, responsive behavior, state completeness, or content authenticity, and only after applicable production checks pass. A small component must score 2 on every applicable quality-floor criterion.
+Broad work is complete at **20/24 or higher**, with no zero in accessibility, consistency and flow, responsive behavior, state completeness, or content authenticity, and only after applicable production checks pass. Any applicable WCAG Level A or AA failure blocks completion regardless of score. A small component must score 2 on every applicable quality-floor criterion and pass its accessibility contract checks.
 
 ## Review-only mode
 

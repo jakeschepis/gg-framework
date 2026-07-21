@@ -1,5 +1,51 @@
 # @kenkaiiii/ggcoder
 
+## 5.20.5
+
+### Patch Changes
+
+- Require generated UIs to meet WCAG 2.2 Level AA and follow ADA-aligned accessibility practices.
+  - @kenkaiiii/gg-ai@5.20.5
+  - @kenkaiiii/gg-agent@5.20.5
+  - @kenkaiiii/gg-core@5.20.5
+
+## 5.20.4
+
+### Patch Changes
+
+- Teach the bundled UI skill to avoid generic soft semantic tint-on-tint treatments.
+  - @kenkaiiii/gg-ai@5.20.4
+  - @kenkaiiii/gg-agent@5.20.4
+  - @kenkaiiii/gg-core@5.20.4
+
+## 5.20.3
+
+### Patch Changes
+
+- Strengthen the bundled UI skill with consistent content rails, control spacing, and pointer focus guidance.
+  - @kenkaiiii/gg-ai@5.20.3
+  - @kenkaiiii/gg-agent@5.20.3
+  - @kenkaiiii/gg-core@5.20.3
+
+## 5.20.2
+
+### Patch Changes
+
+- 5fb6b62: Automatically enforce session retention across desktop, CLI, and chat-agent stores, compress inactive transcripts after seven days, and cap persisted tool output at 40,000 characters. Media is migrated to deduplicated adjacent assets with backward-compatible hydration and archived sessions remain discoverable and resumable through stale saved paths.
+- Updated dependencies [f4b8ec7]
+  - @kenkaiiii/gg-core@5.20.2
+  - @kenkaiiii/gg-ai@5.20.2
+  - @kenkaiiii/gg-agent@5.20.2
+
+## 5.20.1
+
+### Patch Changes
+
+- Show up to 30 recent chat sessions while keeping coding history capped at 5.
+  - @kenkaiiii/gg-ai@5.20.1
+  - @kenkaiiii/gg-agent@5.20.1
+  - @kenkaiiii/gg-core@5.20.1
+
 ## 5.20.0
 
 ### Minor Changes

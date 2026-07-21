@@ -632,8 +632,6 @@ export function App(props: AppProps) {
       cwd: displayedCwd,
     },
     writeStdout,
-    sessionPathRef,
-    sessionManagerRef,
     sessionStore,
     history,
     setHistory,

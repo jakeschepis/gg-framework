@@ -36,11 +36,11 @@ Maximum: **24 points**. Ship broad UI work only at **20/24 or higher**, with no 
 
 ## 3. Composition
 
-- **0:** Layout breaks, clips, ignores shared key lines, or relies on arbitrary modules.
-- **1:** Grid is stable but generic, repetitive, or weakly related to content; some section edges or component geometry drift.
-- **2:** Scale, key lines, alignment, whitespace, and asymmetry/symmetry express content relationships and remain deliberate across viewports.
+- **0:** Layout breaks, clips, ignores shared key lines, uses arbitrary modules, or lets navigation, header, main, section, and footer rails drift without a content reason.
+- **1:** Grid is stable but generic, repetitive, or weakly related to content; some section edges, spacing tokens, or component geometry drift.
+- **2:** Scale, shared content rails, key lines, alignment, whitespace, and asymmetry/symmetry express content relationships and remain deliberate across viewports.
 
-**Test:** Draw vertical and horizontal guides through major regions. Shared edges, baselines, dividers, and repeated component anatomy should align unless an exception communicates real hierarchy.
+**Test:** Draw vertical and horizontal guides through navigation, header, main, repeated sections, and footer at every representative breakpoint. Full-bleed outer surfaces may differ, but their inner content edges must align by default. Compare repeated margins, padding, and gaps side by side; equal roles use equal tokens unless an exception communicates real hierarchy.
 
 ## 4. Consistency and flow
 
@@ -48,7 +48,7 @@ Maximum: **24 points**. Ship broad UI work only at **20/24 or higher**, with no 
 - **1:** Most patterns repeat, but spacing cadence, icon treatment, controls, actions, or section transitions contain visible inconsistencies.
 - **2:** Existing primitives are reused; one icon family, spacing rhythm, component anatomy, navigation order, action placement, and surface logic carry through the full flow.
 
-**Test:** Compare adjacent sections and pages side by side. Trace one repeated action through every occurrence, then inspect container edges, control heights, icon weight, spacing, borders, labels, and state behavior.
+**Test:** Compare adjacent sections and pages side by side. Trace one repeated action through every occurrence, then inspect container edges, control heights, icon weight, spacing, borders, labels, and state behavior. For selects, dropdowns, and comboboxes, verify the trailing icon has intentional edge inset and reserved text clearance at every size, in RTL, and with the longest plausible value. Flag any low-opacity semantic background paired with saturated same-hue text or icons; it fails unless the user requested it or exact established-system reuse is required.
 
 ## 5. Typography
 
@@ -72,7 +72,7 @@ Maximum: **24 points**. Ship broad UI work only at **20/24 or higher**, with no 
 - **1:** Happy-path interaction works, but secondary states, feedback, timing, recovery, or layout continuity are generic or incomplete.
 - **2:** Relevant loading, empty, error, validation, retry, offline, focus, hover/press, selected, expanded, pending, disabled, destructive, and success states are coherent, preserve work and layout, and provide purposeful feedback.
 
-**Test:** Trigger each relevant state with realistic content length and failure wording. Confirm preservation, recovery, duplicate-submission behavior, status announcement, and that any transition improves continuity rather than decoration.
+**Test:** Trigger each relevant state with realistic content length and failure wording. Confirm preservation, recovery, duplicate-submission behavior, status announcement, and that any transition improves continuity rather than decoration. Test pointer and keyboard focus separately, including native dropdown dismissal and clicks onto non-focusable space; no pointer-only highlight may stick, and keyboard focus must remain visible.
 
 ## 8. Responsive behavior
 
@@ -84,11 +84,11 @@ Maximum: **24 points**. Ship broad UI work only at **20/24 or higher**, with no 
 
 ## 9. Accessibility quality floor
 
-- **0:** Keyboard path, focus, semantics, contrast, labels, icon meaning, status, drag-only operation, or target sizes block use.
-- **1:** Basics exist but focus order/visibility, text/non-text contrast, motion, icon labels, status cues, composite-widget behavior, forced colors, or assistive naming has gaps.
-- **2:** Native semantics or verified APG behavior, visible and unobscured focus, keyboard operation, meaningful labels/status, WCAG 2.2 target minimums with platform-appropriate touch targets, reduced motion, forced colors, text contrast of at least 4.5:1 (3:1 for large text), and meaningful non-text contrast of at least 3:1 are verified.
+- **0:** Any applicable WCAG 2.2 Level A or AA criterion fails, or keyboard use, focus, semantics, contrast, labels, media alternatives, status, drag alternatives, target sizes, or assistive-technology output blocks use.
+- **1:** Basics work, but the changed-scope criterion audit is incomplete or focus order/visibility, text/non-text contrast, motion, icon labels, status cues, composite-widget behavior, forced colors, zoom/reflow, media alternatives, or assistive-technology verification has gaps.
+- **2:** The changed scope has evidence that every applicable WCAG 2.2 Level A and AA criterion passes. Native semantics or verified APG behavior, visible and unobscured focus, complete keyboard operation, meaningful names/instructions/status, media alternatives, target minimums, reduced motion, forced colors, 200% text and 320 CSS-pixel reflow where applicable, representative assistive-technology output, text contrast of at least 4.5:1 (3:1 for large text), and meaningful non-text contrast of at least 3:1 are verified.
 
-**Test:** Complete the primary task by keyboard; inspect accessible names and status; verify overlay focus and drag alternatives; measure text, icon, control, and focus contrast; run project accessibility tooling; test 200% text/reflow, `prefers-reduced-motion`, and forced colors; verify color is not the only cue.
+**Test:** Audit every applicable Level A and AA criterion for the changed scope against the official WCAG Quick Reference and all five conformance requirements. Complete the primary task by keyboard and with a representative screen reader or native assistive technology. Inspect names, roles, values, status, reading order, page and passage language, titles, link purpose, multiple navigation paths, consistent help, text/media alternatives, images of text, hover/focus content, overlay focus, context changes, timing, forms and error prevention, pointer cancellation, and gesture/drag alternatives. Measure text, icon, control, state, and focus contrast; run project accessibility tooling; test 200% text, 320 CSS-pixel reflow, zoom or platform text scaling, `prefers-reduced-motion`, and forced colors. Record pass, fail, or justified not applicable. Automated output alone never earns a pass or supports an ADA-compliance or WCAG-conformance claim.
 
 ## 10. Motion purpose
 

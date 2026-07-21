@@ -38,6 +38,22 @@ Uniformity means shared geometry, not equal visual importance.
 - Preserve alignment through responsive recomposition. Mobile may change order or layout, but repeated controls and content edges remain internally consistent.
 - Break the grid only to express real hierarchy, media behavior, or editorial emphasis. A deliberate exception should be visible as an exception, not look accidental.
 
+### Shared content rails and spacing ownership
+
+Establish one page-shell or container primitive that owns the default max-width and responsive inline gutters. Reuse it for navigation, headers, breadcrumbs, main content, adjacent sections, and footers. A full-bleed background or divider may span the viewport, but its inner content returns to the shared rail. A navbar that is slightly wider or narrower than the page body, or neighboring sections with almost-matching edges, is a craft failure unless the user or content explicitly requires a different composition.
+
+Use the project's spacing tokens for repeated section padding, stack gaps, grid gaps, and component insets. The parent layout owns spacing between siblings; each component owns its internal padding. Do not combine ad hoc child margins, wrapper padding, and arbitrary offsets until one section merely looks close to another. A deliberate nested rail, breakout, or asymmetric section needs a visible hierarchy or content reason and must resolve cleanly at every breakpoint.
+
+Test by drawing vertical guides through navigation, header, main, repeated sections, and footer at narrow, intermediate, desktop, and wide sizes. Their inner edges and breakpoint changes must align exactly by default. Compare repeated vertical gaps and section padding side by side; equal roles use equal tokens.
+
+### Control icon insets
+
+A select, dropdown, or combobox chevron is part of the control anatomy, not decoration pasted onto its edge. Give every trailing icon a deliberate `inset-inline-end` that follows the control's horizontal-padding token. Reserve `padding-inline-end` for the outer inset, icon width, and a readable gap so labels, selected values, placeholders, loading indicators, clear buttons, and long or localized content never collide with it. An icon at `right: 0`, touching the border, or squeezed into an unreserved text area is a craft failure.
+
+Keep the icon optically centered and preserve the full control hit area. For a decorative custom chevron over a native select, avoid stacking it over the browser indicator and ensure the overlay does not create a dead pointer zone. Use logical inline properties and verify RTL rather than hard-coding right-side geometry.
+
+Test every control size with the longest plausible value, 200% text zoom, narrow width, RTL, disabled/error/loading states, and both native and custom rendering paths. The trailing inset should visually belong to the same spacing rhythm as the leading content inset.
+
 Carbon's grid guidance uses consistent mini-unit multiples, key lines, fixed padding within breakpoints, and type aligned to box padding. Apply the principle through the project's own grid rather than copying Carbon's exact values.
 
 ## 3. Reuse before invention
@@ -64,6 +80,14 @@ Default motion behavior:
 - Never use `transition: all`. Name the properties that are allowed to interpolate.
 - Avoid animating layout properties such as `width`, `height`, `top`, and `left` unless spatial change is the meaning and performance is verified.
 - Keep focus indication immediate and visible. A transition must never delay awareness of keyboard focus.
+
+### No sticky pointer focus
+
+Pointer focus must not masquerade as a persistent selected, active, or error state. Clicking or tapping a control, native select, combobox, card, or focusable container must not leave a focus ring, highlighted border, shadow, background, or ancestor `:focus-within` treatment stuck after activation, popup dismissal, or a click elsewhere. A genuine selected, expanded, validation, or drag state may persist, but it must use its own semantics and styling rather than an accidental focus treatment.
+
+Prefer `:focus-visible` where it behaves correctly. For native controls or browser quirks that expose focus-visible after pointer activation, track the input modality locally and suppress only the pointer-originated focus treatment. Never solve this with a global `outline: none`, by hiding all focus, or by blurring controls in a way that breaks keyboard operation; keyboard-originated focus must remain immediate, visible, correctly ordered, and restored after overlays.
+
+Test mouse and touch activation separately from Tab and Shift+Tab. Include opening and dismissing native dropdowns, selecting an option, clicking non-focusable blank space, clicking the next control, closing overlays, and switching back to keyboard navigation. No pointer-only highlight may remain after its interaction context ends.
 
 Reuse existing motion tokens first. If none exist, begin with these restrained bands, then tune by component size and distance:
 
@@ -130,6 +154,14 @@ Never use faint light-gray text on white, faint dark-gray text on black, or low-
 - Aim above the minimum for small, thin, long-form, or mission-critical text. Verify computed colors rather than judging from a screenshot alone.
 - Do not use color as the only status cue. Pair color with text, shape, icon, or pattern.
 
+### No soft semantic tint-on-tint
+
+Do not default badges, buttons, toasts, alerts, cards, selected states, status rows, or icon medallions to the familiar `soft`, `subtle`, `surface`, or `tonal` formula: a low-opacity red, green, amber, blue, or purple background paired with saturated same-hue text or icons, often finished with a same-hue border. The border is optional; the same-hue tinted surface plus same-hue foreground is the rejected pattern.
+
+Choose the replacement from the product's existing aesthetic and the component's role. Viable directions include a neutral surface with an isolated semantic icon, dot, or edge; a solid semantic fill with neutral high-contrast text; monochrome treatment; a product accent; plain typography; or another coherent local material model. These are options, not a new house style. Preserve hierarchy, measured contrast, and a non-color cue for status.
+
+Retain tint-on-tint only when the user explicitly asks for it or exact reuse of an established design-system variant is required by scope. Existing examples are evidence to inspect, not permission to spread the treatment into new component families.
+
 ## 7. Consistency and flow
 
 A polished interface feels like one system from section to section, component to component, and page to page.
@@ -163,5 +195,6 @@ Before calling UI work complete, verify:
 - reduced motion preserves state meaning;
 - typography is intentional, loaded efficiently, and stable during fallback;
 - all text and meaningful non-text contrast is measured;
+- no soft semantic tint-on-tint treatment was introduced without an explicit user request or required existing-system match;
 - repeated navigation/actions remain consistent across sections and pages;
 - generated UI copy contains no em dashes unless explicitly allowed.

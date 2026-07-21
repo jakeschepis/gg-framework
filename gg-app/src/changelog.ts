@@ -22,6 +22,42 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.24.5",
+    date: "2026-07-21",
+    items: [
+      "Every interface GG Coder builds now starts with accessibility as a hard requirement. I made `WCAG 2.2 AA` and `ADA-aligned` design non-negotiable across keyboard navigation, screen readers, contrast, motion, forms, media, zoom, and complete user flows. Better UI now means more people can actually use it.",
+    ],
+  },
+  {
+    version: "0.24.4",
+    date: "2026-07-21",
+    items: [
+      "GG Coder's `UI skill` just got pickier about color. I taught it to reject the muddy red-on-red and green-on-green `status pills` AI loves to repeat, then choose styling that actually fits your product instead of forcing another template. Your interfaces get cleaner without all looking the same.",
+    ],
+  },
+  {
+    version: "0.24.3",
+    date: "2026-07-21",
+    items: [
+      "Interfaces GG Coder builds just got a serious taste upgrade. I taught the `UI skill` to lock navigation and content to one clean rail, give `dropdowns` proper breathing room, and kill sticky click outlines without sacrificing `keyboard focus`. The tiny details finally behave like they belong together.",
+    ],
+  },
+  {
+    version: "0.24.2",
+    date: "2026-07-20",
+    items: [
+      "Your conversations now clean up after themselves without disappearing. I keep the last `30 days`, squeeze quiet sessions after `7 days`, and cap runaway saved tool output at `40,000 characters`. You get your disk space back and every archived chat still resumes right where you left it.",
+      "GG Coder refuses to melt down in the background now. I give the engine `5 retries`, then stop it cleanly, and cap each run's logs at `10 MB` so a bad crash can never spiral into a process or disk-space storm.",
+    ],
+  },
+  {
+    version: "0.24.1",
+    date: "2026-07-20",
+    items: [
+      "Your chat history just got six times deeper. I expanded the picker from `5` recent conversations to `30`, so the thread you want is far less likely to disappear while coding history stays lean.",
+    ],
+  },
+  {
     version: "0.24.0",
     date: "2026-07-20",
     items: [
