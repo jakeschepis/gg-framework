@@ -84,7 +84,12 @@ import type { OAuthCredentials, OAuthLoginCallbacks } from "./core/oauth/types.j
 import { AUTH_PROVIDERS, type AuthProviderMeta } from "./core/auth-providers.js";
 import { ensureAppDirs, loadSavedSettings } from "./config.js";
 import { SettingsManager, type Settings } from "./core/settings-manager.js";
-import { getModel, getMaxThinkingLevel, getContextWindow, MODELS } from "./core/model-registry.js";
+import {
+  getModel,
+  getDefaultThinkingLevel,
+  getContextWindow,
+  MODELS,
+} from "./core/model-registry.js";
 import { resolveStartOrFallback } from "./core/resolve-start.js";
 import { getGitBranch, getGitDirtyFileCount, isGitRepo } from "./utils/git.js";
 import { extractPlanSteps } from "./utils/plan-steps.js";
@@ -817,12 +822,16 @@ async function main(): Promise<void> {
   const USAGE_RATE_LIMIT_BACKOFF_MS = 5 * 60_000;
 
   async function fetchUsageProvider(provider: SubscriptionUsageProvider): Promise<UsageResult> {
-    const displayName = provider === "anthropic" ? "Anthropic" : "Codex";
-    if (!(await auth.hasProviderAuth(provider))) {
+    const displayName =
+      provider === "anthropic" ? "Anthropic" : provider === "openai" ? "Codex" : "Kimi";
+    // Kimi plan usage is tracked on the OAuth credential specifically — the
+    // Moonshot platform API key is metered per-token, not per plan window.
+    const authKey = provider === "moonshot" ? MOONSHOT_OAUTH_KEY : provider;
+    if (!(await auth.hasProviderAuth(authKey))) {
       return { provider, displayName, connected: false, windows: [], fetchedAt: Date.now() };
     }
     try {
-      let credentials = await auth.resolveCredentials(provider);
+      let credentials = await auth.resolveCredentials(authKey);
       try {
         const snapshot = {
           ...(await fetchSubscriptionUsage(provider, credentials)),
@@ -834,7 +843,7 @@ async function main(): Promise<void> {
         // A provider can revoke an access token before its stored expiry. Refresh
         // once on 401, matching inference auth recovery, then retry the usage call.
         if (error instanceof SubscriptionUsageError && error.status === 401) {
-          credentials = await auth.resolveCredentials(provider, { forceRefresh: true });
+          credentials = await auth.resolveCredentials(authKey, { forceRefresh: true });
           const snapshot = {
             ...(await fetchSubscriptionUsage(provider, credentials)),
             connected: true as const,
@@ -853,7 +862,7 @@ async function main(): Promise<void> {
       if (error instanceof SubscriptionUsageError && error.status === 429) {
         usageRateLimitedUntil.set(provider, Date.now() + USAGE_RATE_LIMIT_BACKOFF_MS);
       }
-      const connected = await auth.hasProviderAuth(provider);
+      const connected = await auth.hasProviderAuth(authKey);
       return {
         provider,
         displayName,
@@ -992,7 +1001,7 @@ async function main(): Promise<void> {
       if (method === "GET" && (url === "/usage" || url.startsWith("/usage?"))) {
         void (async () => {
           const provider = new URL(url, `http://${host}`).searchParams.get("provider");
-          if (provider !== "anthropic" && provider !== "openai") {
+          if (provider !== "anthropic" && provider !== "openai" && provider !== "moonshot") {
             daemonJson(res, 400, { error: "unsupported usage provider" });
             return;
           }
@@ -1283,6 +1292,10 @@ async function createSession(
   const host = "127.0.0.1";
 
   const saved = loadSavedSettings(paths.settingsFile);
+  // Native login/logout and other live sessions share auth.json. Refresh the
+  // daemon-level snapshot before choosing this session's provider so a project
+  // never boots against credentials that were just replaced or disconnected.
+  await auth.load();
   // Per-project model/thinking prefs win over the shared global settings.json:
   // each window (one project cwd) restores its own selection instead of every
   // window reading the same single global slot that the last writer clobbered
@@ -1307,9 +1320,14 @@ async function createSession(
   }
 
   // Per-project thinking prefs win over the global settings.json fallback.
+  // With no saved level, the default follows the active credential's endpoint:
+  // Kimi K3 on the OAuth coding endpoint starts at its declared default (high),
+  // matching the official kimi-code CLI's plan-usage profile.
   const thinkEnabled = projectPrefs?.thinkingEnabled ?? saved.thinkingEnabled;
   const thinkingLevel: ThinkingLevel | undefined = thinkEnabled
-    ? (projectPrefs?.thinkingLevel ?? saved.thinkingLevel ?? getMaxThinkingLevel(model))
+    ? (projectPrefs?.thinkingLevel ??
+      saved.thinkingLevel ??
+      getDefaultThinkingLevel(model, { baseUrl: auth.getStoredBaseUrl(provider) }))
     : undefined;
 
   // ── SSE fan-out (declared before the session so plan callbacks can use it) ─

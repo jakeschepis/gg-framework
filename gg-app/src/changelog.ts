@@ -22,6 +22,24 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.26.0",
+    date: "2026-07-22",
+    items: [
+      "The login screen just got a glow-up. Every AI provider now shows up as a glossy tile with its real logo, from `Claude` clay to the `DeepSeek` whale, so connecting a new brain feels like picking a fighter. Connected ones get a little green dot so you always know who is ready to roll.",
+      "Kimi users, your quota is no longer a mystery. The title-bar usage meter now tracks your `Kimi For Coding` plan right alongside Claude and ChatGPT, so you can see exactly how much runway you have before you hit a wall.",
+    ],
+  },
+  {
+    version: "0.25.0",
+    date: "2026-07-21",
+    items: [
+      "Kimi `K3` now lets you dial its brainpower with a full `low / high / max` thinking ladder, and you can switch thinking off entirely for quick asks. On the Kimi Code plan it starts at the friendlier `high` default, so your usage stretches further without you lifting a finger.",
+      "GG now just gets on with it. I retuned its marching orders so it stops asking permission for safe, reversible steps and powers through to a verified finish. Fewer pauses, more done.",
+      "Giant sessions stay on the rails. I fixed a compaction bug that could overshoot the context window on monster turns, so long hauls now compress cleanly instead of derailing mid-task.",
+      "Resuming a project tells the truth now. If a session cannot resume, the `project picker` shows the real reason right there instead of leaving you staring at a loading screen that never arrives.",
+    ],
+  },
+  {
     version: "0.24.5",
     date: "2026-07-21",
     items: [
