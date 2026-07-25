@@ -54,8 +54,7 @@ import { useAgentEvents, HOOK_PRESENTATION, type HookKind } from "./useAgentEven
 import { LiveToolPanel, type LiveToolEntry } from "./LiveToolPanel";
 import { SubAgentFeed, type SubAgentLine } from "./SubAgentFeed";
 import { CompactionNotice } from "./CompactionNotice";
-import { ModelMenu } from "./ModelMenu";
-import { modelDisplayName } from "./model-name";
+import { ModelSelect } from "./ModelSelect";
 import { SlashMenu } from "./SlashMenu";
 import { FileMentionMenu } from "./FileMentionMenu";
 import { ReferencedFiles, appendReferencedFiles, parseReferencedFiles } from "./ReferencedFiles";
@@ -78,6 +77,7 @@ import { RadioButton } from "./RadioButton";
 import { ProjectPicker } from "./ProjectPicker";
 import { ChatPicker } from "./ChatPicker";
 import { BackButton } from "./BackButton";
+import { Badge } from "./Badge";
 import { AutopilotToggle } from "./AutopilotToggle";
 import { HomeScreen } from "./HomeScreen";
 import { initialEntryView, type EntryView } from "./app-entry-view";
@@ -425,11 +425,6 @@ function App(): React.ReactElement {
   const [thinkingStartTs, setThinkingStartTs] = useState<number | null>(null);
   const [thinkingAccumMs, setThinkingAccumMs] = useState(0);
   const [models, setModels] = useState<ModelOption[]>([]);
-  // Footer + menus show the friendly registry name (e.g. "Gemini 3.5 Flash"),
-  // not the raw wire id (e.g. "gemini-3-flash").
-  const modelName = (id: string | undefined | null): string => modelDisplayName(models, id);
-  const [modelMenuOpen, setModelMenuOpen] = useState(false);
-  const [kenModelMenuOpen, setKenModelMenuOpen] = useState(false);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
   const [slashIndex, setSlashIndex] = useState(0);
   // `@`-mention file picker state. `mention` is the active token being typed
@@ -755,6 +750,8 @@ function App(): React.ReactElement {
             state?.gitBranch,
             fallbackTitle,
             state?.gitDirtyFileCount,
+            state?.gitHubIssues ?? null,
+            state?.gitHubPRs ?? null,
           )
         : fallbackTitle;
     setWindowTitle(title);
@@ -764,6 +761,8 @@ function App(): React.ReactElement {
     state?.cwd,
     state?.gitBranch,
     state?.gitDirtyFileCount,
+    state?.gitHubIssues,
+    state?.gitHubPRs,
     workspaceMode,
   ]);
 
@@ -1105,17 +1104,10 @@ function App(): React.ReactElement {
     return () => unsub();
   }, [handleEvent]);
 
-  // Boot-time workspace restore: if Rust reopened THIS window from the saved
-  // workspace (after a restart / update), its sidecar is already spawned at the
-  // restored project + session. Skip the picker and hydrate straight in, exactly
-  // like a completed project choice. Consume-once on the Rust side, so this runs
-  // a single time on mount. Always flips `restoreChecked` so the entry render is
-  // unblocked whether or not this was a restored window.
+  // Boot-time/reload workspace recovery: Rust keeps THIS window's active target
+  // for its lifetime. A restored app launch and a WebKit content-process reload
+  // therefore both hydrate straight back into the existing daemon session.
   useEffect(() => {
-    // No cancelled-guard: the Rust target is consume-once, so whichever call
-    // receives it MUST act on it (a dev StrictMode double-mount would otherwise
-    // consume it on the first run and drop it, stranding the window on the
-    // picker). React 19 makes a setState after unmount a safe no-op.
     void restoreTarget()
       .then((target) => {
         if (target) {
@@ -1124,7 +1116,7 @@ function App(): React.ReactElement {
         }
       })
       .finally(() => setRestoreChecked(true));
-    // Mount-only: onProjectChosen reads stable setters; restoreTarget is consumed once.
+    // Mount-only: the native target remains stable for this window's lifetime.
   }, []);
 
   useEffect(() => {
@@ -1193,7 +1185,6 @@ function App(): React.ReactElement {
   // sidecar's ken_model_change broadcast updates state; the .then is just a
   // faster local echo of the same payload.
   function onSelectKenModel(modelId: string | null): void {
-    setKenModelMenuOpen(false);
     if (state && modelId !== null && state.kenModelOverride && modelId === state.kenModel) return;
     if (state && modelId === null && !state.kenModelOverride) return;
     void switchKenModel(modelId).then((res) => {
@@ -1213,7 +1204,6 @@ function App(): React.ReactElement {
   }
 
   function onSelectModel(modelId: string): void {
-    setModelMenuOpen(false);
     if (state && modelId === state.model) return;
     void switchModel(modelId).then((res) => {
       if (res) {
@@ -1805,11 +1795,18 @@ function App(): React.ReactElement {
     setHydrateNonce((n) => n + 1);
   }
 
-  // Hold the entry render until the restore check resolves, so a window reopened
-  // from the saved workspace jumps straight into its project instead of briefly
-  // flashing the home/picker screen.
+  // Show explicit recovery feedback while Rust resolves this window's durable
+  // target. This branch used to paint only the dark background, which looked
+  // indistinguishable from a dead/black webview during a slow recovery.
   if (needsProject && !restoreChecked) {
-    return <div className="app" style={{ background: theme.background }} />;
+    return (
+      <div className="app app-restoring" style={{ background: theme.background }}>
+        <div className="app-restoring-status" role="status" aria-live="polite">
+          <span className="app-restoring-dot" aria-hidden="true" />
+          Restoring workspace…
+        </div>
+      </div>
+    );
   }
 
   if (needsProject) {
@@ -1884,6 +1881,9 @@ function App(): React.ReactElement {
         cwd={state?.cwd}
         gitBranch={state?.gitBranch}
         gitDirtyFileCount={state?.gitDirtyFileCount}
+        gitHubIssues={state?.gitHubIssues}
+        gitHubPRs={state?.gitHubPRs}
+        gitHubRepoUrl={state?.gitHubRepoUrl}
         navHidden={navHidden}
         onToggleNav={toggleNav}
         stripExtras={
@@ -2334,65 +2334,37 @@ function App(): React.ReactElement {
                   );
                 })()}
               <span className="model-anchor">
-                {modelMenuOpen && models.length > 0 && (
-                  <ModelMenu
-                    models={models}
-                    currentModel={state?.model ?? ""}
-                    onSelect={onSelectModel}
-                    onClose={() => setModelMenuOpen(false)}
-                    title={workspaceMode === "chat" ? "GG model" : "GG Coder model"}
-                  />
-                )}
                 <span className="model-label" style={{ color: theme.text }}>
                   GG
                 </span>
-                <button
-                  className="model-button"
-                  style={{ color: theme.text }}
-                  disabled={running || models.length === 0}
+                <ModelSelect
+                  models={models}
+                  currentModel={state?.model ?? ""}
+                  onSelect={onSelectModel}
+                  disabled={running}
                   title={workspaceMode === "chat" ? "Switch GG's model" : "Switch GG Coder's model"}
-                  onClick={() => {
-                    setKenModelMenuOpen(false);
-                    setModelMenuOpen((o) => !o);
-                  }}
-                >
-                  {modelName(state?.model)}
-                </button>
+                />
               </span>
               {workspaceMode === "code" && (
                 <>
                   <FooterSep />
                   <span className="model-anchor">
-                    {kenModelMenuOpen && models.length > 0 && (
-                      <ModelMenu
-                        models={models}
-                        currentModel={state?.kenModel ?? state?.model ?? ""}
-                        onSelect={(id) => onSelectKenModel(id)}
-                        onClose={() => setKenModelMenuOpen(false)}
-                        title="Ken's model"
-                        onSelectFollow={() => onSelectKenModel(null)}
-                        followActive={!state?.kenModelOverride}
-                      />
-                    )}
                     <span className="model-label" style={{ color: theme.ken }}>
                       Ken
                     </span>
-                    <button
-                      className="model-button"
-                      style={{ color: theme.ken }}
-                      disabled={models.length === 0}
+                    <ModelSelect
+                      models={models}
+                      currentModel={state?.kenModel ?? state?.model ?? ""}
+                      onSelect={(id) => onSelectKenModel(id)}
+                      color={theme.ken}
                       title={
                         state?.kenModelOverride
                           ? "Ken is pinned to his own model — click to change"
                           : "Ken follows GG Coder's model — click to pin one"
                       }
-                      onClick={() => {
-                        setModelMenuOpen(false);
-                        setKenModelMenuOpen((o) => !o);
-                      }}
-                    >
-                      {modelName(state?.kenModel ?? state?.model)}
-                    </button>
+                      onSelectFollow={() => onSelectKenModel(null)}
+                      followActive={!state?.kenModelOverride}
+                    />
                   </span>
                 </>
               )}
@@ -2408,13 +2380,24 @@ function App(): React.ReactElement {
           onClick={() => void appUpdate.install()}
         >
           <span className="update-banner-dot" />
-          {`Ken just pushed a new update (${appUpdate.version}) — click here to install`}
+          {"Ken just updated GG Coder!"}
+          <Badge>Install</Badge>
         </button>
       )}
       {appUpdate.phase === "installing" && (
-        <div className="update-banner update-banner-busy">
-          <span className="update-banner-dot" />
-          {"Installing update\u2026 the app will restart automatically."}
+        // Same .update-banner box (padding/font) as the available state, so
+        // banner → progress bar swaps content with zero layout shift. The fill
+        // is absolutely positioned; only the centered percentage is in flow.
+        <div
+          className="update-banner update-banner-busy update-banner-progress"
+          role="progressbar"
+          aria-valuenow={appUpdate.progress ?? 0}
+          aria-valuemin={0}
+          aria-valuemax={100}
+          aria-label="Downloading update"
+        >
+          <span className="update-banner-fill" style={{ width: `${appUpdate.progress ?? 0}%` }} />
+          <span className="update-banner-pct">{`${appUpdate.progress ?? 0}%`}</span>
         </div>
       )}
 

@@ -472,43 +472,59 @@ export function toAnthropicMessages(
       continue;
     }
     if (msg.role === "user") {
+      // Drop empty-string text parts: Anthropic rejects empty text blocks with a
+      // 400 ("text content blocks must be non-empty"). A string content of ""
+      // and an all-empty content array are both degenerate — skip the whole
+      // message rather than send a guaranteed-400 body. Whitespace-only text is
+      // left intact (it is non-empty and the API accepts it). Baseline #20 A/B.
+      if (typeof msg.content === "string") {
+        if (msg.content === "") continue;
+      } else if (!msg.content.some((p) => !(p.type === "text" && p.text === ""))) {
+        continue;
+      }
       out.push({
         role: "user",
         content:
           typeof msg.content === "string"
             ? msg.content
-            : msg.content.map((part) => {
-                if (part.type === "text") return { type: "text" as const, text: part.text };
-                if (part.type === "video") {
-                  // MiniMax-M3 rides the Anthropic transport and accepts native
-                  // video blocks. Non-video models never reach here — video is
-                  // downgraded to text by downgradeUnsupportedVideos first.
+            : msg.content
+                .filter((part) => !(part.type === "text" && part.text === ""))
+                .map((part) => {
+                  if (part.type === "text") return { type: "text" as const, text: part.text };
+                  if (part.type === "video") {
+                    // MiniMax-M3 rides the Anthropic transport and accepts native
+                    // video blocks. Non-video models never reach here — video is
+                    // downgraded to text by downgradeUnsupportedVideos first.
+                    return {
+                      type: "video" as const,
+                      source: {
+                        type: "base64" as const,
+                        media_type: part.mediaType,
+                        data: part.data,
+                      },
+                    } as unknown as Anthropic.ContentBlockParam;
+                  }
                   return {
-                    type: "video" as const,
+                    type: "image" as const,
                     source: {
                       type: "base64" as const,
-                      media_type: part.mediaType,
+                      media_type: part.mediaType as
+                        | "image/jpeg"
+                        | "image/png"
+                        | "image/gif"
+                        | "image/webp",
                       data: part.data,
                     },
-                  } as unknown as Anthropic.ContentBlockParam;
-                }
-                return {
-                  type: "image" as const,
-                  source: {
-                    type: "base64" as const,
-                    media_type: part.mediaType as
-                      | "image/jpeg"
-                      | "image/png"
-                      | "image/gif"
-                      | "image/webp",
-                    data: part.data,
-                  },
-                };
-              }),
+                  };
+                }),
       });
       continue;
     }
     if (msg.role === "assistant") {
+      // A settled assistant turn with string content "" bypasses the array
+      // filter below and would reach the wire as an empty string — Anthropic
+      // 400s on it just like an empty text block. Drop it (baseline #20 D).
+      if (typeof msg.content === "string" && msg.content === "") continue;
       const content =
         typeof msg.content === "string"
           ? msg.content
@@ -625,12 +641,13 @@ export function toAnthropicToolChoice(choice: ToolChoice): Anthropic.ToolChoice 
 
 /**
  * Anthropic models with built-in adaptive thinking (Fable 5, Mythos 5,
- * Opus 4.8/4.7/4.6, Sonnet 5). Matches both dashed (`opus-4-8`) and dotted
- * (`opus-4.8`) forms so callers don't have to enumerate variants. These models
- * don't need the `interleaved-thinking` beta header — it's built in.
+ * Opus 5, Opus 4.8/4.7/4.6, Sonnet 5). Matches both dashed (`opus-4-8`) and
+ * dotted (`opus-4.8`) forms so callers don't have to enumerate variants. These
+ * models don't need the `interleaved-thinking` beta header — it's built in.
+ * (`opus-5` can't false-match `claude-opus-4-5-…` — the `4-` breaks the literal.)
  */
 export function isAdaptiveThinkingModel(model: string): boolean {
-  return /opus-4[-.]8|opus-4[-.]7|opus-4[-.]6|sonnet-5|fable-5|mythos-5/.test(model);
+  return /opus-5|opus-4[-.]8|opus-4[-.]7|opus-4[-.]6|sonnet-5|fable-5|mythos-5/.test(model);
 }
 
 export function toAnthropicThinking(
@@ -644,11 +661,11 @@ export function toAnthropicThinking(
 } {
   if (isAdaptiveThinkingModel(model)) {
     // Adaptive thinking — model decides when/how much to think.
-    // budget_tokens is deprecated on Opus 4.8 / Opus 4.7 / Opus 4.6 / Sonnet 5.
+    // budget_tokens is deprecated on Opus 5 / 4.8 / 4.7 / 4.6 and Sonnet 5.
     // Anthropic's output_config.effort accepts low, medium, high, xhigh, and max.
-    // xhigh is Opus 4.8/4.7-only; max is supported by Opus 4.8/4.7/4.6 and Sonnet 5.
+    // xhigh is Opus 5 / 4.8 / 4.7-only; max is supported by every adaptive model.
     let effort: string = level;
-    if (effort === "xhigh" && !/opus-4-8|opus-4-7/.test(model)) {
+    if (effort === "xhigh" && !/opus-5|opus-4-8|opus-4-7/.test(model)) {
       effort = "high";
     }
     return {
@@ -694,7 +711,11 @@ function remapToolCallId(id: string, idMap: Map<string, string>): string {
   if (!id.startsWith("toolu_")) return id;
   const existing = idMap.get(id);
   if (existing) return existing;
-  const mapped = `call_${id.slice(5)}`;
+  // Strip the full `toolu_` prefix (6 chars). `slice(5)` left the trailing
+  // underscore, producing `call__<id>` (double underscore) — lossy and not
+  // identity-reversible. `slice(6)` yields a clean `call_<id>`. Pairing still
+  // holds because both the tool_call and its result resolve through idMap.
+  const mapped = `call_${id.slice(6)}`;
   idMap.set(id, mapped);
   return mapped;
 }

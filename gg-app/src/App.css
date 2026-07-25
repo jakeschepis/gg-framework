@@ -319,6 +319,45 @@ body {
   color: var(--text);
   -webkit-font-smoothing: antialiased;
 }
+
+.app-restoring {
+  align-items: center;
+  justify-content: center;
+}
+
+.app-restoring-status {
+  display: inline-flex;
+  align-items: center;
+  gap: 9px;
+  color: var(--text-muted);
+  font-family: var(--mono);
+  font-size: 12px;
+}
+
+.app-restoring-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--primary);
+  box-shadow: 0 0 10px rgb(77 157 255 / 45%);
+  animation: appRestoringPulse 1.2s ease-in-out infinite;
+}
+
+@keyframes appRestoringPulse {
+  0%,
+  100% {
+    opacity: 0.45;
+  }
+  50% {
+    opacity: 1;
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .app-restoring-dot {
+    animation: none;
+  }
+}
 .app-file-dragover::before,
 .app-file-dragover::after {
   position: absolute;
@@ -930,14 +969,17 @@ body {
   padding: 0 14px 0 82px;
 }
 /* The visible window title shows project context: cwd, current branch, then the
-   uncommitted-file count. It grows into available space and truncates as one
-   unit on narrow windows so the usage meter and controls remain reachable. */
+   uncommitted-file count and GitHub issue/PR chips. It grows into available
+   space; on narrow windows the segments truncate in priority order (folder
+   name first, then branch) so the compact counts stay visible and the usage
+   meter and controls remain reachable. */
 .chat-head-title {
   flex: 1 1 auto;
   min-width: 0;
   overflow: hidden;
-  text-overflow: ellipsis;
   white-space: nowrap;
+  display: flex;
+  align-items: baseline;
   font-family: var(--mono);
   font-size: 13px;
   font-weight: 500;
@@ -945,16 +987,102 @@ body {
 }
 .chat-head-cwd {
   color: var(--text-dim);
+  /* Project identity — outlasts the branch, truncates before the counts. */
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .chat-head-sep {
+  flex: none;
   margin: 0 8px;
   color: var(--border);
 }
 .chat-head-branch {
   color: var(--secondary);
+  /* Stable context, not a changing count — the FIRST segment to give way
+     (higher shrink factor than the folder), and fully hidden ≤600px below. */
+  flex: 0 3 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
+/* Uncommitted-file count — teal (--info), deliberately NOT --warning amber:
+   the UI already leans on amber heavily (usage meter, plan mode, code tokens),
+   and an informational git status shouldn't compete with real warnings. */
 .chat-head-dirty {
-  color: var(--warning);
+  flex: none;
+  color: var(--info);
+}
+/* Narrow-window cascade (media = window width; halves ≈ 750px, quads ≈ 375px).
+   Segments drop WHOLE, highest-context-cost first, so every surviving count
+   stays complete and readable instead of all ellipsizing into uselessness.
+   The full string always remains in the strip's hover tooltip. */
+@media (max-width: 600px) {
+  /* Branch is the least glance-critical (it's stable context, not a changing
+     count) — drop it (+ its leading separator) so folder + counts stay whole. */
+  .chat-head-branch,
+  .chat-head-sep:has(+ .chat-head-branch) {
+    display: none;
+  }
+}
+@media (max-width: 440px) {
+  /* Quad-tile widths: keep identity (folder, elastic) + the GitHub counts. */
+  .chat-head-dirty,
+  .chat-head-sep:has(+ .chat-head-dirty) {
+    display: none;
+  }
+}
+/* Folder name + branch double as click targets: folder opens its location in the
+   OS file manager, branch opens the linked GitHub repo. Button reset only — the
+   base .chat-head-cwd / .chat-head-branch classes keep the color, flex, and
+   truncation. Hover brightens to signal the affordance. */
+.chat-head-link {
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  cursor: pointer;
+  text-align: left;
+}
+.chat-head-link:hover:not(:disabled) {
+  color: var(--text);
+}
+.chat-head-link:disabled {
+  cursor: default;
+}
+/* GitHub issue/PR counts — buttons when the repo URL is known (click opens the
+   issues/pulls page), static text otherwise. Font metrics come from the parent
+   .chat-head-title so the chip aligns with the branch/dirty segments. */
+.chat-head-github {
+  appearance: none;
+  background: none;
+  border: none;
+  padding: 0;
+  margin: 0;
+  font: inherit;
+  color: var(--text-muted);
+  cursor: pointer;
+  /* Compact, high-signal counts — never truncate or wrap; the narrow-window
+     cascade above drops other segments whole so these stay readable. */
+  flex: none;
+  white-space: nowrap;
+}
+/* The trailing chip absorbs the final squeeze with a graceful ellipsis instead
+   of the container hard-clipping it mid-word (quad-tile widths). */
+.chat-head-github:last-child {
+  flex: 0 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.chat-head-github:hover:not(:disabled) {
+  color: var(--text);
+}
+.chat-head-github:disabled {
+  cursor: default;
 }
 /* Position pill — "1/4" reading-order indicator for multi-window orientation.
    Shown only when >1 window is open. Dimmed when this window is not focused. */
@@ -1023,8 +1151,8 @@ body {
   border-color: var(--primary);
   background: var(--surface-2);
 }
-/* Match the titlebar nav buttons (.commit-button / .winlayout-button): same
-   font-size, weight, and padding so every chrome button reads uniformly. */
+/* Match the titlebar nav buttons (.commit-button / .btn-nav-icon): same
+   font-size, weight, and padding so every chrome control reads uniformly. */
 .picker-new {
   background: transparent;
   border: 1px solid;
@@ -1788,10 +1916,82 @@ body {
   cursor: default;
 }
 
-/* Multi-window layout control + its dropdown. */
+/* Multi-window layout control: looks like the old icon button, but a
+   transparent native <select> stretched over it takes the click and opens the
+   OS-native dropdown (snaps back to its placeholder after each choice). */
 .winlayout {
   position: relative;
   display: inline-flex;
+}
+.winlayout-icon-btn {
+  /* Purely presentational — the overlaying select receives hover/click. */
+  pointer-events: none;
+}
+/* Hover lands on the overlaying select, so mirror the .btn-nav-icon hover
+   (color brighten, no filter — see the .btn-nav-icon comment) from here. */
+.winlayout:has(.winlayout-select:not(:disabled)):hover .winlayout-icon-btn {
+  color: var(--text);
+}
+.winlayout:has(.winlayout-select:disabled) .winlayout-icon-btn {
+  opacity: 0.4;
+}
+.winlayout-select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
+  margin: 0;
+  padding: 0;
+  border: none;
+  opacity: 0;
+  cursor: pointer;
+}
+.winlayout-select:disabled {
+  cursor: default;
+}
+/* Windows/Linux fallback: keep the popup inside the webview because native
+   WebView2/WebKitGTK select popups can open without accepting a selection. */
+.menu-backdrop {
+  position: fixed;
+  inset: 0;
+  z-index: 59;
+}
+.winlayout-menu {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 60;
+  display: flex;
+  min-width: 150px;
+  flex-direction: column;
+  gap: 2px;
+  padding: 5px;
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+}
+.winlayout-item {
+  display: flex;
+  align-items: center;
+  gap: 9px;
+  padding: 6px 9px;
+  border: none;
+  border-radius: var(--radius-button);
+  background: transparent;
+  color: var(--text);
+  font-family: var(--sans);
+  font-size: 13px;
+  text-align: left;
+  cursor: pointer;
+  transition: background-color var(--t-fast);
+}
+.winlayout-item:hover,
+.winlayout-item:focus-visible {
+  background: var(--surface-1);
+}
+.winlayout-divider {
+  height: 1px;
+  margin: 4px 0;
+  background: var(--border);
 }
 /* Hide/show toggle for the nav-button row. Lives at the right of the title
    strip; small and borderless so it reads as a titlebar control, not a button. */
@@ -1814,77 +2014,6 @@ body {
   background: var(--surface-1);
   color: var(--text);
 }
-.winlayout-button {
-  background: transparent;
-  border: 1px solid;
-  border-radius: var(--radius-button);
-  font-family: var(--sans);
-  font-size: 12px;
-  font-weight: 600;
-  padding: 2px 9px;
-  cursor: pointer;
-  transition:
-    color var(--t-fast),
-    background-color var(--t-fast),
-    border-color var(--t-fast);
-}
-.winlayout-button:hover:not(:disabled) {
-  background: var(--surface-1);
-}
-.winlayout-button:disabled {
-  opacity: 0.5;
-  cursor: default;
-}
-/* Invisible full-screen click catcher for dismissing popovers that live in a
-   Tauri drag region (where document mousedown listeners don't fire). Sits just
-   under the menu it dismisses. */
-.menu-backdrop {
-  position: fixed;
-  inset: 0;
-  z-index: 59;
-}
-
-.winlayout-menu {
-  position: absolute;
-  top: calc(100% + 6px);
-  right: 0;
-  border: 1px solid;
-  border-radius: var(--radius-card);
-  padding: 5px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
-  z-index: 60;
-  display: flex;
-  flex-direction: column;
-  gap: 2px;
-  min-width: 150px;
-}
-.winlayout-item {
-  display: flex;
-  align-items: center;
-  gap: 9px;
-  background: transparent;
-  border: none;
-  border-radius: var(--radius-button);
-  font-family: var(--sans);
-  font-size: 13px;
-  text-align: left;
-  padding: 6px 9px;
-  cursor: pointer;
-  transition:
-    color var(--t-fast),
-    background-color var(--t-fast),
-    border-color var(--t-fast);
-}
-.winlayout-item:hover {
-  background: var(--surface-1);
-}
-/* Divider between the create-presets (2/4/6) and the auto-arrange action. */
-.winlayout-divider {
-  height: 1px;
-  margin: 4px 0;
-  background: var(--border);
-}
-
 /* Non-scrolling wrapper around `.transcript` — owns the flex sizing +
    `position: relative` so an absolutely positioned overlay child (the Ken
    power banner) is pinned to the visible chat viewport, not the scrolled
@@ -3496,6 +3625,31 @@ body {
   cursor: default;
   filter: saturate(0.7) brightness(0.92);
 }
+/* Installing state: the banner box itself becomes the progress track — same
+   padding/font as the available state, so the swap causes zero layout shift.
+   The fill is absolutely positioned (out of flow); only the centered
+   percentage occupies the same line box the label text did. */
+.update-banner-progress {
+  /* The busy filter desaturates to grey — right for a static "busy" row, but
+     it muddied the greens here. Progress keeps the vibrant gradient as the
+     track and sweeps a lighter mint from the same family across it. */
+  filter: none;
+}
+.update-banner-fill {
+  position: absolute;
+  top: 0;
+  bottom: 0;
+  left: 0;
+  background: linear-gradient(135deg, #8ff5c6 0%, #a7f3e9 100%);
+  /* Hairline dark leading edge so the fill boundary reads crisply. */
+  box-shadow: 1px 0 0 rgba(4, 19, 13, 0.15);
+  transition: width 180ms linear;
+  pointer-events: none;
+}
+.update-banner-pct {
+  position: relative; /* above the fill */
+  font-variant-numeric: tabular-nums; /* steady width as the digits climb */
+}
 .update-banner-dot {
   width: 8px;
   height: 8px;
@@ -3519,6 +3673,8 @@ body {
    logo, shown only when an update is pending. Deliberately smaller than the
    primary action buttons so it reads as a notification, not a main CTA. */
 .home-update {
+  position: relative; /* anchor + clip the progress fill below */
+  overflow: hidden;
   display: inline-flex;
   align-items: center;
   justify-content: center;
@@ -3545,6 +3701,48 @@ body {
 .home-update:disabled {
   opacity: 0.7;
   cursor: default;
+}
+/* Installing state: the pill keeps its vibrant gradient as the track (no
+   :disabled dimming). Progress is a slim strip along the pill's bottom edge —
+   a full-height fill swept over the "Installing…" label and looked muddy at
+   this size. The percentage reserves a steady 3ch so the label doesn't jitter
+   as it climbs. */
+.home-update-progress {
+  opacity: 1;
+  cursor: default;
+}
+.home-update-fill {
+  position: absolute;
+  bottom: 0;
+  left: 0;
+  height: 3px;
+  background: linear-gradient(90deg, #8ff5c6 0%, #a7f3e9 100%);
+  transition: width 180ms linear;
+  pointer-events: none;
+}
+/* Label swap without resizing: both labels occupy the same grid cell (the
+   inactive one is visibility:hidden), so the pill is always sized to the
+   wider of "Update to x.y.z" and "Installing… 100%". */
+.home-update-swap {
+  display: grid;
+}
+.home-update-swap > * {
+  grid-area: 1 / 1;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  white-space: nowrap;
+}
+.home-update-hidden {
+  visibility: hidden;
+}
+.home-update-pct {
+  display: inline-block;
+  /* 4ch, not 3ch: "100%" is three digits PLUS the % glyph — 3ch fit "99%" but
+     the span outgrew it at 100%, stretching the pill right at the finish. */
+  min-width: 4ch;
+  text-align: right;
+  font-variant-numeric: tabular-nums;
 }
 /* Shown in the update pill's place when already up to date — the current
    version plus a "What's new" button, so the spot never collapses/jumps. */
@@ -3594,9 +3792,9 @@ body {
   /* .inputwrap (an earlier sibling) is `position: relative`, which — despite
      coming first in DOM order — paints ABOVE any non-positioned sibling per
      CSS stacking rules (positioned elements always paint after static ones).
-     Without this, the growing textarea overlapped the upward-opening
-     .model-menu anchored in the footer. Make the footer positioned too, with
-     a higher z-index, so it (and its dropdowns) stack above the input. */
+     Without this, the growing textarea overlapped the popovers anchored in
+     the footer. Make the footer positioned too, with a higher z-index, so it
+     (and its overlays) stack above the input. */
   position: relative;
   z-index: 2;
 }
@@ -3909,17 +4107,16 @@ body {
   text-decoration: underline;
 }
 
-/* ── Model picker (footer, opens upward) ── */
+/* ── Model picker (footer, native <select>) ── */
 .model-anchor {
-  position: relative;
   display: inline-flex;
   align-items: center;
   gap: 4px;
 }
 
 /* Static "GG" / "Ken" prefix — plain text, never clickable. Only the model
-   name next to it opens the dropdown. `line-height: 1` matches `.model-button`
-   below so both sit on the same baseline — without it the button's default UA
+   select next to it opens the dropdown. `line-height: 1` matches `.model-select`
+   below so both sit on the same baseline — without it the control's default UA
    line-height differs from the inherited body line-height and the label
    visibly floats above the model name. */
 .model-label {
@@ -3928,15 +4125,46 @@ body {
   line-height: 1;
 }
 
-.model-button {
-  background: transparent;
-  border: none;
+/* Text-look picker with a native dropdown: the visible label is plain mono
+   text (like the old footer button); a transparent <select> stretched over it
+   takes the click and opens the OS-native dropdown. */
+.model-picker {
+  position: relative;
+  display: inline-flex;
+  line-height: 1;
+}
+.model-select-text {
+  font-family: var(--mono);
+  font-size: 13px;
+  line-height: 1;
+  transition: color var(--t-fast);
+}
+.model-picker:has(.model-select:not(:disabled)):hover .model-select-text {
+  text-decoration: underline;
+}
+.model-select {
+  position: absolute;
+  inset: 0;
+  width: 100%;
   margin: 0;
+  padding: 0;
+  border: none;
+  opacity: 0;
+  cursor: pointer;
+}
+.model-select:disabled {
+  cursor: default;
+}
+/* Windows/Linux fallback menu. The trigger keeps the same plain-text footer
+   treatment as the native macOS control. */
+.model-button {
+  padding: 0;
+  border: none;
+  background: transparent;
   font-family: var(--mono);
   font-size: 13px;
   line-height: 1;
   cursor: pointer;
-  padding: 0;
   transition: color var(--t-fast);
 }
 .model-button:hover:not(:disabled) {
@@ -3945,57 +4173,51 @@ body {
 .model-button:disabled {
   cursor: default;
 }
-
 .model-menu {
   position: absolute;
-  bottom: calc(100% + 8px);
   right: 0;
-  border: 1px solid;
-  border-radius: var(--radius-card);
-  padding: 8px;
-  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
+  bottom: calc(100% + 8px);
   z-index: 50;
   max-width: min(640px, 90vw);
   max-height: 50vh;
   overflow-y: auto;
+  padding: 8px;
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  box-shadow: 0 8px 28px rgba(0, 0, 0, 0.45);
 }
-
 .model-menu-title {
-  font-size: 11px;
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
   padding: 2px 6px 6px;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
 }
-
 .model-menu-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(180px, 1fr));
   gap: 2px 8px;
 }
-
-/* "Follow GG Coder" row in Ken's model picker — full-width above the grid. */
 .model-menu-follow {
   display: block;
   width: 100%;
   margin-bottom: 6px;
 }
-
 .model-menu-item {
+  padding: 4px 8px;
+  overflow: hidden;
   border: none;
   border-radius: var(--radius-button);
+  background: transparent;
   font-family: var(--mono);
   font-size: 12.5px;
   text-align: left;
-  padding: 4px 8px;
-  cursor: pointer;
-  white-space: nowrap;
-  overflow: hidden;
   text-overflow: ellipsis;
-  transition:
-    color var(--t-fast),
-    background-color var(--t-fast);
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background-color var(--t-fast);
 }
-.model-menu-item:hover {
+.model-menu-item:hover,
+.model-menu-item:focus-visible {
   background: var(--surface-1) !important;
 }
 
@@ -4371,10 +4593,7 @@ body {
 }
 .rank-fx-gradient,
 .rank-fx-gradient-glow,
-.rank-fx-animated,
-.rank-fx-gold,
-.rank-fx-gold-shimmer,
-.rank-fx-iridescent {
+.rank-fx-gold {
   color: transparent;
   -webkit-text-fill-color: transparent;
   background-clip: text;
@@ -4388,43 +4607,19 @@ body {
   text-shadow: 0 0 14px rgba(126, 170, 255, 0.25);
 }
 .rank-fx-animated {
-  background-image: linear-gradient(
-    90deg,
-    #9b8cf7 0%,
-    #60a5fa 25%,
-    #34d399 50%,
-    #60a5fa 75%,
-    #9b8cf7 100%
-  );
-  background-size: 200% 100%;
+  color: #7ca8ff;
+  text-shadow: 0 0 12px rgba(96, 165, 250, 0.2);
 }
 .rank-fx-gold {
   background-image: linear-gradient(90deg, #b78b2d, #ffe38a, #d9a441);
 }
 .rank-fx-gold-shimmer {
-  background-image: linear-gradient(
-    110deg,
-    #b78b2d 0%,
-    #d9a441 24%,
-    #ffe38a 42%,
-    #fff3bf 50%,
-    #ffe38a 58%,
-    #d9a441 76%,
-    #b78b2d 100%
-  );
-  background-size: 200% 100%;
+  color: #ffe38a;
+  text-shadow: 0 0 12px rgba(255, 227, 138, 0.2);
 }
 .rank-fx-iridescent {
-  background-image: linear-gradient(
-    90deg,
-    #9b8cf7 0%,
-    #7df9ff 20%,
-    #ff8bd2 40%,
-    #fff18a 60%,
-    #7df9ff 80%,
-    #9b8cf7 100%
-  );
-  background-size: 200% 100%;
+  color: #a99cff;
+  text-shadow: 0 0 12px rgba(125, 249, 255, 0.2);
 }
 @media (prefers-reduced-motion: no-preference) {
   .rank-badge-celebrate::before {
@@ -4443,13 +4638,13 @@ body {
     animation: rankBadgeSparks 1.2s ease-out both;
   }
   .rank-fx-animated {
-    animation: rankShift 8s linear infinite;
+    animation: rankArcaneShift 8s ease-in-out infinite;
   }
   .rank-fx-gold-shimmer {
-    animation: rankShift 7s linear infinite;
+    animation: rankGoldShift 7s ease-in-out infinite;
   }
   .rank-fx-iridescent {
-    animation: rankShift 12s linear infinite;
+    animation: rankIridescentShift 12s ease-in-out infinite;
   }
 }
 @keyframes rankXpChip {
@@ -4528,12 +4723,34 @@ body {
     transform: translate(-50%, -50%) scale(1.15);
   }
 }
-@keyframes rankShift {
-  0% {
-    background-position: 0% 50%;
-  }
+@keyframes rankArcaneShift {
+  0%,
   100% {
-    background-position: 200% 50%;
+    color: #9b8cf7;
+  }
+  50% {
+    color: #34d399;
+  }
+}
+@keyframes rankGoldShift {
+  0%,
+  100% {
+    color: #d9a441;
+  }
+  50% {
+    color: #fff3bf;
+  }
+}
+@keyframes rankIridescentShift {
+  0%,
+  100% {
+    color: #a99cff;
+  }
+  33% {
+    color: #7df9ff;
+  }
+  66% {
+    color: #ff8bd2;
   }
 }
 

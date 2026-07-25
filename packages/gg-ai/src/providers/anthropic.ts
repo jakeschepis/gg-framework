@@ -307,8 +307,8 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
     stream: useStreaming,
   } as Anthropic.MessageCreateParams;
 
-  // Adaptive thinking models (Opus 4.8, Opus 4.7, Opus 4.6, Sonnet 5) don't need the
-  // interleaved-thinking beta — they have it built in.
+  // Adaptive thinking models (Opus 5, Opus 4.8/4.7/4.6, Sonnet 5, Fable 5)
+  // don't need the interleaved-thinking beta — they have it built in.
   const hasAdaptiveThinking = isAdaptiveThinkingModel(options.model);
 
   const betaHeaders = [
@@ -637,6 +637,21 @@ async function* runStream(options: StreamOptions): AsyncGenerator<StreamEvent, S
   if (!receivedAnyEvent) {
     throw new ProviderError("anthropic", "Stream ended without producing any events.", {
       statusCode: 504,
+    });
+  }
+
+  // Silent-partial guard: a complete Anthropic stream always emits `message_delta`
+  // (carrying stop_reason) *before* `message_stop`. So consuming events but never
+  // seeing a stop_reason means the stream was truncated mid-flight — a clean TCP
+  // close with no terminal events. Without this guard, normalizeAnthropicStopReason
+  // maps the null stop into "end_turn", making a truncated turn indistinguishable
+  // from a finished one. Throw a 504 so the agent loop treats it as a retryable
+  // transport failure (same bucket as a mid-stream socket destroy). The partial
+  // body is surfaced on `cause` for debugging, never silently returned.
+  if (stopReason === null) {
+    throw new ProviderError("anthropic", "Stream ended before completion (no stop_reason).", {
+      statusCode: 504,
+      cause: { partialContent: contentParts, outputTokens },
     });
   }
 

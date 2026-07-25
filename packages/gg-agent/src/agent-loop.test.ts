@@ -1,8 +1,9 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { z } from "zod";
-import { ProviderError } from "@kenkaiiii/gg-ai";
+import { GGAIError, ProviderError } from "@kenkaiiii/gg-ai";
 import {
   agentLoop,
+  capToolResults,
   capTurnToolResults,
   classifyOverload,
   extractContextOverflowDetails,
@@ -13,7 +14,7 @@ import {
   serverResetDelayMs,
 } from "./agent-loop.js";
 import type { AgentEvent, AgentResult, AgentTool, TransformContextOptions } from "./types.js";
-import type { Message, StreamOptions, Usage } from "@kenkaiiii/gg-ai";
+import type { Message, StreamOptions, ToolResult, Usage } from "@kenkaiiii/gg-ai";
 
 // ── Mock stream ────────────────────────────────────────────
 
@@ -74,6 +75,28 @@ function mockErrorResult(error: Error) {
       throw error;
     },
     response: p,
+  };
+}
+
+function mockRunawayToolCallResult(kind: "events" | "chars") {
+  const error = Object.assign(new Error("aborted runaway tool call"), { name: "AbortError" });
+  const response = Promise.reject(error);
+  response.catch(() => {});
+  return {
+    [Symbol.asyncIterator]: async function* () {
+      const count = kind === "events" ? 20_001 : 1;
+      const argsJson = kind === "chars" ? "x".repeat(1_000_001) : "";
+      for (let index = 0; index < count; index++) {
+        yield {
+          type: "toolcall_delta" as const,
+          id: "runaway",
+          name: "write",
+          argsJson,
+        };
+      }
+      throw error;
+    },
+    response,
   };
 }
 
@@ -923,6 +946,47 @@ describe("agentLoop", () => {
     ).rejects.toThrow("authentication failed");
   });
 
+  it("allows silent OpenAI reasoning to exceed the normal 90-second hard cap", async () => {
+    vi.useFakeTimers();
+
+    mockStream.mockImplementation((opts: StreamOptions) => {
+      const response = makeResponse("Finished reasoning.");
+      return {
+        [Symbol.asyncIterator]: async function* () {
+          await new Promise<void>((resolve, reject) => {
+            const timer = setTimeout(resolve, 120_000);
+            opts.signal?.addEventListener(
+              "abort",
+              () => {
+                clearTimeout(timer);
+                reject(Object.assign(new Error("aborted"), { name: "AbortError" }));
+              },
+              { once: true },
+            );
+          });
+          yield { type: "text_delta" as const, text: "Finished reasoning." };
+        },
+        response: Promise.resolve(response),
+      } as unknown as ReturnType<typeof stream>;
+    });
+
+    const loopPromise = collectLoop(
+      [
+        { role: "system", content: "sys" },
+        { role: "user", content: "solve this" },
+      ],
+      { provider: "openai", model: "gpt-test", thinking: "medium" },
+    );
+
+    await vi.advanceTimersByTimeAsync(120_000);
+    const { events } = await loopPromise;
+    vi.useRealTimers();
+
+    expect(mockStream).toHaveBeenCalledTimes(1);
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    expect(events.some((event) => event.type === "agent_done")).toBe(true);
+  });
+
   it("flips to non-streaming fallback after repeated stream stalls", async () => {
     vi.useFakeTimers();
 
@@ -987,6 +1051,116 @@ describe("agentLoop", () => {
       turnEnd?.type === "turn_end" ? turnEnd.timing.providerDurationMs : 0,
     ).toBeGreaterThanOrEqual(90_000);
   }, 30_000);
+
+  it("classifies exhausted stalls as a device or network-path failure", async () => {
+    vi.useFakeTimers();
+
+    mockStream.mockImplementation((opts: StreamOptions) => {
+      const abortPromise = new Promise<never>((_, reject) => {
+        opts.signal?.addEventListener(
+          "abort",
+          () => reject(Object.assign(new Error("aborted"), { name: "AbortError" })),
+          { once: true },
+        );
+      });
+      abortPromise.catch(() => {});
+      return {
+        [Symbol.asyncIterator]: async function* () {
+          yield* [];
+          await abortPromise;
+        },
+        response: abortPromise,
+      } as unknown as ReturnType<typeof stream>;
+    });
+
+    const loopPromise = collectLoop(
+      [
+        { role: "system", content: "sys" },
+        { role: "user", content: "hi" },
+      ],
+      { provider: "openai", model: "test" },
+    );
+
+    // Two streaming attempts time out after 45s; the remaining attempts use
+    // the 5-minute non-streaming cap. Drive every timeout and retry backoff.
+    for (let i = 0; i < 10; i++) await vi.advanceTimersByTimeAsync(310_000);
+    const { events } = await loopPromise;
+    vi.useRealTimers();
+
+    const terminal = events.find((event) => event.type === "error");
+    expect(terminal?.type).toBe("error");
+    if (terminal?.type !== "error") throw new Error("expected terminal error");
+    expect(terminal.error).toBeInstanceOf(GGAIError);
+    expect((terminal.error as GGAIError).source).toBe("network");
+    expect((terminal.error as GGAIError).hint).toContain("VPN or proxy");
+    expect(terminal.error.message).toContain("after 5 automatic retries");
+  }, 30_000);
+
+  it("automatically replays a turn after a runaway tool-call stream", async () => {
+    vi.useFakeTimers();
+    mockStream
+      .mockReturnValueOnce(
+        mockRunawayToolCallResult("events") as unknown as ReturnType<typeof stream>,
+      )
+      .mockReturnValueOnce(
+        mockOkResult("Recovered automatically.") as unknown as ReturnType<typeof stream>,
+      );
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "continue the task" },
+    ];
+    const loopPromise = collectLoop(messages, { provider: "openai", model: "test" });
+    await vi.advanceTimersByTimeAsync(1_100);
+    const { events, result } = await loopPromise;
+    vi.useRealTimers();
+
+    expect(mockStream).toHaveBeenCalledTimes(2);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "retry",
+        reason: "runaway_toolcall",
+        attempt: 1,
+        maxAttempts: 2,
+        delayMs: 1_000,
+        silent: true,
+      }),
+    );
+    expect(events.some((event) => event.type === "error")).toBe(false);
+    expect(events.some((event) => event.type === "agent_done")).toBe(true);
+    expect(result.totalTurns).toBe(1);
+  });
+
+  it("bounds runaway tool-call auto-retries", async () => {
+    vi.useFakeTimers();
+    for (let attempt = 0; attempt < 3; attempt++) {
+      mockStream.mockReturnValueOnce(
+        mockRunawayToolCallResult("chars") as unknown as ReturnType<typeof stream>,
+      );
+    }
+
+    const messages: Message[] = [
+      { role: "system", content: "sys" },
+      { role: "user", content: "continue the task" },
+    ];
+    const loopPromise = collectLoop(messages, { provider: "openai", model: "test" });
+    await vi.advanceTimersByTimeAsync(3_100);
+    const { events } = await loopPromise;
+    vi.useRealTimers();
+
+    expect(mockStream).toHaveBeenCalledTimes(3);
+    expect(
+      events.filter((event) => event.type === "retry" && event.reason === "runaway_toolcall"),
+    ).toHaveLength(2);
+    expect(events).toContainEqual(
+      expect.objectContaining({
+        type: "error",
+        error: expect.objectContaining({
+          message: expect.stringContaining("after 2 automatic retries"),
+        }),
+      }),
+    );
+  });
 
   it("preserves partial streamed text across a transport-failure retry", async () => {
     vi.useFakeTimers();
@@ -1767,5 +1941,54 @@ describe("capTurnToolResults", () => {
     capTurnToolResults([structured, text], 5_000);
     expect(structured.content[0].text).toBe("t".repeat(10_000));
     expect(text.content).toContain("characters trimmed");
+  });
+});
+
+// Fix D (baseline #2): capping mutates the model-input/persistent transcript in
+// place while the tool_call_end event already carried the FULL preview. The
+// `capped` marker makes that divergence programmatically visible.
+describe("tool-result cap divergence marker", () => {
+  const result = (id: string, content: string): ToolResult => ({
+    type: "tool_result",
+    toolCallId: id,
+    content,
+  });
+
+  it("marks a per-result cap with original + kept char counts", () => {
+    const r = result("big", "z".repeat(10_000));
+    capToolResults([r], 1_000);
+    expect(r.content).toContain("characters omitted");
+    expect(r.capped).toEqual({
+      originalChars: 10_000,
+      keptChars: (r.content as string).length,
+      scope: "per-result",
+    });
+  });
+
+  it("does not mark a result that fits the per-result budget", () => {
+    const r = result("small", "z".repeat(500));
+    capToolResults([r], 1_000);
+    expect(r.capped).toBeUndefined();
+    expect(r.content).toBe("z".repeat(500));
+  });
+
+  it("marks a per-turn cap with scope 'per-turn'", () => {
+    const large = result("large", "l".repeat(20_000));
+    capTurnToolResults([large], 6_000);
+    expect(large.capped?.scope).toBe("per-turn");
+    expect(large.capped?.originalChars).toBe(20_000);
+    expect(large.capped?.keptChars).toBe((large.content as string).length);
+  });
+
+  it("preserves the true original size when both caps fire in sequence", () => {
+    const r = result("huge", "h".repeat(100_000));
+    capToolResults([r], 50_000); // per-result trim first
+    const afterPerResult = r.capped?.originalChars;
+    capTurnToolResults([r], 5_000); // then per-turn trim
+    expect(afterPerResult).toBe(100_000);
+    // The per-turn marker keeps the FULL pre-any-trim original, not the
+    // already-trimmed intermediate size.
+    expect(r.capped?.originalChars).toBe(100_000);
+    expect(r.capped?.scope).toBe("per-turn");
   });
 });

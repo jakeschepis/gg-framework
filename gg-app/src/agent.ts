@@ -160,6 +160,13 @@ export interface AgentState {
   isGitRepo?: boolean;
   /** Tracked, staged, and untracked files not yet committed. */
   gitDirtyFileCount?: number;
+  /** Open GitHub issues for the project's origin repo, or null when unknown
+   *  (gh CLI missing/unauthed, or origin isn't GitHub). Absent on older sidecars. */
+  gitHubIssues?: number | null;
+  /** Open GitHub pull requests for the project's origin repo (see gitHubIssues). */
+  gitHubPRs?: number | null;
+  /** Web URL of the project's GitHub origin repo (title-bar chip links). */
+  gitHubRepoUrl?: string | null;
   /** True when the active model can accept native video input. */
   supportsVideo?: boolean;
   /** Autopilot (auto-review) toggle for this window's project. Per-window,
@@ -388,6 +395,14 @@ export interface EnhanceResult {
 export async function enhancePrompt(text: string): Promise<EnhanceResult> {
   await waitForReady();
   return invoke<EnhanceResult>("agent_enhance_prompt", { text });
+}
+
+export async function openUrl(url: string): Promise<void> {
+  try {
+    await invoke("open_url", { url });
+  } catch (e) {
+    await logError(`open_url failed: ${String(e)}`);
+  }
 }
 
 export async function openProjectPath(path: string): Promise<void> {
@@ -1018,7 +1033,7 @@ export async function selectProject(cwd: string, sessionPath?: string): Promise<
   await selectWorkspace("code", cwd, sessionPath);
 }
 
-/** The project/session a window was restored to on app boot (workspace restore). */
+/** The active project/session Rust can restore into this webview. */
 export interface RestoreTarget {
   mode: WorkspaceMode;
   chatAgent?: ChatAgentId;
@@ -1027,10 +1042,10 @@ export interface RestoreTarget {
 }
 
 /**
- * If THIS window was reopened from the saved workspace (after a restart/update),
- * return its restore target so the webview can skip the project picker and
- * hydrate straight into the resumed project/session. Returns null for a normal
- * (freshly launched) window. Consume-once: a second call returns null.
+ * Return THIS window's active workspace target so the webview can skip Home and
+ * hydrate its existing daemon session. Rust retains the target for the window's
+ * lifetime, allowing repeated calls after React or WebKit content-process reloads.
+ * Returns null only while this is a fresh picker-only window.
  */
 export async function restoreTarget(): Promise<RestoreTarget | null> {
   try {
