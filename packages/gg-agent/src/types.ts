@@ -122,6 +122,22 @@ export interface AgentMaxTurnsEvent {
 }
 
 /**
+ * Emitted when the loop was about to stop on an exhausted turn budget but the
+ * host granted an extension instead. The effective budget is raised and the
+ * loop continues with a continuation prompt, so this is NOT terminal — unlike
+ * `max_turns`, which still fires if the extended budget is also spent.
+ */
+export interface AgentTurnBudgetExtendedEvent {
+  type: "turn_budget_extended";
+  /** Turn number at which the budget was exhausted. */
+  turn: number;
+  /** New effective `maxTurns` after the extension. */
+  grantedTurns: number;
+  /** 1-based extension count for this run. */
+  extension: number;
+}
+
+/**
  * Warning signal emitted when a turn ended on a non-clean stop reason —
  * `max_tokens` (output clipped at the model's output-token limit), `refusal`,
  * or a provider-reported `error` stop. Distinguishes a truncated/degraded
@@ -213,6 +229,7 @@ export type AgentEvent =
   | AgentTurnEndEvent
   | AgentDoneEvent
   | AgentMaxTurnsEvent
+  | AgentTurnBudgetExtendedEvent
   | AgentTruncatedEvent
   | AgentErrorEvent;
 
@@ -238,6 +255,12 @@ export interface AgentOptions {
   /** Control whether tools may/must be called, or select a named tool when supported. */
   toolChoice?: StreamOptions["toolChoice"];
   maxTurns?: number;
+  /**
+   * How many times `onTurnBudgetExhausted` may grant extra turns in one run.
+   * Each grant raises the effective budget by the original `maxTurns`.
+   * Default: 2. Set 0 to disable extensions entirely.
+   */
+  maxTurnExtensions?: number;
   maxTokens?: number;
   temperature?: number;
   thinking?: StreamOptions["thinking"];
@@ -307,6 +330,18 @@ export interface AgentOptions {
    * on read.
    */
   getFollowUpMessages?: () => Promise<Message[] | null> | Message[] | null;
+  /**
+   * Consulted when a tool-running turn exhausts the turn budget mid-task,
+   * before the loop emits the terminal `max_turns` event. Return true to grant
+   * another `maxTurns` worth of turns; false (the default when unset) keeps
+   * today's hard cut-off. Hosts should only grant on evidence of progress —
+   * extending a spinning agent just buys it more tokens to spin with.
+   */
+  onTurnBudgetExhausted?: (ctx: {
+    turn: number;
+    maxTurns: number;
+    extension: number;
+  }) => Promise<boolean> | boolean;
 }
 
 // ── Agent Result ────────────────────────────────────────────

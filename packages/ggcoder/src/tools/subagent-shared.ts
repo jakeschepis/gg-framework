@@ -8,6 +8,12 @@ import { truncateTail } from "./truncate.js";
 const MUTATING_TOOLS = new Set(["bash", "write", "edit"]);
 
 export const SUB_AGENT_MAX_TURNS = 50;
+/**
+ * Sub-agents get at most ONE turn-budget extension. A child's extensions run
+ * inside a single parent turn, so a child extending itself twice multiplies
+ * against the parent's own budget.
+ */
+export const SUB_AGENT_MAX_TURN_EXTENSIONS = 1;
 export const SUB_AGENT_MAX_OUTPUT_CHARS = 100_000;
 export const SUB_AGENT_MAX_OUTPUT_LINES = 500;
 export const SUB_AGENT_MAX_STDERR_CHARS = 10_000;

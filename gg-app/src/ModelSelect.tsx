@@ -1,6 +1,7 @@
 import { useEffect, useId, useRef, useState } from "react";
 import { theme } from "./theme";
 import { modelDisplayName } from "./model-name";
+import { groupByProvider } from "./provider-labels";
 import { supportsNativeSelectPopup } from "./platform";
 import type { ModelOption } from "./agent";
 
@@ -44,6 +45,14 @@ export function ModelSelect({
   const value = following ? FOLLOW_VALUE : currentModel;
   const known = models.some((model) => model.id === currentModel);
   const unavailable = Boolean(disabled || models.length === 0);
+  // One group per provider company, in registry order, with Local pinned last
+  // (it's the user's own machine, not an account, and its length depends on what
+  // they've pulled). A flat list of 40+ models across a dozen vendors is
+  // unreadable; the vendor is the first thing you scan for.
+  const groups = groupByProvider(models);
+  const activeLocal = models.find((model) => model.id === currentModel && model.local);
+  // Which machine/server is answering matters when a local model is active.
+  const triggerTitle = activeLocal?.endpoint ? `${title} — ${activeLocal.endpoint}` : title;
 
   useEffect(() => {
     if (!open) return;
@@ -101,6 +110,36 @@ export function ModelSelect({
     items[next]?.focus();
   }
 
+  function renderItem(model: ModelOption): React.ReactElement {
+    const active = model.id === currentModel && !(onSelectFollow && following);
+    // A local model that can't call tools can't run the agent — keep it visible
+    // (so the user knows it was found) but unselectable, with the reason.
+    const toolless = model.supportsTools === false;
+    return (
+      <button
+        key={`${model.provider}:${model.id}`}
+        className="model-menu-item"
+        role="menuitemradio"
+        aria-checked={active}
+        disabled={toolless}
+        style={{
+          color: toolless ? theme.textDim : active ? theme.primary : theme.text,
+          background: active ? theme.surface2 : "transparent",
+        }}
+        onClick={() => chooseModel(model.id)}
+        title={
+          toolless
+            ? `${model.name} has no tool calling, so it can't run the agent`
+            : model.endpoint
+              ? `${model.endpoint} · ${model.id}`
+              : `${model.provider} · ${model.id}`
+        }
+      >
+        {model.name}
+      </button>
+    );
+  }
+
   if (supportsNativeSelectPopup()) {
     return (
       <span className="model-picker model-picker-native" style={{ color: color ?? theme.text }}>
@@ -111,7 +150,7 @@ export function ModelSelect({
           className="model-select"
           value={value}
           disabled={unavailable}
-          title={title}
+          title={triggerTitle}
           aria-label={title}
           onChange={(event) => {
             const next = event.target.value;
@@ -132,10 +171,18 @@ export function ModelSelect({
             </option>
           )}
           {!known && currentModel !== "" && <option value={currentModel}>{currentModel}</option>}
-          {models.map((model) => (
-            <option key={`${model.provider}:${model.id}`} value={model.id}>
-              {model.name}
-            </option>
+          {groups.map((group) => (
+            <optgroup key={group.provider} label={group.label}>
+              {group.models.map((model) => (
+                <option
+                  key={`${model.provider}:${model.id}`}
+                  value={model.id}
+                  disabled={model.supportsTools === false}
+                >
+                  {model.supportsTools === false ? `${model.name} — no tool calling` : model.name}
+                </option>
+              ))}
+            </optgroup>
           ))}
         </select>
       </span>
@@ -149,7 +196,7 @@ export function ModelSelect({
         className="model-button"
         style={{ color: color ?? theme.text }}
         disabled={unavailable}
-        title={title}
+        title={triggerTitle}
         aria-haspopup="menu"
         aria-expanded={open}
         aria-controls={open ? menuId : undefined}
@@ -184,27 +231,20 @@ export function ModelSelect({
               Follow GG Coder
             </button>
           )}
-          <div className="model-menu-grid" role="group">
-            {models.map((model) => {
-              const active = model.id === currentModel && !(onSelectFollow && following);
-              return (
-                <button
-                  key={`${model.provider}:${model.id}`}
-                  className="model-menu-item"
-                  role="menuitemradio"
-                  aria-checked={active}
-                  style={{
-                    color: active ? theme.primary : theme.text,
-                    background: active ? theme.surface2 : "transparent",
-                  }}
-                  onClick={() => chooseModel(model.id)}
-                  title={`${model.provider} · ${model.id}`}
-                >
-                  {model.name}
-                </button>
-              );
-            })}
-          </div>
+          {groups.map((group) => (
+            <div key={group.provider} className="model-menu-section">
+              <div
+                className="model-menu-subtitle"
+                style={{ color: theme.textMuted }}
+                aria-hidden="true"
+              >
+                {group.label}
+              </div>
+              <div className="model-menu-grid" role="group" aria-label={group.label}>
+                {group.models.map((model) => renderItem(model))}
+              </div>
+            </div>
+          ))}
         </div>
       )}
     </span>

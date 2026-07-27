@@ -15,6 +15,8 @@
  *   --init-error          fail initialization
  *   --crash-on-open       exit after initialization when a document opens
  *   --silent              never publish diagnostics
+ *   --pid-file=PATH       write this process's pid at startup, so a test can
+ *                         assert the server was actually reaped
  */
 import fs from "node:fs";
 
@@ -27,6 +29,8 @@ const endsProgress = args.includes("--progress-end");
 const initError = args.includes("--init-error");
 const crashOnOpen = args.includes("--crash-on-open");
 const silent = args.includes("--silent");
+const pidFile = args.find((a) => a.startsWith("--pid-file="))?.split("=")[1];
+if (pidFile) fs.writeFileSync(pidFile, String(process.pid));
 
 const documents = new Map(); // uri -> text
 

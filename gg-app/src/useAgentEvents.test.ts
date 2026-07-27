@@ -10,8 +10,12 @@ import type { MutableRefObject } from "react";
 // erased), so the mock just provides that, resolving empty so run_end's command
 // refresh is a no-op.
 vi.mock("./sounds", () => ({ playSound: vi.fn() }));
-vi.mock("./agent", () => ({ listCommands: vi.fn().mockResolvedValue([]) }));
+vi.mock("./agent", () => ({
+  listCommands: vi.fn().mockResolvedValue([]),
+  listModels: vi.fn().mockResolvedValue([]),
+}));
 
+import { listModels } from "./agent";
 import { useAgentEvents, type AgentEventsDeps } from "./useAgentEvents";
 import type { Item } from "./App";
 import type { AgentState, SidecarEvent } from "./agent";
@@ -65,6 +69,12 @@ function setup(
     stateRef.current = agentState;
   }) as AgentEventsDeps["setState"];
 
+  let models: unknown[] = [];
+  const setModels = ((u: unknown) => {
+    models =
+      typeof u === "function" ? (u as (p: unknown[]) => unknown[])(models) : (u as unknown[]);
+  }) as unknown as AgentEventsDeps["setModels"];
+
   const noop = (): void => {};
   stateRef.current = agentState;
   const deps: AgentEventsDeps = {
@@ -92,6 +102,7 @@ function setup(
     setQueuedCount: noop as unknown as AgentEventsDeps["setQueuedCount"],
     setAttachments: noop as unknown as AgentEventsDeps["setAttachments"],
     setCommands: noop as unknown as AgentEventsDeps["setCommands"],
+    setModels,
     stateRef,
     planDoneRef: { current: new Set<number>() },
     planTotalRef: { current: 0 },
@@ -108,6 +119,7 @@ function setup(
     getLiveToolFeed: () => liveToolFeed,
     getPlanReview: () => planReview,
     getState: () => agentState,
+    getModels: () => models,
     setRunning,
     setTokens,
   };
@@ -561,5 +573,37 @@ describe("useAgentEvents", () => {
     expect(groups[1]?.kind === "subagent_group" ? groups[1].agents : []).toMatchObject([
       { toolCallId: "new-agent", status: "starting" },
     ]);
+  });
+});
+
+describe("models_change", () => {
+  it("refreshes the picker when local-model discovery lands", async () => {
+    const discovered = [
+      { id: "local/ollama/gemma4:e2b", name: "gemma4:e2b (Ollama)", provider: "local" },
+    ];
+    vi.mocked(listModels).mockResolvedValue(discovered as never);
+    const { hook, getModels } = setup();
+
+    await act(async () => {
+      hook.result.current.handleEvent(ev("models_change"));
+      await Promise.resolve();
+    });
+
+    // Without this the boot scan finds the user's models and nothing ever
+    // shows them until the app restarts.
+    expect(listModels).toHaveBeenCalled();
+    expect(getModels()).toEqual(discovered);
+  });
+
+  it("keeps the existing list when a refresh comes back empty", async () => {
+    vi.mocked(listModels).mockResolvedValue([] as never);
+    const { hook, getModels } = setup();
+
+    await act(async () => {
+      hook.result.current.handleEvent(ev("models_change"));
+      await Promise.resolve();
+    });
+
+    expect(getModels()).toEqual([]);
   });
 });

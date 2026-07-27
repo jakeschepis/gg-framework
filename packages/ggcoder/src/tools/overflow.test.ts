@@ -3,19 +3,18 @@ import os from "node:os";
 import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it } from "vitest";
 import { writeOverflow, cleanupToolOutputs, getToolOutputRoot } from "./overflow.js";
+import { useFakeHome } from "../test-support/fake-home.js";
 
-let originalHome: string | undefined;
+let restoreHome: (() => void) | undefined;
 let tmpHome: string;
 
 beforeEach(async () => {
-  originalHome = process.env.HOME;
   tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "overflow-home-"));
-  process.env.HOME = tmpHome;
+  restoreHome = useFakeHome(tmpHome);
 });
 
 afterEach(async () => {
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  restoreHome?.();
   await fs.rm(tmpHome, { recursive: true, force: true });
 });
 

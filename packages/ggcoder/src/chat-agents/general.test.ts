@@ -10,9 +10,12 @@ function optionsOf(agent: unknown): AgentSessionOptions {
 
 describe("General chat agent", () => {
   it("uses an isolated session namespace outside GG Coder history", () => {
-    const coderSessions = path.join("/tmp", "gg", "sessions");
+    // path.resolve on BOTH sides: the production code resolves its input, and
+    // on Windows that attaches the current drive ("\\tmp\\gg" -> "D:\\tmp\\gg").
+    // A hardcoded POSIX literal can never match that.
+    const coderSessions = path.resolve("/tmp", "gg", "sessions");
     expect(chatAgentSessionsDir(coderSessions, "general")).toBe(
-      path.join("/tmp", "gg", "chat-sessions", "general"),
+      path.resolve("/tmp", "gg", "chat-sessions", "general"),
     );
   });
 
@@ -34,7 +37,7 @@ describe("General chat agent", () => {
     expect(options.systemPrompt).toContain("- Active agent: general");
     expect(options.systemPrompt).toContain("- Workspace root: /tmp/workspace");
     expect(options.promptCacheKeyPrefix).toBe("ggchat:general");
-    expect(options.sessionRootDir).toBe("/tmp/gg/chat-sessions/general");
+    expect(options.sessionRootDir).toBe(path.resolve("/tmp/gg/chat-sessions/general"));
     expect(options.coderSlashCommands).toBe(false);
     expect(options.selfCorrectionHooks).toBe(false);
     expect(options.projectCustomization).toBe(false);

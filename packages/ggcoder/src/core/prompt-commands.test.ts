@@ -16,6 +16,17 @@ describe("prompt commands", () => {
     expect(bulletProof?.prompt).not.toContain("Press CTRL + G");
   });
 
+  it("tells commands that name kencode tools how to unlock deferred MCP", () => {
+    // `deferredMcpTools` defaults to true, so `mcp__kencode-search__*` sits in
+    // the tool_search catalog until promoted. A command that hard-names it must
+    // say how to unlock it, or the call fails on a default install.
+    for (const name of ["compare", "expand"]) {
+      const cmd = PROMPT_COMMANDS.find((command) => command.name === name);
+      expect(cmd?.prompt, name).toContain("mcp__kencode-search__");
+      expect(cmd?.prompt, name).toContain("call `tool_search`");
+    }
+  });
+
   it("frames bullet-proof as an authorized defensive review with no exploit output", () => {
     const bulletProof = PROMPT_COMMANDS.find((command) => command.name === "bullet-proof");
 
@@ -92,7 +103,7 @@ describe("prompt commands", () => {
     expect(expand?.prompt).not.toContain("planning-only Goal tasks");
   });
 
-  it("keeps /init focused on project-specific CLAUDE.md content", () => {
+  it("keeps /init focused on project-specific context", () => {
     const init = PROMPT_COMMANDS.find((command) => command.name === "init");
 
     expect(init).toBeDefined();
@@ -107,11 +118,70 @@ describe("prompt commands", () => {
     );
     expect(init?.prompt).toContain("Do NOT embed generated symbol maps");
     expect(init?.prompt).toContain("auto-generated project inventories");
-    expect(init?.prompt).toContain("CLAUDE.md must remain durable, agent-focused project context");
+    expect(init?.prompt).toContain(
+      "context file must remain durable, agent-focused project context",
+    );
     expect(init?.prompt).not.toContain("human-authored");
     expect(init?.prompt).not.toContain("one file per component");
     expect(init?.prompt).not.toContain("single responsibility");
     expect(init?.prompt).not.toContain("zero-tolerance code quality checks");
     expect(init?.prompt).not.toContain("run full quality suite after every edit");
+  });
+
+  it("states each redundancy rule exactly once so /init reads as one filter", () => {
+    const init = PROMPT_COMMANDS.find((command) => command.name === "init");
+    const count = (needle: string): number => init!.prompt.split(needle).length - 1;
+
+    // The old prompt restated these across the preamble and 3 separate steps.
+    // Repetition-as-emphasis is what you write when a rule isn't structurally
+    // enforceable; the fence + budget now carry that load instead.
+    expect(count("Do NOT add generic agent behavior")).toBe(1);
+    expect(count("Do NOT embed generated symbol maps")).toBe(1);
+    expect(count("Never add guidance that requires running checks")).toBe(1);
+  });
+
+  it("makes /init regeneration replace a fenced block instead of appending", () => {
+    const init = PROMPT_COMMANDS.find((command) => command.name === "init");
+
+    // /init is re-run over a project's lifetime. Without a marker separating
+    // agent-generated from user-written content, "preserve custom sections"
+    // preserves everything and the file grows monotonically.
+    expect(init?.prompt).toContain("<!-- gg:init:start -->");
+    expect(init?.prompt).toContain("<!-- gg:init:end -->");
+    expect(init?.prompt).toContain("replace everything between the markers wholesale");
+    expect(init?.prompt).toContain("Text outside the fence is user-owned");
+  });
+
+  it("makes /init write to the context file the loader actually reads", () => {
+    const init = PROMPT_COMMANDS.find((command) => command.name === "init");
+
+    // CONTEXT_FILES takes one file per directory, AGENTS.md outranks CLAUDE.md.
+    // Writing a fresh CLAUDE.md next to an existing AGENTS.md creates a file
+    // that is silently never loaded.
+    expect(init?.prompt).toContain("one per directory, first match wins");
+    expect(init?.prompt).toContain("AGENTS.override.md`");
+    expect(init?.prompt).toContain("already has an `AGENTS.md`, update that file");
+  });
+
+  it("budgets /init output in bytes with a stated token cost, not a line cap", () => {
+    const init = PROMPT_COMMANDS.find((command) => command.name === "init");
+
+    // A line cap is unverifiable by the model and doesn't constrain tables or
+    // code fences; the real constraint is PROJECT_CONTEXT_MAX_BYTES (32KB).
+    expect(init?.prompt).toContain("cached prefix of every request");
+    expect(init?.prompt).toContain("Target 6KB or less");
+    expect(init?.prompt).toContain("`wc -c`");
+    expect(init?.prompt).not.toContain("under 100 lines");
+  });
+
+  it("hunts non-derivable knowledge instead of mapping directories", () => {
+    const init = PROMPT_COMMANDS.find((command) => command.name === "init");
+
+    // Gotchas/invariants are the only content an agent can't recover by
+    // reading the code, so they replace the directory-structure sweep whose
+    // output the prompt then forbids embedding anyway.
+    expect(init?.prompt).toContain("Gotchas & Invariants Agent");
+    expect(init?.prompt).toContain("would a competent agent get this wrong without being told?");
+    expect(init?.prompt).not.toContain("Directory Structure Agent");
   });
 });

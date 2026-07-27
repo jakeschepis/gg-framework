@@ -11,6 +11,27 @@ export interface AgentDefinition {
 }
 
 /**
+ * MCP server names an agent's `tools:` list asks for, derived from any
+ * `mcp__<server>__<tool>` entries.
+ *
+ * A session with an allow-list connects MCP servers ONLY when they're named in
+ * `allowedMcpServers` (see `AgentSession.connectMcpServers`). Without this,
+ * every named agent silently got zero MCP tools — even one that explicitly
+ * listed `mcp__kencode-search__searchCode` — so agents fell back to training
+ * data instead of real public code.
+ */
+export function mcpServersForAgent(tools: readonly string[]): string[] {
+  const servers = new Set<string>();
+  for (const tool of tools) {
+    // mcp__<server>__<tool> — server names may themselves contain single
+    // underscores, so split on the double-underscore delimiter only.
+    const match = /^mcp__(.+?)__(.+)$/.exec(tool);
+    if (match) servers.add(match[1]);
+  }
+  return [...servers];
+}
+
+/**
  * Discover agent definitions from global and project-local directories.
  * Agent files are markdown with frontmatter (similar to skills).
  *

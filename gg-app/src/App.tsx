@@ -1,5 +1,6 @@
 import { useState, useRef, useEffect, useLayoutEffect, useCallback, memo } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
+import { open, save } from "@tauri-apps/plugin-dialog";
 import { theme } from "./theme";
 import {
   waitForReady,
@@ -13,9 +14,12 @@ import {
   cycleThinking,
   listModels,
   switchModel,
+  isSwitchModelError,
   switchKenModel,
   listCommands,
   listHistory,
+  exportTranscriptName,
+  saveTranscript,
   listTasks,
   runTask,
   runAllTasks,
@@ -69,6 +73,7 @@ import { ConfirmModal } from "./ConfirmModal";
 import { InitGitModal } from "./InitGitModal";
 import { PlanModeLogo } from "./PlanModeLogo";
 import { KenPowerBanner } from "./KenPowerBanner";
+import { ExportChatButton } from "./ExportChatButton";
 import { PlanReviewModal } from "./PlanReviewModal";
 import { WindowLayoutButton } from "./WindowLayoutButton";
 // Experimental gaze focus — disabled for now (see main.tsx).
@@ -81,6 +86,7 @@ import { Badge } from "./Badge";
 import { AutopilotToggle } from "./AutopilotToggle";
 import { HomeScreen } from "./HomeScreen";
 import { initialEntryView, type EntryView } from "./app-entry-view";
+import { submitDisposition } from "./submit-disposition";
 import { Toaster } from "./Toaster";
 import { Confetti } from "./Confetti";
 import { RankBadge } from "./RankBadge";
@@ -101,6 +107,7 @@ import { EnhancedSegments } from "./PromptEnhancement";
 import { EnhanceDissolve } from "./EnhanceDissolve";
 import { toast } from "./toast";
 import { fileToPending, toWire, attachmentToPending, type PendingAttachment } from "./attachments";
+import { basename } from "./tool-format";
 import "./App.css";
 
 const DEFAULT_INPUT_PLACEHOLDER = "Type a message, / commands, @ files, @Ken for help";
@@ -506,6 +513,45 @@ function App(): React.ReactElement {
     [toolsHidden, setToolsHiddenPersisted],
   );
   const [newSessionBusy, setNewSessionBusy] = useState(false);
+  // Transcript export (the download button in the activity bar). The chosen
+  // folder is remembered so the second export lands where the first one did —
+  // stored per-machine, not per-project, because that's how people organise
+  // exports (one "agent transcripts" folder, many projects).
+  const [exporting, setExporting] = useState(false);
+  // The export pill only exists while the pointer is over the chat area. Kept
+  // true while a save is in flight so the button doesn't vanish mid-click when
+  // the native dialog steals the pointer and fires mouseleave.
+  const [chatHovered, setChatHovered] = useState(false);
+  const exportTranscript = useCallback(async () => {
+    setExporting(true);
+    try {
+      const filename = (await exportTranscriptName()) ?? "your-chat.md";
+      let lastDir: string | null = null;
+      try {
+        lastDir = localStorage.getItem("gg-export-dir");
+      } catch {
+        /* ignore */
+      }
+      const target = await save({
+        title: "Save transcript",
+        defaultPath: lastDir ? `${lastDir}/${filename}` : filename,
+        filters: [{ name: "Markdown", extensions: ["md"] }],
+      });
+      if (!target) return; // user cancelled — not an error, say nothing
+      await saveTranscript(target);
+      const dir = target.replace(/[/\\][^/\\]*$/, "");
+      try {
+        if (dir) localStorage.setItem("gg-export-dir", dir);
+      } catch {
+        /* ignore */
+      }
+      toast(`Saved ${target.split(/[/\\]/).pop() ?? "transcript"}`, "success");
+    } catch (e) {
+      toast(`Could not save transcript: ${String(e)}`, "error");
+    } finally {
+      setExporting(false);
+    }
+  }, []);
   // App self-update (GitHub releases). Drives the footer update banner.
   const appUpdate = useAppUpdate();
   // Initialize-git modal (shown via the top-right button when not yet a repo).
@@ -939,6 +985,7 @@ function App(): React.ReactElement {
     setQueuedCount,
     setAttachments,
     setCommands,
+    setModels,
     stateRef,
     planDoneRef,
     planTotalRef,
@@ -1206,21 +1253,26 @@ function App(): React.ReactElement {
   function onSelectModel(modelId: string): void {
     if (state && modelId === state.model) return;
     void switchModel(modelId).then((res) => {
-      if (res) {
-        // Sakana Fugu easter egg: blow the fugu horn when a Fugu model is picked.
-        if (res.model.startsWith("fugu")) playSound("fugu");
-        setState((s) =>
-          s
-            ? {
-                ...s,
-                provider: res.provider,
-                model: res.model,
-                thinkingLevel: res.thinkingLevel,
-                supportedThinkingLevels: res.supportedThinkingLevels,
-              }
-            : s,
-        );
+      if (isSwitchModelError(res)) {
+        // The sidecar refuses with a reason worth reading ("Ollama isn't
+        // running at …", "has no tool calling"). Show it — otherwise the
+        // picker just snaps back with no explanation.
+        toast(res.error, "error");
+        return;
       }
+      // Sakana Fugu easter egg: blow the fugu horn when a Fugu model is picked.
+      if (res.model.startsWith("fugu")) playSound("fugu");
+      setState((s) =>
+        s
+          ? {
+              ...s,
+              provider: res.provider,
+              model: res.model,
+              thinkingLevel: res.thinkingLevel,
+              supportedThinkingLevels: res.supportedThinkingLevels,
+            }
+          : s,
+      );
     });
   }
 
@@ -1296,9 +1348,29 @@ function App(): React.ReactElement {
   const defaultRepoName = (state?.cwd ?? "").split(/[\\/]/).filter(Boolean).pop() ?? "";
 
   function pickSlashCommand(cmd: SlashCommand): void {
+    if (cmd.name === "add-dir" || cmd.name === "remove-dir") {
+      setInput("");
+      setSlashIndex(0);
+      void pickWorkspaceDirectory(cmd.name);
+      return;
+    }
+
     // Fill the input with the command; the user can add args or press Enter.
     setInput(`/${cmd.name} `);
     setSlashIndex(0);
+  }
+
+  async function pickWorkspaceDirectory(command: "add-dir" | "remove-dir"): Promise<void> {
+    const selected = await open({
+      directory: true,
+      multiple: false,
+      title:
+        command === "add-dir"
+          ? "Add project folder to workspace"
+          : "Remove project folder from workspace",
+    });
+    if (typeof selected !== "string") return;
+    submitText(`/${command} ${selected}`, command === "add-dir" ? "/add-dir" : "/remove-dir");
   }
 
   // Detect an active `@`-mention token at the caret: a `@` that starts at a word
@@ -1369,12 +1441,19 @@ function App(): React.ReactElement {
     setMentionedPaths((prev) => prev.filter((x) => x !== p));
   }
 
-  // Submit arbitrary text as if typed + entered. Shared by the input and the
-  // top-right commit button. `label` shows a friendly shimmer phrase in the
-  // transcript while the full `text` is still sent to the agent.
+  // Submit arbitrary text as if typed + entered. Shared by the input, the
+  // top-right commit button, and the workspace directory picker. `label` shows
+  // a friendly shimmer phrase in the transcript while the full `text` is still
+  // sent to the agent.
   function submitText(text: string, label?: string): void {
     const trimmed = text.trim();
-    if (!trimmed || !readyRef.current || running) return;
+    // Mid-run this QUEUES as steering, exactly like a typed message (see
+    // submit()): the sidecar injects it into the running loop. Dropping it
+    // instead would be silent — the folder picker especially, which gives no
+    // hint that the directory you just chose went nowhere.
+    const disposition = submitDisposition(trimmed, readyRef.current, running);
+    if (disposition === "ignore") return;
+    const queued = disposition === "queue";
     // A user send always re-pins to the bottom — they want to see their message.
     stickToBottomRef.current = true;
     pushItem({
@@ -1383,10 +1462,11 @@ function App(): React.ReactElement {
       text: trimmed,
       command: label !== undefined || isWorkflowCommand(trimmed),
       ...(label !== undefined ? { label } : {}),
+      ...(queued ? { queued: true } : {}),
     });
     setInput("");
     setSlashIndex(0);
-    endStreamingText();
+    if (!queued) endStreamingText();
     void sendPrompt(trimmed);
   }
 
@@ -1884,6 +1964,7 @@ function App(): React.ReactElement {
         gitHubIssues={state?.gitHubIssues}
         gitHubPRs={state?.gitHubPRs}
         gitHubRepoUrl={state?.gitHubRepoUrl}
+        additionalRoots={state?.additionalRoots}
         navHidden={navHidden}
         onToggleNav={toggleNav}
         stripExtras={
@@ -2024,7 +2105,11 @@ function App(): React.ReactElement {
           existing session scrolled down it rendered far above what's on
           screen. Anchoring to this non-scrolling sibling keeps it pinned to
           what the user is actually looking at, at any scroll position. */}
-      <div className="transcript-frame">
+      <div
+        className="transcript-frame"
+        onMouseEnter={() => setChatHovered(true)}
+        onMouseLeave={() => setChatHovered(false)}
+      >
         {workspaceMode === "code" && kenPowerBanner && (
           <KenPowerBanner mode={kenPowerBanner} onDone={() => setKenPowerBanner(null)} />
         )}
@@ -2049,6 +2134,13 @@ function App(): React.ReactElement {
             </>
           )}
         </div>
+        {items.length > 0 && (
+          <ExportChatButton
+            visible={chatHovered || exporting}
+            busy={exporting}
+            onExport={() => void exportTranscript()}
+          />
+        )}
       </div>
 
       <div className="liveregion">
@@ -2676,7 +2768,7 @@ const TranscriptRow = memo(function TranscriptRow({
                 />
                 {img.path && (
                   <figcaption className="img-cap" title={img.path}>
-                    {img.path.split("/").filter(Boolean).pop()}
+                    {basename(img.path)}
                   </figcaption>
                 )}
               </figure>

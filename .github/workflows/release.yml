@@ -82,7 +82,15 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      # shell: bash is load-bearing on the windows-latest leg. The default shell
+      # there is PowerShell, which does NOT abort a multi-line script when an
+      # intermediate command exits non-zero — only the LAST line decides the
+      # step's outcome. Without this a failing gg-ai or gg-agent build is
+      # silently swallowed by ggcoder's build succeeding after it, and we SHIP
+      # an installer built from stale or missing artifacts. The same bug hid 72
+      # failing tests in ci.yml.
       - name: Build framework packages
+        shell: bash
         run: |
           pnpm --filter @kenkaiiii/gg-ai build
           pnpm --filter @kenkaiiii/gg-agent build

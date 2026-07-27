@@ -1,6 +1,7 @@
 import path from "node:path";
 import fs from "node:fs/promises";
 import fsSync from "node:fs";
+import { createHash } from "node:crypto";
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { getAppPaths, type AppPaths } from "@kenkaiiii/gg-core";
 import type { ThemeName } from "./ui/theme/theme.js";
@@ -137,8 +138,24 @@ function isValidThemeSetting(value: string): value is "auto" | ThemeName {
   return VALID_THEME_SETTINGS.has(value);
 }
 
-/** Seed built-in agent definitions on first run (won't overwrite user edits). */
-async function seedDefaultAgents(agentsDir: string): Promise<void> {
+/**
+ * SHA-256 of the exact `auditor.md` / `skeptic.md` bodies seeded by v5.22.6.
+ * Used to delete only our own mistakenly-seeded copies — never a user's file.
+ */
+export const SHADOWING_SEEDED_AGENT_HASHES: Record<string, string> = {
+  "auditor.md": "7c8c6c1ff892a7ebf45164b0367e340f099cf2cd611bfec23eb39ecc24592502",
+  "skeptic.md": "7def72d81da78919efb4934f396d8da47912786a49176badf996eac4d57a285d",
+};
+
+/**
+ * Seed built-in agent definitions on first run (won't overwrite user edits).
+ *
+ * Exported for tests: `getAppPaths()` resolves `os.homedir()` inside gg-core's
+ * prebuilt dist, which vitest does not transform, so a homedir spy would not
+ * apply and the test would operate on the developer's real `~/.gg`. Tests must
+ * call this with an explicit temp directory instead of going via ensureAppDirs.
+ */
+export async function seedDefaultAgents(agentsDir: string): Promise<void> {
   const defaults: Record<string, string> = {
     "owl.md": `---
 name: owl
@@ -190,44 +207,6 @@ When given a task:
 
 Do the work, don't just describe it. Don't over-engineer.
 `,
-    "auditor.md": `---
-name: auditor
-description: "Defensive security analyst \u2014 finds exploitable weaknesses with concrete vulnerability scenarios"
-tools: read, grep, find, ls, source_path
----
-
-You are Auditor, a defensive security analyst. You review code the owner asked to have reviewed so weaknesses can be patched before they ship. You are read-only: report findings, never modify anything. Never produce working exploit code or payloads \u2014 describe each risk at the data-flow level so it maps directly to a fix.
-
-For the vulnerability class you are assigned:
-1. **Trace data flow** from the provided Sources to Sinks \u2014 no pattern-matching without a traced path
-2. Apply the untrusted-vs-trusted decision: is the input actually reachable by an untrusted party, or is it a settings constant / build-time string / server-controlled value?
-3. Describe a concrete **risk scenario** \u2014 what kind of input reaches the source, how the system processes it, what exposure results. If you can't describe the steps, don't flag it
-4. Assign **confidence 0.0\u20131.0**; drop everything below 0.8 before returning
-5. Be framework-aware: ORM parameterization, auto-escaping, and memory-safe languages eliminate whole classes \u2014 don't flag what the framework already handles
-
-Never flag: DOS without an amplification primitive, theoretical races, log spoofing, env-var trust, client-side checks backed by server validation, findings in docs/tests/fixtures, dev-only tooling, or style preferences.
-
-Report each finding: location (file:line), source \u2192 sink path, risk scenario, impact, concrete code-level fix, confidence.
-`,
-    "skeptic.md": `---
-name: skeptic
-description: "Rigorous false-positive reviewer \u2014 disproves security findings and applies exclusion rules strictly"
-tools: read, grep, find, ls, source_path
----
-
-You are Skeptic, a false-positive reviewer for security findings. Start from "this is a false positive" and try to disprove each finding you are given \u2014 only findings that survive your challenge are confirmed.
-
-For each finding:
-1. Re-read the actual code at the cited location \u2014 does the claimed source \u2192 sink path really exist as described?
-2. Hunt for sanitization, validation, framework protection, or unreachable preconditions between source and sink
-3. Check whether the "untrusted" input is truly attacker-reachable, or is server-controlled config / env / build-time data
-4. Apply exclusions strictly: DOS and rate-limit noise, theoretical races, log spoofing, env-var trust, client-side checks backed by server validation, docs/test/fixture code, dev-only tooling, style preferences \u2014 all DROP
-
-Verdict per finding, with one-line justification:
-- **CONFIRM** \u2014 the path is real and reachable; evidence held up
-- **DOWNGRADE** \u2014 real but overstated; state the correct severity and why
-- **DROP** \u2014 disproved; cite the disproving evidence (file:line)
-`,
   };
 
   for (const [filename, content] of Object.entries(defaults)) {
@@ -237,6 +216,29 @@ Verdict per finding, with one-line justification:
       // File exists — don't overwrite user edits
     } catch {
       await fs.writeFile(filePath, content, "utf-8");
+    }
+  }
+
+  await removeShadowingSeededAgents(agentsDir);
+}
+
+/**
+ * v5.22.6 briefly seeded `auditor.md` / `skeptic.md` into the user agents dir.
+ * Those names are already shipped as BUNDLED_AGENTS with richer prompts, and
+ * user-dir agents take precedence — so the seeded copies silently shadowed the
+ * bundled ones (a weaker /bullet-proof). Delete them, but ONLY when the file is
+ * byte-identical to what 5.22.6 wrote, so a user who edited or authored their
+ * own agent of that name keeps it.
+ */
+async function removeShadowingSeededAgents(agentsDir: string): Promise<void> {
+  for (const [filename, seededHash] of Object.entries(SHADOWING_SEEDED_AGENT_HASHES)) {
+    const filePath = path.join(agentsDir, filename);
+    try {
+      const content = await fs.readFile(filePath, "utf-8");
+      const hash = createHash("sha256").update(content, "utf-8").digest("hex");
+      if (hash === seededHash) await fs.rm(filePath, { force: true });
+    } catch {
+      // Missing or unreadable — nothing to clean up.
     }
   }
 }

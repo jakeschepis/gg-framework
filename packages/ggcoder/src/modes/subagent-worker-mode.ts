@@ -2,7 +2,11 @@ import { createInterface } from "node:readline";
 import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { AgentSession } from "../core/agent-session.js";
 import { isModelUnavailableError } from "../tools/subagent.js";
-import { boundSubAgentOutput, SUB_AGENT_TIMEOUT_MS } from "../tools/subagent-shared.js";
+import {
+  boundSubAgentOutput,
+  SUB_AGENT_MAX_TURN_EXTENSIONS,
+  SUB_AGENT_TIMEOUT_MS,
+} from "../tools/subagent-shared.js";
 import { captureSidecarError, flushSidecarErrors } from "../core/sidecar-error-reporter.js";
 
 export interface SubagentWorkerInitialize {
@@ -14,6 +18,8 @@ export interface SubagentWorkerInitialize {
   systemPrompt?: string;
   thinkingLevel?: ThinkingLevel;
   allowedTools?: string[];
+  /** MCP servers this agent may connect, derived from its `tools:` frontmatter. */
+  allowedMcpServers?: string[];
   promptCacheKey?: string;
   sessionRootDir: string;
   childSessionPath?: string;
@@ -60,6 +66,7 @@ export async function runSubagentWorkerMode(): Promise<void> {
       "tool_call_end",
       "turn_end",
       "max_turns",
+      "turn_budget_extended",
       "truncated",
       "server_tool_call",
       "server_tool_result",
@@ -81,6 +88,7 @@ export async function runSubagentWorkerMode(): Promise<void> {
     const next = new AgentSession({
       ...sessionOptions,
       maxTurns: 50,
+      maxTurnExtensions: SUB_AGENT_MAX_TURN_EXTENSIONS,
       transient: false,
       sessionRootDir: options.sessionRootDir,
       sessionId: childSessionPath,

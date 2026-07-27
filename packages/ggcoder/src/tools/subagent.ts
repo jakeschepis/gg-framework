@@ -3,7 +3,7 @@ import { createInterface } from "node:readline";
 import { z } from "zod";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import type { Provider } from "@kenkaiiii/gg-ai";
-import type { AgentDefinition } from "../core/agents.js";
+import { mcpServersForAgent, type AgentDefinition } from "../core/agents.js";
 import { log } from "../core/logger.js";
 import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 import {
@@ -118,6 +118,13 @@ export function createSubAgentTool(
         }
         if (agentDef?.tools.length) {
           cliArgs.push("--tools", agentDef.tools.join(","));
+          // An allow-listed child connects MCP servers only when they're named
+          // here — otherwise a `mcp__kencode-search__*` entry in the agent's
+          // tools list could never resolve and it falls back to training data.
+          const mcpServers = mcpServersForAgent(agentDef.tools);
+          if (mcpServers.length > 0) {
+            cliArgs.push("--mcp-servers", mcpServers.join(","));
+          }
         }
         cliArgs.push(args.task);
         return cliArgs;

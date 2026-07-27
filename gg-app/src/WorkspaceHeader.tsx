@@ -11,6 +11,8 @@ interface WorkspaceHeaderProps {
   gitHubPRs?: number | null;
   /** Origin repo's web URL — makes the issue/PR chips clickable. */
   gitHubRepoUrl?: string | null;
+  /** Extra workspace roots added with /add-dir. */
+  additionalRoots?: string[];
   navHidden: boolean;
   onToggleNav: () => void;
   stripExtras?: ReactNode;
@@ -28,10 +30,13 @@ export function formatWorkspaceTitle(
   gitDirtyFileCount = 0,
   gitHubIssues: number | null = null,
   gitHubPRs: number | null = null,
+  additionalRoots: string[] = [],
 ): string {
   const directory = cwd?.split(/[\\/]/).filter(Boolean).pop();
   if (!directory) return fallback;
   const segments = [directory];
+  if (additionalRoots.length > 0)
+    segments.push(`+${pluralize(additionalRoots.length, "root", "roots")}`);
   if (gitBranch) segments.push(`⎇ ${gitBranch}`);
   if (gitDirtyFileCount > 0) segments.push(`${gitDirtyFileCount} uncommitted`);
   if (gitHubIssues !== null && gitHubIssues > 0)
@@ -49,6 +54,7 @@ export function WorkspaceHeader({
   gitHubIssues = null,
   gitHubPRs = null,
   gitHubRepoUrl = null,
+  additionalRoots = [],
   navHidden,
   onToggleNav,
   stripExtras,
@@ -70,6 +76,7 @@ export function WorkspaceHeader({
             gitDirtyFileCount,
             gitHubIssues,
             gitHubPRs,
+            additionalRoots,
           )}
         >
           {directory ? (
@@ -102,6 +109,20 @@ export function WorkspaceHeader({
                       {`⎇ ${gitBranch}`}
                     </span>
                   )}
+                </>
+              )}
+              {additionalRoots.length > 0 && (
+                <>
+                  <span className="chat-head-sep" data-tauri-drag-region>
+                    {"│"}
+                  </span>
+                  <span
+                    className="chat-head-dirty"
+                    data-tauri-drag-region
+                    title={`Additional workspace roots:\n${additionalRoots.join("\n")}`}
+                  >
+                    {`+${pluralize(additionalRoots.length, "root", "roots")}`}
+                  </span>
                 </>
               )}
               {gitDirtyFileCount > 0 && (

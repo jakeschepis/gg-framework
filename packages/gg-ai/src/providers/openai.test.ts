@@ -3,6 +3,7 @@ import type OpenAI from "openai";
 import type { Provider, ThinkingLevel } from "../types.js";
 import { ProviderError } from "../errors.js";
 import { streamOpenAI } from "./openai.js";
+import { resetReasoningFieldCache } from "./reasoning-field.js";
 
 const createMock = vi.fn();
 
@@ -686,5 +687,118 @@ describe("streamOpenAI silent-partial truncation guard", () => {
     }
     await expect(result.response).resolves.toMatchObject({ stopReason: "stop_sequence" });
     expect(text).toBe("Hello");
+  });
+});
+
+function reasoningStream(field: string): AsyncIterable<OpenAI.ChatCompletionChunk> {
+  return (async function* () {
+    yield {
+      id: "chatcmpl_r",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test",
+      choices: [{ index: 0, delta: { [field]: "pondering" }, finish_reason: null }],
+    };
+    yield {
+      id: "chatcmpl_r",
+      object: "chat.completion.chunk",
+      created: 1,
+      model: "test",
+      choices: [{ index: 0, delta: { content: "done" }, finish_reason: "stop" }],
+      usage: { prompt_tokens: 1, completion_tokens: 1, total_tokens: 2 },
+    };
+  })() as AsyncIterable<OpenAI.ChatCompletionChunk>;
+}
+
+describe("streamOpenAI reasoning-field detection", () => {
+  afterEach(() => {
+    createMock.mockReset();
+    resetReasoningFieldCache();
+  });
+
+  it.each(["reasoning_content", "reasoning", "reasoning_text"])(
+    "yields thinking for a `%s` delta and echoes the same field back",
+    async (field) => {
+      const baseUrl = `https://vllm.test/${field}/v1`;
+      createMock.mockResolvedValueOnce(reasoningStream(field));
+      const first = streamOpenAI({
+        provider: "openai",
+        model: "local-model",
+        baseUrl,
+        messages: [{ role: "user", content: "hi" }],
+        apiKey: "test-key",
+        thinking: "high",
+      });
+
+      const thinking: string[] = [];
+      for await (const event of first) {
+        if (event.type === "thinking_delta") thinking.push(event.text);
+      }
+      const response = await first.response;
+      expect(thinking).toEqual(["pondering"]);
+      expect(response.message.content).toContainEqual({ type: "thinking", text: "pondering" });
+
+      // Follow-up turn echoes history back using the detected field name.
+      createMock.mockResolvedValueOnce(reasoningStream(field));
+      const second = streamOpenAI({
+        provider: "openai",
+        model: "local-model",
+        baseUrl,
+        messages: [
+          { role: "user", content: "hi" },
+          {
+            role: "assistant",
+            content: [
+              { type: "thinking", text: "pondering" },
+              { type: "text", text: "done" },
+            ],
+          },
+          { role: "user", content: "again" },
+        ],
+        apiKey: "test-key",
+        thinking: "high",
+      });
+      for await (const _event of second) {
+        /* consume */
+      }
+
+      const params = createMock.mock.calls[1]?.[0] as Record<string, unknown>;
+      const assistant = (params.messages as Array<Record<string, unknown>>)[1]!;
+      expect(assistant[field]).toBe("pondering");
+      for (const other of ["reasoning_content", "reasoning", "reasoning_text"]) {
+        if (other !== field) expect(assistant).not.toHaveProperty(other);
+      }
+    },
+  );
+
+  it("defaults to reasoning_content for an endpoint that never emitted reasoning", async () => {
+    createMock.mockResolvedValueOnce(createStreamingResult(""));
+    const result = streamOpenAI({
+      provider: "openai",
+      model: "unknown-model",
+      baseUrl: "https://unknown.test/v1",
+      messages: [
+        { role: "user", content: "hi" },
+        {
+          role: "assistant",
+          content: [
+            { type: "thinking", text: "hmm" },
+            { type: "text", text: "ok" },
+          ],
+        },
+        { role: "user", content: "again" },
+      ],
+      apiKey: "test-key",
+      thinking: "high",
+    });
+    for await (const _event of result) {
+      /* consume */
+    }
+
+    const params = createMock.mock.calls[0]?.[0] as Record<string, unknown>;
+    expect((params.messages as Array<Record<string, unknown>>)[1]).toHaveProperty(
+      "reasoning_content",
+      "hmm",
+    );
   });
 });

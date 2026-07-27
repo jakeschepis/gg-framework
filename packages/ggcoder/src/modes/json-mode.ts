@@ -4,6 +4,7 @@ import { isAbortError } from "@kenkaiiii/gg-agent";
 import { formatUserError } from "../utils/error-handler.js";
 import { closeLogger } from "../core/logger.js";
 import { captureSidecarError, flushSidecarErrors } from "../core/sidecar-error-reporter.js";
+import { SUB_AGENT_MAX_TURN_EXTENSIONS } from "../tools/subagent-shared.js";
 
 export interface JsonModeOptions {
   message: string;
@@ -21,6 +22,13 @@ export interface JsonModeOptions {
    * write/edit/bash. Empty/undefined → full toolset (backward compatible).
    */
   allowedTools?: string[];
+  /**
+   * MCP servers this sub-agent may connect, derived from the `mcp__<server>__*`
+   * entries in its agent definition's `tools:` frontmatter. Only meaningful
+   * alongside `allowedTools` — an allow-listed session otherwise skips MCP
+   * entirely, so a research agent would silently lose live code search.
+   */
+  allowedMcpServers?: string[];
   /**
    * Stable prompt-cache routing key inherited from the parent ggcoder
    * process. Without this, each sub-agent session generates a unique
@@ -50,7 +58,9 @@ export async function runJsonMode(options: JsonModeOptions): Promise<void> {
     cwd: options.cwd,
     thinkingLevel: options.thinkingLevel,
     maxTurns: options.maxTurns,
+    maxTurnExtensions: SUB_AGENT_MAX_TURN_EXTENSIONS,
     allowedTools: options.allowedTools,
+    allowedMcpServers: options.allowedMcpServers,
     signal: ac.signal,
     // Subagent runs are one-shot, NDJSON-streamed to the parent over stdout,
     // and have no resumable identity. Skip writing a `.jsonl` so the spawn
@@ -88,6 +98,9 @@ export async function runJsonMode(options: JsonModeOptions): Promise<void> {
   });
   session.eventBus.on("max_turns", (payload) => {
     emitJson({ type: "max_turns", ...payload });
+  });
+  session.eventBus.on("turn_budget_extended", (payload) => {
+    emitJson({ type: "turn_budget_extended", ...payload });
   });
   session.eventBus.on("truncated", (payload) => {
     emitJson({ type: "truncated", ...payload });

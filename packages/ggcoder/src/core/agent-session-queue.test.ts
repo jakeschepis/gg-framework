@@ -9,6 +9,7 @@ import path from "node:path";
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import type * as GgAgentModule from "@kenkaiiii/gg-agent";
 import type * as McpModule from "./mcp/index.js";
+import { useFakeHome } from "../test-support/fake-home.js";
 
 const agentLoopMock = vi.hoisted(() => vi.fn());
 
@@ -33,15 +34,14 @@ vi.mock("./mcp/index.js", async () => {
   };
 });
 
-let originalHome: string | undefined;
+let restoreHome: (() => void) | undefined;
 let tmpHome: string;
 let tmpProject: string;
 
 beforeEach(async () => {
-  originalHome = process.env.HOME;
   tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "agent-session-queue-home-"));
   tmpProject = await fs.mkdtemp(path.join(os.tmpdir(), "agent-session-queue-project-"));
-  process.env.HOME = tmpHome;
+  restoreHome = useFakeHome(tmpHome);
   agentLoopMock.mockReset();
   await fs.mkdir(path.join(tmpHome, ".gg"), { recursive: true });
   await fs.writeFile(
@@ -58,8 +58,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  restoreHome?.();
   await fs.rm(tmpHome, { recursive: true, force: true });
   await fs.rm(tmpProject, { recursive: true, force: true });
   vi.clearAllMocks();

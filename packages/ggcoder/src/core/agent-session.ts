@@ -54,7 +54,7 @@ import {
 } from "./model-registry.js";
 import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
-import { buildSystemPrompt } from "../system-prompt.js";
+import { buildSystemPrompt, type SystemPromptEnvironment } from "../system-prompt.js";
 import {
   createTools,
   createWebSearchTool,
@@ -92,12 +92,24 @@ import {
   type CycleDetection,
 } from "./loop-breaker.js";
 import { buildRegroundingMessage } from "./regrounding.js";
-import { wrapSteeringText, STEERING_PREFIX } from "./steering.js";
+import { wrapSteeringText, buildNotificationSteeringText, STEERING_PREFIX } from "./steering.js";
+import { AgentNotificationQueue } from "./agent-notifications.js";
+import { ProjectJournal, buildJournalPromptTail } from "./memory/journal.js";
+import { buildCompactionNotes } from "./memory/compaction-notes.js";
+
 import { findUserSessionPrompt, getUserSessionPrompt } from "./session-preview.js";
 import { normalizeMessageImages } from "./message-images.js";
 import crypto from "node:crypto";
 import fs from "node:fs/promises";
+import type { Stats } from "node:fs";
+import os from "node:os";
 import path from "node:path";
+
+/**
+ * A run whose tool calls fail more often than this is thrashing, not
+ * progressing — refuse to extend its turn budget.
+ */
+const TURN_EXTENSION_MAX_FAILURE_RATIO = 0.5;
 
 // ── Options ────────────────────────────────────────────────
 
@@ -124,6 +136,13 @@ export interface AgentSessionOptions {
   continueRecent?: boolean;
   maxTokens?: number;
   maxTurns?: number;
+  /**
+   * How many times the turn budget may be extended when the agent is still
+   * making progress. Defaults to the agent-loop default (2); sub-agents pass a
+   * stricter cap because a child's extensions multiply against the parent's
+   * own budget.
+   */
+  maxTurnExtensions?: number;
   thinkingLevel?: ThinkingLevel;
   signal?: AbortSignal;
   /** Prefix used for provider prompt-cache routing keys. */
@@ -252,6 +271,24 @@ export function resolveSessionTurnToolResultCharLimit(
   return Math.max(100_000, Math.min(Math.floor(contextChars * 0.15), 240_000));
 }
 
+/** Marker the compactor prepends to the summary message it injects. */
+const COMPACTION_SUMMARY_MARKER = "[Previous conversation summary]";
+
+/** The compactor's summary text, identified by its marker. */
+function isCompactionSummary(content: Message["content"]): content is string {
+  return typeof content === "string" && content.startsWith(COMPACTION_SUMMARY_MARKER);
+}
+
+/**
+ * True when an assistant message ends a turn with tool calls still awaiting
+ * their results. Inserting a user message there would orphan the tool_use
+ * blocks and the provider rejects the next request.
+ */
+function hasUnresolvedToolCalls(message: Message): boolean {
+  if (typeof message.content === "string" || !Array.isArray(message.content)) return false;
+  return message.content.some((part) => part.type === "tool_call");
+}
+
 // ── State ──────────────────────────────────────────────────
 
 export interface AgentSessionState {
@@ -346,6 +383,18 @@ export class AgentSession {
   private processManager?: ProcessManager;
   private lspManager?: LspManager;
   private subAgentManager?: SubAgentManager;
+  /**
+   * Out-of-band push notifications (finished children, background-process
+   * progress). Producers enqueue; `getHookSteeringMessages` drains into the
+   * live turn so the agent never has to spend a turn asking.
+   */
+  private readonly notifications = new AgentNotificationQueue();
+  /**
+   * Durable cross-session journal at `<project>/.gg/memory.md`. Written only by
+   * the compactor, and only as past-tense history — see `memory/journal.ts` for
+   * why nothing else may write it. Undefined when `memoryEnabled` is off.
+   */
+  private journal?: ProjectJournal;
   private managerAbortSignal?: AbortSignal;
   private readonly managerAbortHandler = () => {
     void this.subAgentManager?.interruptAll();
@@ -373,6 +422,8 @@ export class AgentSession {
    *  set, the system prompt carries the `[DONE:n]` progress contract so the
    *  model emits step-completion markers the UI's plan-progress widget reads. */
   private approvedPlanPath?: string;
+  /** Extra workspace roots added with `/add-dir` (resolved, de-duplicated). */
+  private additionalRoots: string[] = [];
 
   private sessionId = "";
   /** Stable identity shared by compaction and approved-plan checkpoint files. */
@@ -449,6 +500,13 @@ export class AgentSession {
     this.authStorage = new AuthStorage(paths.authFile);
     await this.authStorage.load();
 
+    // Opt-in: it is the only feature here that adds tokens to every turn.
+    // Transient sessions (Ken, sub-agents) never write a project's journal —
+    // their compactions are not the project's history.
+    if (this.settingsManager.get("memoryEnabled") && !this.opts.transient) {
+      this.journal = new ProjectJournal(this.cwd);
+    }
+
     // Session manager. Agent-specific roots keep chat and coder histories isolated.
     this.sessionManager = new SessionManager(this.opts.sessionRootDir ?? paths.sessionsDir);
 
@@ -492,6 +550,11 @@ export class AgentSession {
       lspDiagnostics: this.settingsManager.get("lspDiagnostics"),
       getWriteGuardSettings: () => ({
         allowOutsideWorkspaceWrites: this.settingsManager.get("allowOutsideWorkspaceWrites"),
+        additionalRoots: this.additionalRoots,
+      }),
+      getNetworkPolicy: () => ({
+        mode: this.settingsManager.get("networkMode"),
+        allow: this.settingsManager.get("networkAllow"),
       }),
       authStorage: this.authStorage,
       onFileRead: (filePath) => this.reviewCoverage.recordRead(filePath),
@@ -510,6 +573,7 @@ export class AgentSession {
       getMaxPerModel: () => this.settingsManager.get("subagentMaxPerModel"),
       disableAsyncSubagents: this.opts.subagentWorker,
       onSubAgentState: (snapshot) => this.eventBus.emit("subagent_state", snapshot),
+      notifications: this.notifications,
       // Plan mode: only wired when the host supplies callbacks. The ref is
       // shared so bash/edit/write enforce read-only restrictions live.
       ...(this.opts.onEnterPlan || this.opts.onExitPlan
@@ -556,10 +620,10 @@ export class AgentSession {
         this.tools.map((tool) => tool.name),
         undefined,
         this.provider,
+        this.promptEnvironment(),
       ));
     this.baseSystemPrompt = basePrompt;
     this.messages = [{ role: "system", content: this.withSystemPromptTail(basePrompt) }];
-    this.syncUltraOrchestrationPrompt();
 
     // Load or create session. Transient sessions (subagent spawns) never
     // touch the session store — sessionPath stays empty and persistMessage
@@ -987,12 +1051,33 @@ export class AgentSession {
   }
 
   /**
-   * Mid-loop steering hook: fires the loop-breaker when the agent looks stuck,
-   * then post-compaction re-grounding. At most one of each per run. Mirrors the
-   * TUI's getSteeringMessages ordering (minus user steering, which the app
-   * delivers as normal prompts).
+   * Mid-loop steering hook: delivers pushed notifications and queued user
+   * steering, fires the loop-breaker when the agent looks stuck, then
+   * post-compaction re-grounding. At most one loop-break/re-grounding per run.
+   * Mirrors the TUI's getSteeringMessages ordering.
    */
   private getHookSteeringMessages(): Message[] | null {
+    // Push notifications: a child that finished or a background build that
+    // exited is new *fact*, not a correction, and it is cheap (bounded to 1 KiB
+    // per drain). Drained above the loop-break checks so the agent can act on
+    // it in the very next turn instead of discovering it at the pre-stop
+    // completion gate — but it never displaces user steering, which rides out
+    // in the same batch when both are pending.
+    const notified = this.notifications.drain();
+    const notificationMessage: Message | null =
+      notified.length > 0
+        ? {
+            role: "user",
+            content: buildNotificationSteeringText(notified.map((entry) => entry.text)),
+          }
+        : null;
+    if (notificationMessage) {
+      log("INFO", "notifications", "Injecting pushed notifications", {
+        count: String(notified.length),
+        chars: String(notificationMessage.content.length),
+      });
+    }
+
     // User steering wins: drain any messages queued during this run first so the
     // agent sees them mid-loop instead of after it stops.
     if (this.userQueue.length > 0) {
@@ -1002,7 +1087,7 @@ export class AgentSession {
       // the original task and silently drops it. ONE message per queued item
       // (not merged): each persists as its own user message, so a resumed
       // session shows the same number of bubbles the live run did.
-      return queued.map((m): Message => {
+      const steeringMessages = queued.map((m): Message => {
         if (m.attachments.length === 0) {
           return { role: "user", content: wrapSteeringText(m.text) };
         }
@@ -1014,7 +1099,9 @@ export class AgentSession {
         ];
         return { role: "user", content: parts };
       });
+      return notificationMessage ? [...steeringMessages, notificationMessage] : steeringMessages;
     }
+    if (notificationMessage) return [notificationMessage];
     if (this.opts.selfCorrectionHooks === false) return null;
     if (!this.settingsManager.get("idealReviewEnabled")) return null;
     // Two-stage loop-breaker: stage 1 nudges; a FRESH detection after that
@@ -1053,6 +1140,51 @@ export class AgentSession {
       return [buildRegroundingMessage(this.originalRequest)];
     }
     return null;
+  }
+
+  /**
+   * Turn-budget extension gate. The loop consults this instead of stopping
+   * mid-task when it exhausts `maxTurns`. Grant ONLY on evidence of progress —
+   * handing more turns to a spinning agent just buys it more tokens to spin
+   * with — so reuse the same stuck signals that drive the loop-breaker.
+   */
+  private shouldExtendTurnBudget(ctx: {
+    turn: number;
+    maxTurns: number;
+    extension: number;
+  }): boolean {
+    const refusals: string[] = [];
+
+    const stuck = evaluateLoopBreak({
+      consecutiveFailures: this.hookConsecutiveFailures,
+      repeatedNoProgressCalls: this.hookRepeatedNoProgressCalls,
+      textRepetitionDetected: detectTextRepetition(this.hookText),
+      ...(this.hookCyclicPattern ? { cyclicPattern: this.hookCyclicPattern } : {}),
+    });
+    if (stuck.shouldBreak) refusals.push(...stuck.reasons);
+
+    // Stage 2 means the loop-breaker already detected spinning twice and told
+    // the agent to stop and report. Do not overrule that with more turns.
+    if (this.loopBreakInjected >= 2) refusals.push("loop-breaker already escalated");
+
+    const { toolCalls, toolFailures } = this.hookStats;
+    if (toolCalls > 0 && toolFailures / toolCalls > TURN_EXTENSION_MAX_FAILURE_RATIO) {
+      refusals.push(`${toolFailures}/${toolCalls} tool calls failed`);
+    }
+
+    const granted = refusals.length === 0;
+    log(
+      "INFO",
+      "turn-budget",
+      granted ? "Extending turn budget" : "Refusing turn-budget extension",
+      {
+        turn: String(ctx.turn),
+        maxTurns: String(ctx.maxTurns),
+        extension: String(ctx.extension),
+        ...(granted ? {} : { reasons: refusals.join(", ") }),
+      },
+    );
+    return granted;
   }
 
   /**
@@ -1239,6 +1371,7 @@ export class AgentSession {
         webSearch: true,
         maxTokens: this.maxTokens,
         maxTurns: this.opts.maxTurns,
+        maxTurnExtensions: this.opts.maxTurnExtensions,
         thinking: this.thinkingLevel,
         apiKey,
         baseUrl: effectiveBaseUrl,
@@ -1272,6 +1405,7 @@ export class AgentSession {
         // polled mid-loop; the ideal review is polled when the agent would stop.
         getSteeringMessages: () => this.getHookSteeringMessages(),
         getFollowUpMessages: () => this.getHookFollowUpMessages(),
+        onTurnBudgetExhausted: (ctx) => this.shouldExtendTurnBudget(ctx),
         // Check authoritative provider usage before every model/tool step.
         // Forced overflow recovery bypasses settings and cooldown; proactive
         // checks honor both and estimate only messages unseen by the provider.
@@ -1470,6 +1604,11 @@ export class AgentSession {
 
   async switchModel(provider: string, model: string): Promise<void> {
     const prevProvider = this.provider;
+    const prevModel = this.model;
+    // Diff gate: a "switch" to the model already in use is not state change.
+    // Recording it anyway would write a redundant marker and a redundant
+    // history note on every no-op re-selection from the UI.
+    const changed = model !== prevModel || (Boolean(provider) && provider !== prevProvider);
     if (provider) this.provider = provider as Provider;
     this.model = model;
     this.providerContext = null;
@@ -1477,7 +1616,6 @@ export class AgentSession {
     // the live selection after an in-session model switch.
     this.opts.provider = this.provider;
     this.opts.model = this.model;
-    this.syncUltraOrchestrationPrompt();
     setEstimatorModel(model);
     // maxTokens must follow the active model — it was frozen at the boot
     // model's `maxOutputTokens` in the constructor, so without this a session
@@ -1500,6 +1638,29 @@ export class AgentSession {
       this.tools = this.tools.map((t) => (t.name === "read" ? newReadTool : t));
     }
 
+    // Model-dependent guidance lives in the uncached tail, so this rewrites
+    // only the bytes after the cache marker — the cached prefix survives the
+    // switch intact and the next turn still reads from cache.
+    this.refreshSystemPromptTail();
+
+    if (changed) {
+      // Durable, replayable record of which model produced which segment. Rides
+      // the existing app-marker path (parentId null, anchored by message count)
+      // so a resumed session reconstructs the switch without the LLM seeing an
+      // extra transcript row.
+      await this.persistAppMarker("model_switch", {
+        from: prevModel,
+        to: this.model,
+        provider: this.provider,
+        fromProvider: prevProvider,
+      }).catch((error) => {
+        log("WARN", "session", "Failed to persist model-switch marker", {
+          error: error instanceof Error ? error.message : String(error),
+        });
+      });
+      this.appendModelSwitchNote(prevModel, prevProvider);
+    }
+
     // Update provider-specific tools when provider changes
     if (provider && provider !== prevProvider) {
       // Add/remove client-side web_search tool based on provider.
@@ -1510,7 +1671,12 @@ export class AgentSession {
         this.tools = this.tools.filter((t) => t.name !== "web_search");
       } else if (this.provider !== "anthropic" && !hasWebSearch) {
         // Switching FROM anthropic — add client-side web_search
-        this.tools.push(createWebSearchTool());
+        this.tools.push(
+          createWebSearchTool(() => ({
+            mode: this.settingsManager.get("networkMode"),
+            allow: this.settingsManager.get("networkAllow"),
+          })),
+        );
       }
 
       // Reconnect MCP servers ONLY when GLM is involved on either side — GLM
@@ -1556,6 +1722,29 @@ export class AgentSession {
     }
   }
 
+  /**
+   * Record the switch as its own trailing message at the point it happened,
+   * rather than by rewriting the system prompt. Two reasons: the system prompt
+   * is the cached prefix and rewriting it costs a full cache write, and a
+   * resumed transcript can only attribute output to the right model if the
+   * switch sits in message order.
+   *
+   * Skipped before the conversation starts (nothing to disambiguate) and while
+   * an assistant turn has unresolved tool calls, where inserting a user message
+   * would break tool_use/tool_result pairing.
+   */
+  private appendModelSwitchNote(prevModel: string, prevProvider: Provider): void {
+    const last = this.messages[this.messages.length - 1];
+    if (!last || last.role === "system") return;
+    if (last.role === "assistant" && hasUnresolvedToolCalls(last)) return;
+    const from = prevProvider === this.provider ? prevModel : `${prevProvider}/${prevModel}`;
+    const to = prevProvider === this.provider ? this.model : `${this.provider}/${this.model}`;
+    this.messages.push({
+      role: "user",
+      content: `[Model switched from ${from} to ${to}. Everything above was produced under the previous model; continue the current task from here.]`,
+    });
+  }
+
   async compact(existingCredentials?: {
     accessToken: string;
     accountId?: string;
@@ -1573,6 +1762,7 @@ export class AgentSession {
       accountId: creds.accountId,
     });
     this.eventBus.emit("compaction_start", { messageCount: this.messages.length });
+    const messagesBefore = [...this.messages];
 
     const result = await compact(this.messages, {
       provider: this.provider,
@@ -1585,6 +1775,10 @@ export class AgentSession {
       signal: this.opts.signal,
     });
 
+    // Messages the summary is about to replace, identified by reference:
+    // compaction keeps the retained tail as the same objects it was handed.
+    const retained = new Set(result.messages);
+    const droppedMessages = messagesBefore.filter((message) => !retained.has(message));
     this.messages = result.messages;
     this.lastCompactionCompacted = result.result.compacted;
 
@@ -1598,6 +1792,7 @@ export class AgentSession {
     }
 
     this.providerContext = null;
+    await this.writeCompactionJournal(droppedMessages);
 
     // Transient sessions (Ken chat/autopilot, subagent spawns) must NEVER touch
     // the session store: without this guard, the first auto-compaction called
@@ -1673,10 +1868,10 @@ export class AgentSession {
         this.tools.map((tool) => tool.name),
         undefined,
         this.provider,
+        this.promptEnvironment(),
       ));
     this.baseSystemPrompt = basePrompt;
     this.messages = [{ role: "system", content: this.withSystemPromptTail(basePrompt) }];
-    this.syncUltraOrchestrationPrompt();
     // Fresh conversation — new entries must not chain onto the old DAG's leaf.
     this.currentLeafId = null;
     // Transient sessions (Ken chat/autopilot, subagent spawns) never touch the
@@ -1838,7 +2033,6 @@ export class AgentSession {
     } else {
       this.messages.unshift({ role: "system", content });
     }
-    this.syncUltraOrchestrationPrompt();
   }
 
   /**
@@ -1866,6 +2060,71 @@ export class AgentSession {
     await this.rebuildSystemPromptInPlace();
   }
 
+  /** Extra workspace roots added with `/add-dir`, in the order added. */
+  getAdditionalRoots(): string[] {
+    return [...this.additionalRoots];
+  }
+
+  /**
+   * Add another workspace root. Tools already accept absolute paths, so this
+   * only widens the write guard and tells the model the root exists. Rebuilding
+   * the system prompt costs one cache-miss turn — the alternative (an uncached
+   * suffix) would drift from the tool behaviour it describes.
+   *
+   * @returns the resolved root, or an error message for the user.
+   */
+  async addDirectory(
+    dir: string,
+  ): Promise<{ ok: true; root: string } | { ok: false; error: string }> {
+    const resolved = path.resolve(this.cwd, dir.replace(/^~(?=[/\\]|$)/, os.homedir()));
+    let stat: Stats;
+    try {
+      stat = await fs.stat(resolved);
+    } catch {
+      return { ok: false, error: `Not found: ${resolved}` };
+    }
+    if (!stat.isDirectory()) return { ok: false, error: `Not a directory: ${resolved}` };
+
+    const covered = [this.cwd, ...this.additionalRoots].some((root) => {
+      const relative = path.relative(path.resolve(root), resolved);
+      return relative === "" || (!relative.startsWith("..") && !path.isAbsolute(relative));
+    });
+    if (covered) return { ok: false, error: `Already in the workspace: ${resolved}` };
+
+    // Drop roots the new one subsumes so the list stays minimal.
+    this.additionalRoots = this.additionalRoots.filter((root) => {
+      const relative = path.relative(resolved, path.resolve(root));
+      return relative.startsWith("..") || path.isAbsolute(relative);
+    });
+    this.additionalRoots.push(resolved);
+    await this.rebuildSystemPromptInPlace();
+    return { ok: true, root: resolved };
+  }
+
+  /** Remove an exact root previously added with `/add-dir`. */
+  async removeDirectory(
+    dir: string,
+  ): Promise<{ ok: true; root: string } | { ok: false; error: string }> {
+    const resolved = path.resolve(this.cwd, dir.replace(/^~(?=[/\\]|$)/, os.homedir()));
+    const index = this.additionalRoots.findIndex((root) => path.resolve(root) === resolved);
+    if (index === -1) {
+      return { ok: false, error: `Not an additional workspace root: ${resolved}` };
+    }
+
+    this.additionalRoots.splice(index, 1);
+    await this.rebuildSystemPromptInPlace();
+    return { ok: true, root: resolved };
+  }
+
+  /** Environment facts that vary per session rather than per host. */
+  private promptEnvironment(): SystemPromptEnvironment {
+    const networkAllow =
+      this.settingsManager.get("networkMode") === "allowlist"
+        ? this.settingsManager.get("networkAllow")
+        : [];
+    return { additionalRoots: this.additionalRoots, networkAllow };
+  }
+
   /** Rebuild messages[0] from current plan-mode + approved-plan state. */
   private async rebuildSystemPromptInPlace(): Promise<void> {
     if (this.customSystemPrompt) return;
@@ -1877,6 +2136,7 @@ export class AgentSession {
       this.tools.map((tool) => tool.name),
       undefined,
       this.provider,
+      this.promptEnvironment(),
     );
     this.baseSystemPrompt = rebuilt;
     const content = this.withSystemPromptTail(rebuilt);
@@ -1885,18 +2145,59 @@ export class AgentSession {
     } else {
       this.messages.unshift({ role: "system", content });
     }
-    this.syncUltraOrchestrationPrompt();
   }
 
+  /**
+   * Compose the system message: stable prefix, then everything volatile behind
+   * the `<!-- uncached -->` marker that providers split on for cache control.
+   *
+   * Anything that varies with the live model/provider/thinking level belongs in
+   * the tail. Putting it in the prefix means every model switch rewrites cached
+   * bytes and the next turn pays a full cache write instead of a read.
+   */
   private withSystemPromptTail(basePrompt: string): string {
-    if (!this.opts.getSystemPromptTail) return basePrompt;
-    return `${basePrompt}\n\n<!-- uncached -->\n${this.opts.getSystemPromptTail()}`;
+    const tailParts: string[] = [];
+    const orchestration = this.orchestrationPolicyTail();
+    if (orchestration) tailParts.push(orchestration);
+    // Journal is re-read on every refresh, so an entry written this turn (or a
+    // human edit to .gg/memory.md) is visible on the next one. Uncached by
+    // construction: it changes as work proceeds and must never sit in the
+    // cached prefix.
+    if (this.journal) {
+      const journalTail = buildJournalPromptTail(this.journal);
+      if (journalTail) tailParts.push(journalTail);
+    }
+    const hostTail = this.opts.getSystemPromptTail?.();
+    if (hostTail) tailParts.push(hostTail);
+    if (tailParts.length === 0) return basePrompt;
+    return `${basePrompt}\n\n<!-- uncached -->\n${tailParts.join("\n\n")}`;
   }
 
+  /**
+   * Sol/Terra async-orchestration guidance for the CURRENT model and thinking
+   * level. Per-switch volatile by definition, so it is rendered as a tail part
+   * rather than spliced into the cached prefix.
+   */
+  private orchestrationPolicyTail(): string {
+    if (this.opts.orchestrationPrompt === false) return "";
+    return applyAsyncSubagentPolicy(
+      "",
+      this.provider,
+      this.model,
+      this.thinkingLevel,
+      this.tools.map((tool) => tool.name),
+    ).trim();
+  }
+
+  /**
+   * Re-render the uncached tail of messages[0] in place. The cached prefix is
+   * byte-identical afterwards, so this is safe to call on every model /
+   * thinking-level change.
+   */
   private refreshSystemPromptTail(): void {
-    if (!this.opts.getSystemPromptTail) return;
     const content = this.withSystemPromptTail(this.baseSystemPrompt);
     if (this.messages[0]?.role === "system") {
+      if (this.messages[0].content === content) return;
       this.messages[0] = { role: "system", content };
     } else {
       this.messages.unshift({ role: "system", content });
@@ -2087,6 +2388,32 @@ export class AgentSession {
     await this.sessionManager.appendEntry(this.sessionPath, entry);
   }
 
+  /**
+   * Record what this compaction is about to discard as past-tense journal
+   * entries. Compaction is one-way — without this the specifics are gone for
+   * good, which is precisely the hole the journal exists to fill. No-op when
+   * memory is off, and bounded to a few entries so the file stays readable.
+   */
+  private async writeCompactionJournal(dropped: Message[]): Promise<void> {
+    if (!this.journal || dropped.length === 0) return;
+    const summary = this.messages.map((message) => message.content).find(isCompactionSummary) ?? "";
+    const notes = buildCompactionNotes(dropped, summary);
+    if (notes.length === 0) return;
+    try {
+      const written = await this.journal.append(notes);
+      if (written > 0) {
+        log("INFO", "memory", "Recorded compaction history", {
+          entries: String(written),
+          file: this.journal.filePath,
+        });
+      }
+    } catch (error) {
+      log("WARN", "memory", "Failed to write journal entries", {
+        error: error instanceof Error ? error.message : String(error),
+      });
+    }
+  }
+
   /** Re-append the in-memory app markers to the current session file. Mirrors
    *  `rePersistKenTurns` — called after a continuation/compaction file is
    *  created so display-only rows survive the rewrite. */
@@ -2146,22 +2473,7 @@ export class AgentSession {
    * effect on the next prompt, since the in-flight loop reads it at start. */
   setThinkingLevel(level: ThinkingLevel | undefined): void {
     this.thinkingLevel = level;
-    this.syncUltraOrchestrationPrompt();
-  }
-
-  /** Sol/Terra Ultra delegates proactively; lower levels require an explicit request. */
-  private syncUltraOrchestrationPrompt(): void {
-    if (this.opts.orchestrationPrompt === false) return;
-    const systemMessage = this.messages[0];
-    if (systemMessage?.role !== "system" || typeof systemMessage.content !== "string") return;
-
-    systemMessage.content = applyAsyncSubagentPolicy(
-      systemMessage.content,
-      this.provider,
-      this.model,
-      this.thinkingLevel,
-      this.tools.map((tool) => tool.name),
-    );
+    this.refreshSystemPromptTail();
   }
 
   /** Replace the abort signal (e.g. after cancellation). */
@@ -2426,6 +2738,9 @@ export class AgentSession {
         );
         return `${branches.length} branch(es):\n${lines.join("\n")}`;
       },
+      addDirectory: (dir) => this.addDirectory(dir),
+      removeDirectory: (dir) => this.removeDirectory(dir),
+      getAdditionalRoots: () => this.getAdditionalRoots(),
     };
   }
 }

@@ -1,5 +1,6 @@
 import { existsSync } from "node:fs";
 import path from "node:path";
+import { toPosixPath } from "../tools/path-utils.js";
 import type { Message } from "@kenkaiiii/gg-ai";
 
 export interface IdealReviewStats {
@@ -77,8 +78,12 @@ export class ReviewCoverageTracker {
 
   private display(filePath: string): string {
     const relative = path.relative(this.cwd, filePath);
+    // Forward-slashed: this string is shown to the model and matched against
+    // the paths it echoes back, which are always forward-slashed. A native
+    // `src\a.ts` on Windows never matched the model's `src/a.ts`, so review
+    // coverage counted every changed file as unread.
     return relative && !relative.startsWith(`..${path.sep}`) && relative !== ".."
-      ? relative
+      ? toPosixPath(relative)
       : filePath;
   }
 }

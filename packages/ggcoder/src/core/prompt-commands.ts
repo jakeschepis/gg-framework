@@ -3,6 +3,8 @@
  * into the agent loop. Each command maps to a full prompt the agent executes.
  */
 
+import { isGgApp } from "./runtime-mode.js";
+
 export interface PromptCommand {
   name: string;
   aliases: string[];
@@ -10,22 +12,18 @@ export interface PromptCommand {
   prompt: string;
 }
 
-/**
- * True when this process is the gg-app sidecar (Tauri spawns it with
- * `GG_APP_PORT` set, even to "0" — plain `ggcoder` CLI never sets it). Used
- * to phrase user-facing notices (restart / task-list pointers) in terms of
- * the desktop app's UI instead of CLI keybinds, since most users are on the
- * app now and it has no terminal keybinds at all.
- */
-const IS_GG_APP = process.env.GG_APP_PORT !== undefined;
+const IS_GG_APP = isGgApp();
 
 const TASKS_ADDED_NOTICE = IS_GG_APP
   ? 'Tasks added. Click the "Tasks" button to open the task list and run them.'
   : "Tasks added. Press Ctrl+T to open the task list and run them.";
 
+// The context file is whichever name won CONTEXT_FILES priority for this repo
+// (AGENTS.override.md > AGENTS.md > CLAUDE.md > …), so the notice stays
+// filename-agnostic — /init picks the winner at run time.
 const CLAUDE_MD_RESTART_NOTICE = IS_GG_APP
-  ? '> ⚠️ CLAUDE.md was created/updated. GG App loads it fresh per session, so start a **New Session** (click "+ New") before continuing. Without a new session, I won\'t see the new context.'
-  : "> ⚠️ CLAUDE.md was created/updated. ggcoder loads it at startup, so **exit and restart ggcoder** (`/quit` then run `ggcoder` again) before continuing. Without a restart, I won't see the new context.";
+  ? '> ⚠️ The project context file was created/updated. GG App loads it fresh per session, so start a **New Session** (click "+ New") before continuing. Without a new session, I won\'t see the new context.'
+  : "> ⚠️ The project context file was created/updated. ggcoder loads it at startup, so **exit and restart ggcoder** (`/quit` then run `ggcoder` again) before continuing. Without a restart, I won't see the new context.";
 
 /**
  * Shared sub-agent fan-out phrasing. One home so the "call the tool N times
@@ -33,6 +31,15 @@ const CLAUDE_MD_RESTART_NOTICE = IS_GG_APP
  */
 const spawnParallel = (count: string | number): string =>
   `in parallel using the subagent tool (call the subagent tool ${count} times in a single response)`;
+
+/**
+ * Kencode-search ships behind deferred MCP loading (`deferredMcpTools` defaults
+ * to true), so its tools sit in the `tool_search` catalog until promoted. Any
+ * command that names an `mcp__kencode-search__*` tool must say how to unlock it,
+ * or the call fails on a default install.
+ */
+const KENCODE_UNLOCK_NOTE =
+  'If the `mcp__kencode-search__*` tools aren\'t active yet, call `tool_search` (e.g. "search public code") first to unlock them.';
 
 export const PROMPT_COMMANDS: PromptCommand[] = [
   {
@@ -84,7 +91,7 @@ For every candidate from the sub-agents, validate it yourself before reporting:
 1. Confirm the external source is relevant to this project and fresh enough (normally within 6 months).
 2. Search this repo with grep/find and language-aware anchors to confirm the feature is not already present under another name.
 3. Check routes, CLI commands, UI surfaces, package exports, config, docs, and examples before calling a feature missing.
-4. Use mcp__kencode-search__searchCode when a code-level look clarifies how peers actually ship the feature. Use literal imports, functions, config keys, CLI flags, route names, or package names — not conceptual phrases.
+4. Use mcp__kencode-search__searchCode when a code-level look clarifies how peers actually ship the feature. Use literal imports, functions, config keys, CLI flags, route names, or package names — not conceptual phrases. ${KENCODE_UNLOCK_NOTE}
 5. Drop anything already present, irrelevant, too vague, too stale, or that is not a real user-facing feature.
 6. Merge duplicates and keep only the most exciting 5–10 features.
 
@@ -316,60 +323,76 @@ Defensive reference material from public incident reports and OWASP — patterns
     name: "init",
     aliases: [],
     description: "Generate or update CLAUDE.md for this project",
-    prompt: `Generate or update a minimal CLAUDE.md with project-specific context only: what this project is, how it is structured, and commands/workflows that are unique to it.
+    prompt: `Generate or update the project context file with project-specific context only: what this project is, the non-obvious knowledge needed to change it safely, and the workflows that are unique to it.
 
-Do NOT add generic agent behavior already covered by the system prompt, including: read before edit/write, re-read after formatters, ask before destructive actions, no fake verification, generic code-quality advice, single-responsibility rules, one-file-per-component rules, or language-style conventions. Never add guidance that requires running checks, builds, or the full quality suite after every edit or every file change. Include only project-specific overrides or stricter local requirements.
+This file is injected verbatim into the **cached prefix of every request in every future session**, alongside the system prompt. Every line costs tokens forever. A line that repeats something the agent already has is worse than absent: it dilutes the lines that matter. So the bar is not "is this true?" — it is **"would a competent agent get this wrong without being told?"**
 
-## Step 1: Check if CLAUDE.md Exists
+## What is already in the agent's context — never restate any of it
 
-If CLAUDE.md exists:
-- Read the existing file
-- Preserve custom sections the user may have added
-- Update only project-specific facts that are stale or missing
-- Remove generic guidance that is already covered by the system prompt unless it is a deliberate project-specific override
+Read this list once and apply it to every step below. These are already supplied by the system prompt, so writing them into the context file is pure duplication:
 
-If CLAUDE.md does NOT exist:
-- Create a new one from scratch
+1. **Agent behavior** — Do NOT add generic agent behavior already covered by the system prompt: read before edit/write, re-read after formatters, ask before destructive actions, no fake verification, generic code-quality advice, how to use tools, or how to talk to the user.
+2. **Language conventions** — a Language Style Packs section is auto-injected for every language detected in this repo. Do not duplicate language style packs, generic verification rules, or boilerplate quality gates such as "After editing ANY file" / "Code Quality — Zero Tolerance".
+3. **Verify commands** — a Verification section is auto-generated from package scripts / manifests (lint, typecheck, format, test) with the correct runner already resolved from the lockfile. Only write a command down if it is NOT discoverable that way: an undocumented multi-step sequence, a required ordering, a non-obvious flag, or a command that lives outside the manifest. Never add guidance that requires running checks, builds, or the full quality suite after every edit or every file change, and never turn discovered commands into mandatory after-every-edit requirements unless local CI explicitly enforces that sequence.
+4. **The file tree** — the agent can list and grep the repo in one call. Do NOT embed generated symbol maps, exhaustive file indexes, auto-generated directory listings, or large trees. Do not add symbol indexes or auto-generated project inventories; the context file must remain durable, agent-focused project context.
 
-## Step 2: Analyze Project (Use Sub-agents in Parallel)
+Include only project-specific overrides, stricter local requirements, or knowledge that cannot be derived by reading the code.
 
-Derive every fact from the actual project — source code, entry points, manifests, and config. Treat README, docs, and code comments as unverified hints that are frequently stale: never copy claims from them, and only state things you can confirm from the code and config themselves.
+## Step 1: Pick the target filename
+
+Context files are loaded **one per directory, first match wins**, in this priority order: \`AGENTS.override.md\` > \`AGENTS.md\` > \`CLAUDE.md\` > \`.cursorrules\` > \`CONVENTIONS.md\`.
+
+List the repo root and write to **whichever of those already exists with the highest priority**. If the repo already has an \`AGENTS.md\`, update that file — creating a new CLAUDE.md next to it produces a file the agent will never load. If none exists, create \`CLAUDE.md\`. State which file you chose and why in one line.
+
+## Step 2: Set up the regenerated block
+
+\`/init\` is re-run over the project's lifetime, so the generated content must be **replaceable, not appendable** — otherwise each run grows the file forever.
+
+All content you generate goes inside these exact fence markers:
+
+\`\`\`
+<!-- gg:init:start -->
+…generated content…
+<!-- gg:init:end -->
+\`\`\`
+
+- If the file exists and already has the fence: **replace everything between the markers wholesale**. Text outside the fence is user-owned — do not touch it, do not reformat it, do not move it.
+- If the file exists without the fence: read it, decide which content is hand-written knowledge worth keeping, move that above the fence untouched, and put your generated content inside a new fence. Remove generic guidance that is already covered by the system prompt (see the list above) unless it is a deliberate project-specific override.
+- If the file does not exist: create it with the fence.
+
+## Step 3: Analyze the project (sub-agents in parallel)
+
+Derive every fact from the actual project — source code, entry points, manifests, config, and history. Treat README, docs, and code comments as unverified hints that are frequently stale: never copy claims from them, and only state things you can confirm from the code and config themselves.
 
 Spawn 3 sub-agents ${spawnParallel(3)}:
 
-1. **Project Purpose Agent**: Determine what the project actually does from its real code — entry points, main modules, exported/public APIs, CLI commands, routes, and manifests. Do not rely on the README's description.
-2. **Directory Structure Agent**: Map out the folder structure and what each folder contains
-3. **Tech Stack Agent**: Identify languages, frameworks, tools, and dependencies from manifests/lockfiles and config (not from prose docs)
+1. **Purpose & Shape Agent**: What does this project actually do, and what are its top-level parts? Read entry points, main modules, exported/public APIs, CLI commands, routes, and manifests. Return: a one-sentence purpose, and for each package/app/module a one-line statement of what it *owns*. Do not rely on the README's description. Do not return a directory listing.
+2. **Gotchas & Invariants Agent**: Find the knowledge that is expensive to rediscover. Mine \`git log\` (especially revert/fix/hotfix commits), CI and release workflows, \`NOTE\`/\`HACK\`/\`IMPORTANT\`/\`WARNING\`/\`XXX\` comments, test names asserting surprising behavior, generated-file and build-order constraints, and any config with a non-default value. Return only: rules that are non-obvious from reading the code, ordering/sequencing constraints, things that silently break, and the *reason* each exists. Skip anything a careful reader would infer in 30 seconds.
+3. **Workflow & Stack Agent**: How is this project run, built, released, and deployed, from authoritative sources only — package scripts, manifests, Makefiles, CI config, deploy config. Return the workflows and any command that is NOT a plain single manifest script (multi-step sequences, required order, env vars, non-obvious flags, commands living outside the manifest). Do not return commands the auto-generated Verification section already covers (see item 3 above). Do not invent commands from convention, and do not trust README/doc command snippets unless a script or manifest confirms they still exist.
 
-Wait for all sub-agents to complete, then synthesize the information.
+Wait for all sub-agents to complete, then synthesize.
 
-## Step 3: Detect Project Type & Commands
+## Step 4: Write the generated block
 
-Check for config files:
-- package.json -> JavaScript/TypeScript (extract package-manager, build, lint, typecheck, test, format, and server scripts)
-- pyproject.toml or requirements.txt -> Python
-- go.mod -> Go
-- Cargo.toml -> Rust
-
-Extract exact commands that are useful project facts. Take commands from authoritative sources — package scripts, manifests, Makefiles, and CI config; do not invent them from convention, and do not trust README/doc command snippets unless a script or manifest confirms they still exist. Do not restate generic "run checks after edits" behavior, and do not turn discovered commands into mandatory after-every-edit requirements unless local docs or CI explicitly require that stricter sequence.
-
-## Step 4: Summarize Stable Structure
-
-If useful, create a concise structure summary for future agents showing only key stable directories and files with brief descriptions. Do NOT embed generated symbol maps, exhaustive file indexes, auto-generated directory listings, or large trees in CLAUDE.md.
-
-## Step 5: Generate or Update CLAUDE.md
-
-Create CLAUDE.md with only sections that add project-specific value. Prefer this structure:
+Inside the fence, write only sections that add project-specific value. Prefer this order — drop any section that would be empty or obvious:
 
 - Project name and one-sentence purpose
-- Key packages/apps/modules and what each owns
-- Important project-specific architecture or workflow notes
-- Exact local commands (install/build/check/test/dev/publish/deploy) when they are not obvious from package scripts alone
-- Project-specific constraints that override defaults (for example required publish order, generated-file workflow, auth/secrets storage, deployment caveats)
+- Key packages/apps/modules and what each owns (one line each, no tree)
+- Architecture or data-flow notes an agent could not infer quickly from the code
+- **Gotchas / invariants** — the highest-value section. Each entry states the rule *and* why it exists.
+- Project-specific commands and workflows that survived the Step 3 filter (required publish order, generated-file workflow, dev-server startup, deployment caveats, auth/secrets storage)
 
-Avoid generic sections named "Code Quality", "Organization Rules", or "How to Work" unless every bullet is specific to this project. Do not duplicate language style packs, generic verification rules, or boilerplate quality gates such as "After editing ANY file" / "Code Quality — Zero Tolerance". Do not add symbol indexes, exhaustive file indexes, or auto-generated project inventories; CLAUDE.md must remain durable, agent-focused project context.
+Avoid generic sections named "Code Quality", "Organization Rules", or "How to Work" unless every bullet is specific to this project.
 
-Keep total file under 100 lines. If updating, preserve any custom sections the user added. After writing, re-read CLAUDE.md and confirm it contains only project-specific facts supported by local files.
+## Step 5: Budget and verify
+
+The combined budget for all project context files is 32KB, shared with any parent-directory context files. **Target 6KB or less for the generated block** — a tight 4KB file that gets read every time beats a 25KB file the agent skims.
+
+After writing:
+
+1. Run \`wc -c\` on the file and report the byte size. If the generated block exceeds ~6KB, cut the weakest sections (the ones closest to "derivable by reading the code") and rewrite.
+2. Re-read the file and confirm every remaining line passes the bar: **project-specific, supported by a local file you actually read, and not already in the agent's context per the list above.**
+3. Report in one line: which file, how many bytes, and how many lines you removed as redundant.
 
 ## Step 6: Restart Notice
 
@@ -446,6 +469,8 @@ Report that /commit is now available with quality checks, an agent code review g
     aliases: [],
     description: "Compare real-world code",
     prompt: `Compare the code you just created or modified in this conversation against real-world implementations using the \`mcp__kencode-search__searchCode\` tool.
+
+${KENCODE_UNLOCK_NOTE}
 
 You already know what you just built. For each file you created or modified, use \`mcp__kencode-search__searchCode\` to search for how real projects implement the same patterns. Look at the specific APIs, hooks, functions, and architecture you used.
 

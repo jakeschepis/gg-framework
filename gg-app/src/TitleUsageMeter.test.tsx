@@ -104,6 +104,71 @@ describe("TitleUsageMeter", () => {
     expect(meter.querySelector<HTMLElement>(".title-usage-fill")?.style.width).toBe("11%");
   });
 
+  it("keeps the last good snapshot when a refresh comes back unavailable", async () => {
+    getUsageMock
+      .mockResolvedValueOnce({
+        provider: "openai",
+        displayName: "Codex",
+        connected: true,
+        windows: [{ kind: "current", label: "5-hour", usedPercent: 22 }],
+        fetchedAt: Date.now(),
+      })
+      .mockResolvedValue({
+        provider: "openai",
+        displayName: "Codex",
+        connected: true,
+        windows: [],
+        fetchedAt: Date.now(),
+        error: "Usage is temporarily unavailable.",
+      });
+
+    render(<TitleUsageMeter currentProvider="openai" />);
+
+    await screen.findByRole("button", { name: /Codex 5-hour: 22% used/ });
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => expect(getUsageMock).toHaveBeenCalledTimes(2));
+    expect(screen.getByRole("button", { name: /Codex 5-hour: 22% used/ })).toBeDefined();
+  });
+
+  it("marks a replayed snapshot as last-known rather than live", async () => {
+    getUsageMock.mockResolvedValue({
+      provider: "openai",
+      displayName: "Codex",
+      connected: true,
+      windows: [{ kind: "current", label: "5-hour", usedPercent: 22 }],
+      fetchedAt: Date.now(),
+      stale: true,
+    });
+
+    render(<TitleUsageMeter currentProvider="openai" />);
+
+    const meter = await screen.findByRole("button", { name: /last known/ });
+    expect(meter.className).toContain("is-stale");
+  });
+
+  it("hides when the provider is no longer connected", async () => {
+    getUsageMock
+      .mockResolvedValueOnce({
+        provider: "openai",
+        displayName: "Codex",
+        connected: true,
+        windows: [{ kind: "current", label: "5-hour", usedPercent: 22 }],
+        fetchedAt: Date.now(),
+      })
+      .mockResolvedValue({
+        provider: "openai",
+        displayName: "Codex",
+        connected: false,
+        windows: [],
+        fetchedAt: Date.now(),
+      });
+
+    const { container } = render(<TitleUsageMeter currentProvider="openai" />);
+    await screen.findByRole("button", { name: /Codex 5-hour: 22% used/ });
+    window.dispatchEvent(new Event("focus"));
+    await waitFor(() => expect(container.firstChild).toBeNull());
+  });
+
   it("stays hidden for providers without subscription quota support", () => {
     const { container } = render(<TitleUsageMeter currentProvider="gemini" />);
     expect(container.firstChild).toBeNull();

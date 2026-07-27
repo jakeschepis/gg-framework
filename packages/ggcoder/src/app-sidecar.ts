@@ -67,6 +67,11 @@ import {
   restoreAssistantTexts,
   autopilotMarkerCopySeed,
 } from "./core/session-history.js";
+import {
+  sessionToMarkdown,
+  defaultExportFilename,
+  type ToolDetail,
+} from "./core/session-export.js";
 import { AuthStorage } from "./core/auth-storage.js";
 import { cleanupToolOutputs } from "./tools/overflow.js";
 import { readCappedBody } from "./utils/http-body.js";
@@ -75,9 +80,24 @@ import {
   MOONSHOT_OAUTH_KEY,
   SubscriptionUsageError,
   XIAOMI_CREDITS_KEY,
+  discoverLocalModels,
+  findProbedModel,
+  formatLocalModelId,
+  parseLocalModelId,
+  probeEndpoint,
+  toModelInfo as localModelInfo,
+  type LocalEndpoint,
+  type LocalEndpointProbe,
   type SubscriptionUsageProvider,
   type SubscriptionUsageSnapshot,
 } from "@kenkaiiii/gg-core";
+import {
+  LocalEndpointError,
+  addCustomEndpoint,
+  listAllEndpoints,
+  removeCustomEndpoint,
+  syncEndpointCredentials,
+} from "./core/local-endpoint-store.js";
 import { loginAnthropic } from "./core/oauth/anthropic.js";
 import { loginOpenAI } from "./core/oauth/openai.js";
 import { loginGemini } from "./core/oauth/gemini.js";
@@ -90,7 +110,9 @@ import {
   getModel,
   getDefaultThinkingLevel,
   getContextWindow,
-  MODELS,
+  getAllModels,
+  clearRuntimeModels,
+  registerRuntimeModels,
 } from "./core/model-registry.js";
 import { resolveStartOrFallback } from "./core/resolve-start.js";
 import { getGitBranch, getGitDirtyFileCount, isGitRepo } from "./utils/git.js";
@@ -550,6 +572,12 @@ async function searchProjectFiles(cwd: string, rawQuery: string): Promise<FileHi
  * hook prompt, by its distinctive opening phrase. Returns the hook kind so the
  * webview can render the short notice line instead of the full prompt body.
  */
+/** `?tools=` on /export. Anything unrecognised (including absent) falls back to
+ *  the human-facing `summary` default rather than dumping every payload. */
+function parseToolDetail(value: string | null): ToolDetail {
+  return value === "none" || value === "full" ? value : "summary";
+}
+
 function detectHookKind(text: string): "ideal" | "loop_break" | "regrounding" | null {
   const t = text.trimStart();
   if (t.startsWith("Ideal? Review the actual work")) return "ideal";
@@ -683,6 +711,7 @@ async function runJsonModeIfRequested(): Promise<boolean> {
       "max-turns": { type: "string" },
       "system-prompt": { type: "string" },
       tools: { type: "string" },
+      "mcp-servers": { type: "string" },
       "prompt-cache-key": { type: "string" },
     },
     allowPositionals: true,
@@ -699,6 +728,15 @@ async function runJsonModeIfRequested(): Promise<boolean> {
         .filter(Boolean)
     : [];
   const allowedTools = parsedTools.length > 0 ? parsedTools : undefined;
+  // MCP servers the agent definition asked for. Without forwarding these, an
+  // allow-listed child connects no MCP at all and loses live code search.
+  const parsedMcpServers = values["mcp-servers"]
+    ? values["mcp-servers"]
+        .split(",")
+        .map((s) => s.trim())
+        .filter(Boolean)
+    : [];
+  const allowedMcpServers = parsedMcpServers.length > 0 ? parsedMcpServers : undefined;
   await runJsonMode({
     message: positionals[0] ?? "",
     provider: (values.provider ?? "anthropic") as Provider,
@@ -707,6 +745,7 @@ async function runJsonModeIfRequested(): Promise<boolean> {
     systemPrompt: values["system-prompt"],
     maxTurns: maxTurnsRaw ? parseInt(maxTurnsRaw, 10) : undefined,
     allowedTools,
+    allowedMcpServers,
     promptCacheKey: values["prompt-cache-key"],
   }).catch(async (err: unknown) => {
     captureSidecarError(err, "app-sidecar.json-mode", {
@@ -848,7 +887,7 @@ async function main(): Promise<void> {
   });
 
   type UsageResult =
-    | (SubscriptionUsageSnapshot & { connected: true; error?: never })
+    | (SubscriptionUsageSnapshot & { connected: true; error?: never; stale?: boolean })
     | {
         provider: SubscriptionUsageProvider;
         displayName: string;
@@ -856,12 +895,20 @@ async function main(): Promise<void> {
         windows: [];
         fetchedAt: number;
         error?: string;
+        stale?: boolean;
       };
   const usageCache = new Map<
     SubscriptionUsageProvider,
     { expiresAt: number; result: UsageResult }
   >();
   const usageRequests = new Map<SubscriptionUsageProvider, Promise<UsageResult>>();
+  // Last snapshot that actually carried windows, per provider. Replayed while a
+  // fetch is failing so the title meter never blinks out of existence. Bounded
+  // by USAGE_LAST_GOOD_MAX_AGE_MS — a provider that never recovers must stop
+  // reporting rather than freeze a percentage (and a long-past reset time) on
+  // screen forever. The 429 backoff alone runs to 24h, far past any usefulness.
+  const usageLastGood = new Map<SubscriptionUsageProvider, UsageResult>();
+  const USAGE_LAST_GOOD_MAX_AGE_MS = 30 * 60_000;
   // 429 backoff: quota endpoints are auxiliary UI data. Honor Retry-After when
   // provided; otherwise retain the unavailable snapshot for 30 minutes. Clamp
   // the provider value so a malformed header can neither hammer the endpoint
@@ -878,6 +925,9 @@ async function main(): Promise<void> {
     // Moonshot platform API key is metered per-token, not per plan window.
     const authKey = provider === "moonshot" ? MOONSHOT_OAUTH_KEY : provider;
     if (!(await auth.hasProviderAuth(authKey))) {
+      // Logged out: drop the replay cache so a later login on a DIFFERENT
+      // account can never inherit the previous one's numbers.
+      usageLastGood.delete(provider);
       return { provider, displayName, connected: false, windows: [], fetchedAt: Date.now() };
     }
     try {
@@ -926,6 +976,17 @@ async function main(): Promise<void> {
       });
 
       const connected = await auth.hasProviderAuth(authKey);
+      // Transient failures (notably the 429s these auxiliary quota endpoints
+      // hand out) must not blank the meter. Keep serving the last good
+      // snapshot, flagged `stale`, so the bar stays put instead of flickering
+      // out for the whole backoff window and back in on the next success.
+      // Past the max age it's dropped — no data beats confidently wrong data.
+      const lastGood = usageLastGood.get(provider);
+      if (lastGood && Date.now() - lastGood.fetchedAt >= USAGE_LAST_GOOD_MAX_AGE_MS) {
+        usageLastGood.delete(provider);
+      } else if (connected && lastGood) {
+        return { ...lastGood, stale: true };
+      }
       return {
         provider,
         displayName,
@@ -946,6 +1007,11 @@ async function main(): Promise<void> {
     usageRequests.set(provider, request);
     try {
       const result = await request;
+      // Never re-store a replay — it would keep its original `fetchedAt`, but
+      // writing it back muddies the "last GOOD" contract for no gain.
+      if (result.connected && !result.error && !result.stale && result.windows.length > 0) {
+        usageLastGood.set(provider, result);
+      }
       // Anthropic can return utilization before it assigns reset timestamps
       // (notably before the account's first active request). Retry that partial
       // snapshot quickly; complete snapshots keep the normal one-minute cache.
@@ -1463,6 +1529,25 @@ async function createSession(
     );
   }
 
+  /**
+   * Guidance for a connection failure against the ACTIVE local endpoint, or
+   * undefined when that isn't the situation (so the generic wording stands).
+   * "Disable your VPN / allow us through the firewall" is useless advice for a
+   * server running on this machine — name what the user has to restart.
+   */
+  function localNetworkGuidance(source: string | undefined): string | undefined {
+    if (source !== "network") return undefined;
+    const state = session.getState();
+    if (state.provider !== "local") return undefined;
+    const parsed = parseLocalModelId(state.model);
+    const probe = localProbes.find((p) => p.endpoint.id === parsed?.endpointId);
+    if (!probe) return undefined;
+    return (
+      `${probe.endpoint.label} stopped responding at ${probe.endpoint.baseUrl}. ` +
+      "Start it again and retry, or pick another model."
+    );
+  }
+
   // Turn any thrown value into the same clear headline/message/guidance shape
   // the TUI shows (see gg-ai's formatError) instead of a bare `err.message`, log
   // the full detail, and broadcast it under `type` ("error" or "ken_error").
@@ -1476,7 +1561,7 @@ async function createSession(
   ): void {
     const f = formatError(err);
     const message = f.message ? desktopGuidance(f.message) : undefined;
-    const guidance = desktopGuidance(f.guidance);
+    const guidance = localNetworkGuidance(f.source) ?? desktopGuidance(f.guidance);
     captureSidecarError(err, `app-sidecar.${logLabel.replaceAll(" ", "-")}`, {
       scope: type,
       ...(f.provider ? { provider: f.provider } : {}),
@@ -1586,6 +1671,124 @@ async function createSession(
   }
   log("INFO", "app-sidecar", "session ready", { provider, model, mode, chatAgent, cwd });
 
+  // ── Local models (Ollama / LM Studio / llama.cpp / vLLM) ──
+  // Probing four HTTP endpoints must never delay readiness, so this runs in the
+  // background (same shape as backgroundMcpConnect) and pushes a models_change
+  // frame when it lands.
+  let localProbes: LocalEndpointProbe[] = [];
+
+  async function scanLocalModels(force: boolean): Promise<LocalEndpointProbe[]> {
+    const endpoints = await listAllEndpoints();
+    const { probes, models } = await discoverLocalModels(endpoints, { force });
+    localProbes = probes;
+    // Only endpoints that answered get a credential: writing one for a server
+    // that isn't running would make `hasProviderAuth("local")` true forever.
+    await syncEndpointCredentials(
+      probes.filter((probe) => probe.reachable).map((probe) => probe.endpoint),
+    );
+    clearRuntimeModels((m) => m.provider === "local");
+    registerRuntimeModels(models);
+    log("INFO", "app-sidecar", "local model scan", {
+      reachable: probes.filter((p) => p.reachable).length + "/" + probes.length,
+      models: String(models.length),
+    });
+    return probes;
+  }
+
+  /** Endpoint rows + models, in the shape the Local models UI renders. */
+  function localStatePayload(): {
+    endpoints: {
+      id: string;
+      label: string;
+      baseUrl: string;
+      kind: LocalEndpoint["kind"];
+      custom: boolean;
+      reachable: boolean;
+      reason?: string;
+      models: {
+        id: string;
+        rawId: string;
+        contextWindow: number;
+        contextWindowKnown: boolean;
+        supportsTools: boolean;
+        supportsImages: boolean;
+        supportsThinking: boolean;
+        loaded?: boolean;
+      }[];
+    }[];
+  } {
+    return {
+      endpoints: localProbes.map((probe) => ({
+        id: probe.endpoint.id,
+        label: probe.endpoint.label,
+        baseUrl: probe.endpoint.baseUrl,
+        kind: probe.endpoint.kind,
+        custom: probe.endpoint.custom === true,
+        reachable: probe.reachable,
+        ...(probe.reason ? { reason: probe.reason } : {}),
+        models: probe.models.map((m) => ({
+          id: formatLocalModelId(probe.endpoint.id, m.rawId),
+          rawId: m.rawId,
+          contextWindow: m.contextWindow,
+          contextWindowKnown: m.contextWindowKnown,
+          supportsTools: m.supportsTools,
+          supportsImages: m.supportsImages,
+          supportsThinking: m.supportsThinking,
+          ...(m.loaded === undefined ? {} : { loaded: m.loaded }),
+        })),
+      })),
+    };
+  }
+
+  /**
+   * Why `modelId` can't be selected right now, or `undefined` when it can.
+   * Two real footguns get a clear answer instead of a mid-run provider error:
+   * a model with no tool calling (can't drive the agent at all), and a server
+   * that has since been shut down.
+   */
+  async function localModelBlocker(modelId: string): Promise<string | undefined> {
+    const parsed = parseLocalModelId(modelId);
+    if (!parsed) return undefined;
+    const endpoints = await listAllEndpoints();
+    const endpoint = endpoints.find((e) => e.id === parsed.endpointId);
+    if (!endpoint)
+      return `Unknown local endpoint "${parsed.endpointId}" — re-scan for local models.`;
+
+    const probe = await probeEndpoint(endpoint);
+    // Keep the cached view honest: this probe is fresher than the last scan.
+    localProbes = localProbes.map((p) => (p.endpoint.id === endpoint.id ? probe : p));
+    if (!probe.reachable) {
+      return `${endpoint.label} isn't running at ${endpoint.baseUrl}. Start it and scan again.`;
+    }
+    const model = probe.models.find((m) => m.rawId === parsed.rawId);
+    if (!model) {
+      return `${endpoint.label} no longer serves "${parsed.rawId}".`;
+    }
+    if (!model.supportsTools) {
+      return `${parsed.rawId} has no tool calling, so it can't run the agent. Pick a tool-capable model.`;
+    }
+    registerRuntimeModels(probe.models.map((m) => localModelInfo(m, endpoint)));
+    return undefined;
+  }
+
+  /**
+   * A restored per-project pref can ask for thinking on a local model that
+   * turns out not to reason (capabilities are only known after a probe). Drop
+   * the level once we know, so the first prompt doesn't carry a
+   * `reasoning_effort` the server rejects.
+   */
+  function clampLocalThinking(): void {
+    const st = session.getState();
+    const level = session.getThinkingLevel();
+    if (!level || st.provider !== "local") return;
+    if (isThinkingLevelSupported(st.provider, st.model, level)) return;
+    session.setThinkingLevel(undefined);
+    broadcast("thinking_change", {
+      thinkingLevel: null,
+      supportedThinkingLevels: getSupportedThinkingLevels(st.provider, st.model),
+    });
+  }
+
   // Workspace extras (context window, git status, background tasks). Git state
   // is resolved once at startup and refreshed after every run; the context
   // window follows the active model.
@@ -1619,6 +1822,7 @@ async function createSession(
     gitHubPRs: number | null;
     gitHubRepoUrl: string | null;
     tasks: ReturnType<typeof session.listBackgroundProcesses>;
+    additionalRoots: string[];
   } {
     return {
       contextWindow: currentContextWindow(),
@@ -1629,8 +1833,24 @@ async function createSession(
       gitHubPRs,
       gitHubRepoUrl: gitHubSlug ? `https://github.com/${gitHubSlug}` : null,
       tasks: session.listBackgroundProcesses(),
+      // Roots added with /add-dir — the header shows a badge when non-empty.
+      additionalRoots: session.getAdditionalRoots(),
     };
   }
+
+  void scanLocalModels(false)
+    .then(() => {
+      clampLocalThinking();
+      broadcast("extras", footerExtras());
+    })
+    .then(() => broadcast("models_change", { local: localStatePayload() }))
+    .catch((err: unknown) => {
+      // A discovery failure is never fatal — the user simply has no local
+      // models. Log it; don't push an error row into the transcript.
+      log("WARN", "app-sidecar", "local model scan failed", {
+        error: err instanceof Error ? err.message : String(err),
+      });
+    });
 
   // Refresh the GitHub counts and broadcast only on change. Transient failures
   // keep the last-known numbers so the chips don't flicker off on a timeout.
@@ -2822,6 +3042,35 @@ async function createSession(
       return;
     }
 
+    // Markdown transcript export for the app's download button. Serialized
+    // here rather than in the webview because the webview's transcript model
+    // deliberately keeps tool activity in the LiveToolPanel — exporting from
+    // there would hand the user a coding session with the coding missing.
+    // `?name=1` asks for the suggested filename only (the save dialog needs it
+    // before there is a path), so the markdown never crosses IPC twice.
+    if (method === "GET" && (url === "/export" || url.startsWith("/export?"))) {
+      const query = new URLSearchParams(url.slice(url.indexOf("?") + 1));
+      const st = session.getState();
+      const filename = defaultExportFilename(mode);
+      if (query.get("name") === "1") {
+        json(res, 200, { filename });
+        return;
+      }
+      const markdown = sessionToMarkdown(
+        {
+          mode,
+          cwd,
+          provider: st.provider,
+          model: st.model,
+          ...(st.sessionId ? { sessionId: st.sessionId } : {}),
+        },
+        session.getMessages(),
+        { toolDetail: parseToolDetail(query.get("tools")) },
+      );
+      json(res, 200, { filename, markdown });
+      return;
+    }
+
     if (method === "GET" && url === "/history") {
       // Reconstruct the transcript from persisted messages so resume is 1:1 with
       // the live SSE stream. Walks ALL message types (not just user/assistant):
@@ -3165,16 +3414,37 @@ async function createSession(
           description: c.description,
           source: "built-in" as const,
         }));
+        // Desktop-safe registry actions belong in the same picker as workflows.
+        // Most registry commands have dedicated app controls or TUI-only flows;
+        // multi-root management has no other affordance, so expose only these.
+        const workspaceActions = [
+          {
+            name: "add-dir",
+            aliases: ["adddir"],
+            description: "Add another project folder to this workspace",
+            source: "built-in" as const,
+          },
+          {
+            name: "remove-dir",
+            aliases: ["removedir"],
+            description: "Remove an added project folder from this workspace",
+            source: "built-in" as const,
+          },
+        ];
         const custom = (await loadCustomCommands(cwd))
-          // A custom command can't shadow a built-in name.
-          .filter((c) => !PROMPT_COMMANDS.some((b) => b.name === c.name))
+          // A custom command can't shadow a built-in name or app action.
+          .filter(
+            (c) =>
+              !PROMPT_COMMANDS.some((b) => b.name === c.name) &&
+              !workspaceActions.some((action) => action.name === c.name),
+          )
           .map((c) => ({
             name: c.name,
             aliases: [] as string[],
             description: c.description,
             source: "custom" as const,
           }));
-        json(res, 200, { commands: [...builtins, ...custom] });
+        json(res, 200, { commands: [...workspaceActions, ...builtins, ...custom] });
       })();
       return;
     }
@@ -3553,12 +3823,30 @@ async function createSession(
           if (await auth.hasProviderAuth(p)) loggedIn.push(p);
         }
         // Just the names, grouped by provider in registry order — the UI shows
-        // a clean multi-column list of model ids.
-        const models = MODELS.filter((m) => loggedIn.includes(m.provider)).map((m) => ({
-          id: m.id,
-          name: m.name,
-          provider: m.provider,
-        }));
+        // a clean multi-column list of model ids. Local models come from the
+        // runtime registry (populated by the background scan) and are always
+        // listed: their "login" is the endpoint answering a probe.
+        const models = getAllModels()
+          .filter((m) => m.provider === "local" || loggedIn.includes(m.provider))
+          .map((m) => {
+            if (m.provider !== "local") {
+              return { id: m.id, name: m.name, provider: m.provider };
+            }
+            const probed = findProbedModel(localProbes, m.id);
+            return {
+              id: m.id,
+              name: m.name,
+              provider: m.provider,
+              local: true,
+              endpoint: probed?.endpoint.label ?? parseLocalModelId(m.id)?.endpointId,
+              // A local model that can't call tools can't run the agent — the UI
+              // renders it disabled rather than hiding it, so the user learns why.
+              supportsTools: probed?.model.supportsTools ?? true,
+              contextWindow: m.contextWindow,
+              contextWindowKnown: probed?.model.contextWindowKnown ?? false,
+              supportsThinking: m.supportsThinking,
+            };
+          });
         json(res, 200, { models });
       })();
       return;
@@ -3582,6 +3870,13 @@ async function createSession(
         if (running) {
           json(res, 409, { error: "cannot switch model while running" });
           return;
+        }
+        if (target.provider === "local") {
+          const problem = await localModelBlocker(target.id);
+          if (problem) {
+            json(res, 409, { error: problem });
+            return;
+          }
         }
         await session.switchModel(target.provider, target.id);
         // Ken follows GG Coder's model only while un-pinned; a user-set Ken
@@ -3998,6 +4293,86 @@ async function createSession(
     }
 
     // ── Telegram config (mirrors `ggcoder telegram`) ─────────
+    // ── Local models ──────────────────────────────────────
+    // GET returns the last scan (cheap, no probing) so opening the modal is
+    // instant; POST /local/scan is the explicit refresh.
+    if (method === "GET" && url === "/local") {
+      json(res, 200, localStatePayload());
+      return;
+    }
+
+    if (method === "POST" && url === "/local/scan") {
+      void scanLocalModels(true)
+        .then(() => {
+          broadcast("models_change", { local: localStatePayload() });
+          json(res, 200, localStatePayload());
+        })
+        .catch((err: unknown) => {
+          broadcastError("error", "local model scan failed", err);
+          json(res, 500, { error: "Local model scan failed — see the sidecar log." });
+        });
+      return;
+    }
+
+    if (method === "POST" && url === "/local/endpoints") {
+      void readBody(req, res).then(async (raw) => {
+        if (raw === null) return;
+        let body: { label?: string; baseUrl?: string; apiKey?: string };
+        try {
+          body = JSON.parse(raw) as typeof body;
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        try {
+          const endpoint = await addCustomEndpoint({
+            baseUrl: body.baseUrl ?? "",
+            ...(body.label ? { label: body.label } : {}),
+            ...(body.apiKey ? { apiKey: body.apiKey } : {}),
+          });
+          await scanLocalModels(true);
+          broadcast("models_change", { local: localStatePayload() });
+          json(res, 200, {
+            endpoint: { id: endpoint.id, label: endpoint.label },
+            ...localStatePayload(),
+          });
+        } catch (err) {
+          // Validation errors are the user's typo, not a system fault — 400 with
+          // the exact reason, and nothing in the transcript.
+          if (err instanceof LocalEndpointError) {
+            json(res, 400, { error: err.message });
+            return;
+          }
+          broadcastError("error", "add local endpoint failed", err);
+          json(res, 500, { error: "Could not save the endpoint — see the sidecar log." });
+        }
+      });
+      return;
+    }
+
+    if (method === "DELETE" && url.startsWith("/local/endpoints/")) {
+      const id = decodeURIComponent(url.slice("/local/endpoints/".length));
+      void (async () => {
+        try {
+          await removeCustomEndpoint(id);
+          clearRuntimeModels(
+            (m) => m.provider === "local" && parseLocalModelId(m.id)?.endpointId === id,
+          );
+          await scanLocalModels(true);
+          broadcast("models_change", { local: localStatePayload() });
+          json(res, 200, localStatePayload());
+        } catch (err) {
+          if (err instanceof LocalEndpointError) {
+            json(res, 400, { error: err.message });
+            return;
+          }
+          broadcastError("error", "remove local endpoint failed", err);
+          json(res, 500, { error: "Could not remove the endpoint — see the sidecar log." });
+        }
+      })();
+      return;
+    }
+
     if (method === "GET" && url === "/telegram") {
       void loadTelegramConfig().then((cfg) => {
         if (!cfg) {

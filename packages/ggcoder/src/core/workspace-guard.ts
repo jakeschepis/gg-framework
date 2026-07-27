@@ -18,6 +18,8 @@ import { getAppPaths } from "../config.js";
 
 export interface WriteGuardSettings {
   allowOutsideWorkspaceWrites?: boolean;
+  /** Extra workspace roots added at runtime via `/add-dir`. */
+  additionalRoots?: string[];
 }
 
 export interface WriteGuardResult {
@@ -44,18 +46,21 @@ export function resolveWriteGuard(
   if (settings?.allowOutsideWorkspaceWrites) return { allowed: true };
 
   const target = path.resolve(resolvedPath);
+  const extraRoots = (settings?.additionalRoots ?? []).map((root) => path.resolve(root));
   const allowedRoots = [
     path.resolve(cwd),
+    ...extraRoots,
     path.resolve(os.tmpdir()),
     path.resolve(getAppPaths().agentDir),
   ];
   for (const root of allowedRoots) {
     if (isWithin(root, target)) return { allowed: true };
   }
+  const workspaceRoots = [path.resolve(cwd), ...extraRoots].join(", ");
   return {
     allowed: false,
     reason:
-      `Blocked: ${target} is outside the workspace (${path.resolve(cwd)}). ` +
+      `Blocked: ${target} is outside the workspace (${workspaceRoots}). ` +
       "Writing outside the workspace requires user approval — ask the user to confirm, " +
       "or have them enable the allowOutsideWorkspaceWrites setting.",
   };

@@ -4,7 +4,7 @@ import readline from "node:readline";
 import os from "node:os";
 import path from "node:path";
 import { getAppPaths } from "../config.js";
-import { encodeCwd } from "./encode-cwd.js";
+import { encodeCwd, stripExtendedLengthPrefix } from "./encode-cwd.js";
 import { getUserSessionPrompt } from "./session-preview.js";
 import { isSessionPath, openSessionReadStream, resolveSessionPath } from "./session-storage.js";
 
@@ -95,8 +95,11 @@ async function discoverGgcoderProjects(): Promise<DiscoveredProject[]> {
       (await readFirstFromGgcoderDir(dir, ggcoderCwdExtractor)) ?? fallbackUnderscoreDecode(entry);
     if (!rawCwd) continue;
     // Normalize traversal segments (e.g. an agent launched with cwd
-    // `.../src-tauri/../..`) so the basename isn't a stray "..".
-    const cwd = path.resolve(rawCwd);
+    // `.../src-tauri/../..`) so the basename isn't a stray "..", and drop any
+    // Windows extended-length prefix so a session recorded as `\\?\C:\proj`
+    // (what Rust's canonicalize used to hand the sidecar) resolves to the same
+    // project as a plain `C:\proj` instead of listing a prefixed duplicate.
+    const cwd = path.resolve(stripExtendedLengthPrefix(rawCwd));
     if (!(await isDirectory(cwd))) continue;
 
     results.push({
@@ -111,12 +114,36 @@ async function discoverGgcoderProjects(): Promise<DiscoveredProject[]> {
 }
 
 /**
+ * Is `value` an absolute path on ANY platform?
+ *
+ * `path.isAbsolute` is platform-bound, but a session store is portable: read on
+ * Windows it carries `C:\Users\…` / `\\server\share\…`, on POSIX `/Users/…`.
+ * The old POSIX-only `startsWith("/")` check silently rejected every Windows
+ * cwd header, so discovery fell back to the lossy directory-name decode and
+ * every project/session vanished from the picker on Windows.
+ */
+export function isAbsoluteCwd(value: string): boolean {
+  return path.posix.isAbsolute(value) || path.win32.isAbsolute(value);
+}
+
+/**
  * Best-effort decode of a ggcoder session directory name back to a cwd, used
  * only when the session files carry no `cwd` header. Lossy by design (literal
  * underscores are indistinguishable from separators); the caller still verifies
  * the result is an existing directory.
+ *
+ * `encodeCwd` drops the drive colon (`C:\a\b` → `C_a_b`), so on Windows we
+ * re-attach it for a leading single-letter segment; otherwise a decoded
+ * `/C/a/b` names a directory that never exists and the project disappears.
  */
 function fallbackUnderscoreDecode(entry: string): string {
+  if (process.platform === "win32") {
+    const parts = entry.split("_");
+    if (parts.length > 1 && /^[A-Za-z]$/.test(parts[0]!)) {
+      return `${parts[0]}:\\${parts.slice(1).join("\\")}`;
+    }
+    return entry.replace(/_/g, "\\");
+  }
   return "/" + entry.replace(/_/g, "/");
 }
 
@@ -296,7 +323,7 @@ type LineExtractor = (line: string) => string | null;
 const claudeCwdExtractor: LineExtractor = (line) => {
   try {
     const parsed = JSON.parse(line) as { cwd?: unknown };
-    if (typeof parsed.cwd === "string" && parsed.cwd.startsWith("/")) return parsed.cwd;
+    if (typeof parsed.cwd === "string" && isAbsoluteCwd(parsed.cwd)) return parsed.cwd;
   } catch {
     // skip malformed
   }
@@ -310,7 +337,7 @@ const claudeCwdExtractor: LineExtractor = (line) => {
 const ggcoderCwdExtractor: LineExtractor = (line) => {
   try {
     const parsed = JSON.parse(line) as { type?: unknown; cwd?: unknown };
-    if (parsed.type === "session" && typeof parsed.cwd === "string" && parsed.cwd.startsWith("/")) {
+    if (parsed.type === "session" && typeof parsed.cwd === "string" && isAbsoluteCwd(parsed.cwd)) {
       return parsed.cwd;
     }
   } catch {
@@ -327,14 +354,14 @@ const codexCwdExtractor: LineExtractor = (line) => {
   try {
     const parsed = JSON.parse(line) as { payload?: { cwd?: unknown } };
     const cwd = parsed.payload?.cwd;
-    if (typeof cwd === "string" && cwd.startsWith("/")) return cwd;
+    if (typeof cwd === "string" && isAbsoluteCwd(cwd)) return cwd;
   } catch {
     // not JSON or unexpected shape; fall through to legacy regex
   }
   // Legacy format (pre-late-2025): cwd embedded as <cwd>...</cwd> inside an
   // <environment_context> user-message string.
   const m = CODEX_CWD_RE.exec(line);
-  if (m && m[1] && m[1].startsWith("/")) return m[1];
+  if (m && m[1] && isAbsoluteCwd(m[1])) return m[1];
   return null;
 };
 
@@ -420,7 +447,14 @@ function fallbackDashDecode(entry: string): string | null {
   // used when the JSONLs have no cwd events; the caller still verifies the
   // result is an existing directory.
   if (!entry.startsWith("-")) return null;
-  return "/" + entry.slice(1).replace(/-/g, "/");
+  const body = entry.slice(1);
+  if (process.platform === "win32") {
+    // Claude Code on Windows encodes `C:\a\b` as `C--a-b` (drive colon → dash).
+    const drive = /^([A-Za-z])--(.*)$/.exec(body);
+    if (drive) return `${drive[1]}:\\${drive[2]!.replace(/-/g, "\\")}`;
+    return body.replace(/-/g, "\\");
+  }
+  return "/" + body.replace(/-/g, "/");
 }
 
 function formatRelativeTime(ms: number): string {

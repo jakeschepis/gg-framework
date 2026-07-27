@@ -2,6 +2,7 @@ import { z } from "zod";
 import type { AgentTool, ToolContext } from "@kenkaiiii/gg-agent";
 import { extractToMarkdown } from "./html-extract.js";
 import { extractPdfText, PdfExtractorUnavailable } from "./pdf-extract.js";
+import { checkUrlPolicy, type GetNetworkPolicy } from "../core/network-guard.js";
 
 /**
  * Block requests to private/internal network addresses to prevent SSRF.
@@ -197,6 +198,8 @@ interface FetchOptions {
   maxLength: number;
   format: FetchFormat;
   preferLlmsTxt: boolean;
+  /** Network allowlist policy, read lazily (undefined = unrestricted). */
+  getNetworkPolicy?: GetNetworkPolicy;
 }
 
 interface RawResponse {
@@ -248,10 +251,16 @@ async function fetchOne(
   url: string,
   signal: AbortSignal,
   format: FetchFormat,
+  getNetworkPolicy?: GetNetworkPolicy,
 ): Promise<FetchOneResult> {
   let currentUrl = url;
 
   for (let hop = 0; hop <= MAX_REDIRECTS; hop++) {
+    // Every hop — the initial request and each redirect target — is checked, so
+    // a redirect can never carry the fetch to a disallowed host.
+    const blocked = checkUrlPolicy(currentUrl, getNetworkPolicy);
+    if (blocked) return { ok: false, error: `Error: ${blocked}` };
+
     let response = await requestHop(currentUrl, signal, format);
     if (response.status === 403 && response.headers.get("cf-mitigated") === "challenge") {
       response.body?.cancel().catch(() => undefined);
@@ -439,7 +448,7 @@ async function fetchAndProcess(
   }
 
   try {
-    const result = await fetchOne(url, signal, opts.format);
+    const result = await fetchOne(url, signal, opts.format, opts.getNetworkPolicy);
     if (!result.ok) return result.error;
 
     const { response } = result;
@@ -604,7 +613,7 @@ async function tryLlmsResource(
   const probes = await runPool(eligibleCandidates, PROBE_CONCURRENCY, async (candidate) => {
     try {
       const probeSignal = AbortSignal.any([signal, AbortSignal.timeout(PROBE_TIMEOUT_MS)]);
-      const result = await fetchOne(candidate.url, probeSignal, "markdown");
+      const result = await fetchOne(candidate.url, probeSignal, "markdown", opts.getNetworkPolicy);
       if (!result.ok) return null;
       const { response } = result;
       if (response.status !== 200) return null;
@@ -632,7 +641,9 @@ async function fetchWithPreferredDocs(
   return await fetchAndProcess(url, opts, signal);
 }
 
-export function createWebFetchTool(): AgentTool<typeof parameters> {
+export function createWebFetchTool(
+  getNetworkPolicy?: GetNetworkPolicy,
+): AgentTool<typeof parameters> {
   return {
     name: "web_fetch",
     description:
@@ -650,7 +661,12 @@ export function createWebFetchTool(): AgentTool<typeof parameters> {
       if (args.urls && args.urls.length > 0) {
         const urls = args.urls;
         const perUrlBudget = Math.max(PER_URL_MIN_BUDGET, Math.floor(maxLength / urls.length));
-        const opts: FetchOptions = { maxLength: perUrlBudget, format, preferLlmsTxt };
+        const opts: FetchOptions = {
+          maxLength: perUrlBudget,
+          format,
+          preferLlmsTxt,
+          getNetworkPolicy,
+        };
         const sections = await runPool(urls, MAX_CONCURRENCY, (u) =>
           fetchWithPreferredDocs(u, opts, context.signal),
         );
@@ -662,7 +678,7 @@ export function createWebFetchTool(): AgentTool<typeof parameters> {
         return "Error: provide either `url` or `urls`.";
       }
 
-      const opts: FetchOptions = { maxLength, format, preferLlmsTxt };
+      const opts: FetchOptions = { maxLength, format, preferLlmsTxt, getNetworkPolicy };
       return await fetchWithPreferredDocs(url, opts, context.signal);
     },
   };

@@ -183,7 +183,15 @@ export const APP_MARKER_CUSTOM_KIND = "app_transcript_marker";
 
 export interface AppMarkerPayload {
   version: 1;
-  kind: "plan" | "task" | "error" | "user_hint" | "compaction" | "agent_handoff";
+  kind:
+    | "plan"
+    | "task"
+    | "error"
+    | "user_hint"
+    | "compaction"
+    | "agent_handoff"
+    /** Mid-session model/provider change; `data` carries { from, to, provider }. */
+    | "model_switch";
   afterMessageCount: number;
   /** Kind-specific display fields (reason/title/headline/kenSent/counts/…). */
   data: Record<string, unknown>;
@@ -800,7 +808,8 @@ export class SessionManager {
           kind === "error" ||
           kind === "user_hint" ||
           kind === "compaction" ||
-          kind === "agent_handoff")
+          kind === "agent_handoff" ||
+          kind === "model_switch")
       ) {
         return [
           {

@@ -83,6 +83,27 @@ describe("WorkspaceHeader", () => {
     expect(screen.getByRole("button", { name: "1 PR" })).toBeDefined();
   });
 
+  it("shows an added-roots badge and appends it to the window title", () => {
+    expect(
+      formatWorkspaceTitle("/work/app", "main", "GG Coder", 0, null, null, ["/work/sdk"]),
+    ).toBe("app │ +1 root │ ⎇ main");
+
+    render(
+      <WorkspaceHeader
+        workspaceMode="code"
+        cwd="/work/gg-coder"
+        gitBranch="main"
+        additionalRoots={["/work/sdk", "/work/docs"]}
+        navHidden
+        onToggleNav={() => {}}
+      >
+        <button>New session</button>
+      </WorkspaceHeader>,
+    );
+
+    expect(screen.getByText("+2 roots")).toBeDefined();
+  });
+
   it("hides the GitHub chips when the counts are unknown", () => {
     render(
       <WorkspaceHeader

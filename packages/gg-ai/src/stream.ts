@@ -127,6 +127,38 @@ providerRegistry.register("minimax", {
     }),
 });
 
+/**
+ * Local model ids are namespaced by endpoint (`local/<endpointId>/<rawId>`) so
+ * the same model name served by two machines stays distinct in the registry.
+ * The server only knows the raw id, so strip the routing prefix here — at the
+ * one place that talks to the wire. Counterpart to gg-core's
+ * `formatLocalModelId`/`parseLocalModelId`.
+ */
+export function localWireModelId(id: string): string {
+  const match = /^local\/[^/]+\/(.+)$/.exec(id);
+  return match?.[1] ?? id;
+}
+
+providerRegistry.register("local", {
+  // Locally hosted OpenAI-compatible servers (Ollama, LM Studio, llama.cpp,
+  // vLLM). There is no default endpoint: the baseUrl comes from the endpoint
+  // credential the discovery layer wrote, so a missing one is a wiring bug, not
+  // something to paper over with a guess at someone else's port.
+  stream: (options) => {
+    if (!options.baseUrl) {
+      throw new GGAIError(
+        "Local provider requires a baseUrl (e.g. http://127.0.0.1:11434/v1). " +
+          "No local endpoint was resolved for this model — re-scan for local models.",
+      );
+    }
+    return streamOpenAI({
+      ...options,
+      model: localWireModelId(options.model),
+      webSearch: false,
+    });
+  },
+});
+
 // ── Public API ─────────────────────────────────────────────
 
 /**

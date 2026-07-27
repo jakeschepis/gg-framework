@@ -4,10 +4,11 @@ import { createInterface } from "node:readline";
 import path from "node:path";
 import type { Message, Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { getAppPaths } from "@kenkaiiii/gg-core";
-import type { AgentDefinition } from "./agents.js";
+import { mcpServersForAgent, type AgentDefinition } from "./agents.js";
 import { SubAgentStore, type PersistedSubAgentRecord } from "./subagent-store.js";
 import { SessionManager } from "./session-manager.js";
 import { log } from "./logger.js";
+import type { AgentNotificationQueue } from "./agent-notifications.js";
 import {
   boundSubAgentOutput,
   childSubAgentEnv,
@@ -64,6 +65,12 @@ export interface SubAgentManagerOptions {
    *  reduces concurrency below the global ACTIVE_LIMIT. */
   getMaxPerModel?: () => number | undefined;
   onState?: (snapshot: SubAgentSnapshot) => void;
+  /**
+   * Push queue for child-completion notifications. When set, a finished child
+   * announces itself into the parent's next turn instead of waiting to be
+   * discovered by `wait_agent` or the pre-stop completion gate.
+   */
+  notifications?: AgentNotificationQueue;
   workerEntry?: string;
   idleTimeoutMs?: number;
   store?: SubAgentStore;
@@ -94,6 +101,22 @@ const DEFAULT_IDLE_MS = 10 * 60_000;
 function activity(name: string, args: Record<string, unknown>): string {
   const value = Object.values(args).find((candidate) => typeof candidate === "string");
   return value ? `${name}: ${String(value).slice(0, 60)}` : name;
+}
+
+/** Chars of a child's result kept in its completion notification. */
+const NOTIFICATION_DIGEST_CHARS = 160;
+
+/**
+ * One-line gist of a child's result for a push notification. The full output
+ * stays behind `wait_agent`; this only has to tell the parent whether the
+ * result is worth collecting now.
+ */
+function summarizeForNotification(text: string): string {
+  const collapsed = text.replace(/\s+/g, " ").trim();
+  if (!collapsed) return "";
+  return collapsed.length <= NOTIFICATION_DIGEST_CHARS
+    ? collapsed
+    : `${collapsed.slice(0, NOTIFICATION_DIGEST_CHARS - 1)}\u2026`;
 }
 
 /** Shared pre-finalization hook used by both AgentSession and the Ink host. */
@@ -247,6 +270,11 @@ export class SubAgentManager {
           systemPrompt: selection.agentDef?.systemPrompt,
           thinkingLevel: childThinkingLevel(this.options.getThinkingLevel()),
           allowedTools: selection.agentDef?.tools.length ? selection.agentDef.tools : undefined,
+          // Without this, an allow-listed child connects NO MCP servers — even
+          // when its `tools:` frontmatter names `mcp__<server>__<tool>`.
+          allowedMcpServers: selection.agentDef?.tools.length
+            ? mcpServersForAgent(selection.agentDef.tools)
+            : undefined,
           promptCacheKey: subAgentCacheKey(
             this.options.getCacheKey?.(),
             selection.model,
@@ -511,6 +539,9 @@ export class SubAgentManager {
           systemPrompt: agentDef?.systemPrompt,
           thinkingLevel: childThinkingLevel(this.options.getThinkingLevel()),
           allowedTools: agentDef?.tools.length ? agentDef.tools : undefined,
+          allowedMcpServers: agentDef?.tools.length
+            ? mcpServersForAgent(agentDef.tools)
+            : undefined,
           promptCacheKey: subAgentCacheKey(
             this.options.getCacheKey?.(),
             model,
@@ -627,10 +658,30 @@ export class SubAgentManager {
       worker.current_activity = undefined;
       worker.updated_at = Date.now();
       this.publish(worker);
+      this.notifyTerminal(worker);
       for (const resolve of worker.turnResolvers) resolve();
       worker.turnResolvers.clear();
       this.scheduleIdleReap(worker);
     }
+  }
+
+  /**
+   * Announce a finished child into the parent's next turn. Carries the id, the
+   * state and a short digest — NOT the output, which stays behind `wait_agent`
+   * so a chatty child cannot dump its transcript into the parent's context.
+   */
+  private notifyTerminal(worker: WorkerRecord): void {
+    const queue = this.options.notifications;
+    if (!queue) return;
+    const digest = summarizeForNotification(worker.error ?? worker.output ?? "");
+    queue.enqueue(
+      "subagent",
+      worker.agent_id,
+      `Child agent "${worker.task_name}" (${worker.agent_id}) is ${worker.state} after ` +
+        `${worker.turn_count} turn(s)${digest ? `: ${digest}` : ""}. ` +
+        `Collect its full output with wait_agent agent_ids ["${worker.agent_id}"].`,
+      { terminal: true },
+    );
   }
 
   private request(

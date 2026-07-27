@@ -20,7 +20,9 @@ export function createTaskOutputTool(
     name: "task_output",
     description:
       "Read output from a background process. Returns new output since last read by default. " +
-      "Use from_start=true to read from the beginning.",
+      "Use from_start=true to read from the beginning. Progress and exit status arrive " +
+      "automatically for background processes \u2014 call this when you need the full output, " +
+      "not merely to check whether something finished.",
     parameters: TaskOutputParams,
     async execute({ id, from_start }) {
       const result = await processManager.readOutput(id, from_start);

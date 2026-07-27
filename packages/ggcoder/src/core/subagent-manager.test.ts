@@ -6,6 +6,7 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { AgentDefinition } from "./agents.js";
 import { buildSubAgentCompletionFollowUp, SubAgentManager } from "./subagent-manager.js";
 import { SubAgentStore, type PersistedSubAgentRecord } from "./subagent-store.js";
+import { AgentNotificationQueue } from "./agent-notifications.js";
 
 const workerEntry = fileURLToPath(
   new URL("../tools/__fixtures__/fake-subagent-worker.mjs", import.meta.url),
@@ -36,9 +37,11 @@ function manager(
     cwd?: string;
     sessionRootDir?: string;
     maxPerModel?: number;
+    notifications?: AgentNotificationQueue;
   } = {},
 ) {
   const instance = new SubAgentManager({
+    notifications: options.notifications,
     cwd: options.cwd ?? process.cwd(),
     agents: options.agentDefs ?? agents,
     getProvider: () => "openai",
@@ -109,6 +112,23 @@ describe("SubAgentManager", () => {
       cacheRead: 20,
       cacheWrite: 5,
     });
+  });
+
+  it("pushes a bounded completion notification without waiting", async () => {
+    const notifications = new AgentNotificationQueue();
+    const instance = manager({ notifications });
+
+    const child = await instance.spawn("notify-child", "fast", "fake");
+    // Event-driven, but NOT a collection: the parent never calls wait().
+    await instance.wait([child.agent_id], "all", 1_000);
+
+    const drained = notifications.drain();
+    expect(drained).toHaveLength(1);
+    expect(drained[0]).toMatchObject({ kind: "subagent", id: child.agent_id, terminal: true });
+    expect(drained[0]!.text).toContain("notify-child");
+    expect(drained[0]!.text).toContain("completed");
+    expect(drained[0]!.text).toContain("wait_agent");
+    expect(drained[0]!.text.length).toBeLessThanOrEqual(512);
   });
 
   it("waits for any, times out, steers, interrupts, and reuses context", async () => {

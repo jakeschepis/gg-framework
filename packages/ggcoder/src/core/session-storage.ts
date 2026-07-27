@@ -168,10 +168,32 @@ export async function openSessionReadStream(filePath: string): Promise<{
   return { path: resolved, stream: input };
 }
 
+/**
+ * Flush a file's contents to disk before it is renamed into place.
+ *
+ * Opened "r+" (read/write), NOT "r": Windows implements fsync as
+ * `FlushFileBuffers`, which requires a handle with WRITE access and fails with
+ * EPERM on a read-only one. Every durable session write funnels through here,
+ * so on Windows this threw while saving sessions, archiving cold sessions and
+ * writing redirects — session persistence was broken outright, not just slow.
+ *
+ * A failed flush is also downgraded to non-fatal. fsync is a durability
+ * optimization here (it narrows the crash window before the atomic rename), and
+ * some filesystems — network shares, container overlays — reject it outright.
+ * Losing durability on those is acceptable; refusing to save the user's session
+ * is not.
+ */
 async function syncFile(filePath: string): Promise<void> {
-  const handle = await fs.open(filePath, "r");
+  let handle;
+  try {
+    handle = await fs.open(filePath, "r+");
+  } catch {
+    return; // Not openable for write (e.g. read-only mount) — skip the flush.
+  }
   try {
     await handle.sync();
+  } catch {
+    // Filesystem doesn't support fsync; the write itself still succeeded.
   } finally {
     await handle.close();
   }

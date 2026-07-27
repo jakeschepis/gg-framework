@@ -12,6 +12,7 @@ import { PersistentShell } from "../core/persistent-shell.js";
 import { isReadOnlyCommand } from "./read-only-bash.js";
 import { isPlanModeActive, planModeRestriction } from "../core/runtime-mode.js";
 import { isCatastrophicCommand } from "../core/workspace-guard.js";
+import { checkCommandPolicy, type GetNetworkPolicy } from "../core/network-guard.js";
 
 const DEFAULT_TIMEOUT = 120_000; // 120 seconds
 const MAX_OUTPUT_BYTES = 10 * 1024 * 1024; // 10 MB — cap buffered output to prevent OOM
@@ -69,6 +70,7 @@ export function createBashTool(
   ops: ToolOperations = localOperations,
   planModeRef?: { current: boolean },
   shellOpts?: ResolveShellOpts,
+  getNetworkPolicy?: GetNetworkPolicy,
 ): AgentTool<typeof BashParams> {
   // Lazily created on the first persist:true call; one session per tool
   // instance (i.e. per agent session), killed when the process exits.
@@ -117,10 +119,17 @@ export function createBashTool(
       if (catastrophic) {
         return `Error: ${catastrophic}`;
       }
+      // Network allowlist — defence in depth only. Recognises the common egress
+      // command shapes; an unrecognised command is never blocked (see
+      // core/network-guard.ts for why this is not a sandbox).
+      const networkBlocked = checkCommandPolicy(command, getNetworkPolicy);
+      if (networkBlocked) {
+        return `Error: ${networkBlocked}`;
+      }
       // Persistent session mode — POSIX only; Windows-without-bash falls through
       // to the normal spawn path (cmd.exe fallback) below.
-      if (persist && !run_in_background && !resolveShell(command).isCmdFallback) {
-        sessionShell ??= new PersistentShell(cwd, getSafeToolEnv(), MAX_OUTPUT_BYTES);
+      if (persist && !run_in_background && !resolveShell(command, shellOpts).isCmdFallback) {
+        sessionShell ??= new PersistentShell(cwd, getSafeToolEnv(), MAX_OUTPUT_BYTES, shellOpts);
         const res = await sessionShell.run(
           command,
           timeoutMs ?? DEFAULT_TIMEOUT,
@@ -155,7 +164,11 @@ export function createBashTool(
         // cmd.exe fallback). Hardcoding "bash" broke on Windows with `spawn
         // bash ENOENT`, and accidentally hitting WSL's bash ran commands in a
         // separate Linux filesystem (the "files not mounted" symptom).
-        const shell = resolveShell(command);
+        // `shellOpts` MUST be threaded through here, not just into the
+        // description above: without it the tool advertised cmd.exe semantics
+        // while actually executing through bash, and no test could drive the
+        // Windows fallback path on a real Windows host.
+        const shell = resolveShell(command, shellOpts);
         const child = ops.spawn(shell.file, shell.args, {
           cwd,
           detached: true,

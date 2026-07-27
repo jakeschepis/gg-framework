@@ -11,6 +11,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { resolveShell, type ResolveShellOpts } from "./shell.js";
 import { killProcessTree } from "../utils/process.js";
 
 export interface PersistentRunResult {
@@ -27,6 +28,7 @@ export class PersistentShell {
     private readonly cwd: string,
     private readonly env: NodeJS.ProcessEnv,
     private readonly maxOutputBytes: number,
+    private readonly shellOpts?: ResolveShellOpts,
   ) {}
 
   /** True while a previous persistent command is still running. */
@@ -39,11 +41,18 @@ export class PersistentShell {
       return this.child;
     }
     // Fresh session: no rc files so startup is fast and deterministic.
-    const child = spawn("bash", ["--norc", "--noprofile"], {
+    //
+    // Spawn the SAME bash the one-shot path resolved, not a bare `bash`: on
+    // Windows the caller only reaches persist mode when Git Bash was found,
+    // but Git for Windows puts `cmd\` on PATH and `bash.exe` in `bin\` — so a
+    // bare `bash` spawn is ENOENT and every persist-mode command failed.
+    const child = spawn(resolveShell("", this.shellOpts).file, ["--norc", "--noprofile"], {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: this.env,
-      detached: true,
+      // Windows has no process groups; `detached` there only orphans the shell
+      // past a parent crash instead of grouping it for a clean tree-kill.
+      detached: process.platform !== "win32",
     });
     // Don't let a lingering session shell keep the parent process alive.
     child.unref();

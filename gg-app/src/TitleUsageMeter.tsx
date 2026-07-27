@@ -25,16 +25,25 @@ export function TitleUsageMeter({ currentProvider }: { currentProvider: string }
   const [now, setNow] = useState(() => Date.now());
   const windowKind = selection.provider === currentProvider ? selection.kind : "current";
 
+  // Never carry one provider's numbers over to another — clear on switch.
+  useEffect(() => {
+    setSnapshot((previous) => (previous?.provider === currentProvider ? previous : null));
+  }, [currentProvider]);
+
   useEffect(() => {
     if (!supportedProvider(currentProvider)) return;
     let disposed = false;
     const refresh = async (): Promise<void> => {
       try {
         const response = await getSubscriptionUsage(currentProvider);
-        if (!disposed) {
-          setSnapshot(response);
-          setNow(Date.now());
-        }
+        if (disposed) return;
+        setNow(Date.now());
+        // A transient failure (these quota endpoints hand out 429s freely) comes
+        // back as a connected-but-empty snapshot. Dropping it into state would
+        // unmount the meter for the whole backoff window and pop it back in on
+        // the next success — so keep the last usable snapshot instead.
+        const usable = response.connected && !response.error && response.windows.length > 0;
+        if (usable || !response.connected) setSnapshot(response);
       } catch {
         // The title strip is ambient status, not an error surface. Keep it quiet
         // when the provider's private usage endpoint is temporarily unavailable.
@@ -73,11 +82,15 @@ export function TitleUsageMeter({ currentProvider }: { currentProvider: string }
   const roundedPercent = Math.round(percent);
   const reset = compactResetLabel(selectedWindow.resetsAt, now);
   const nextKind = selectedWindow.kind === "current" ? "weekly" : "current";
-  const title = `${snapshot.displayName} ${selectedWindow.label}: ${roundedPercent}% used · ${fullResetLabel(selectedWindow.resetsAt, now)}${canToggle ? ` · Click for ${nextKind} usage` : ""}`;
+  // `stale` means the sidecar is replaying its last good snapshot because the
+  // provider's quota endpoint is failing (usually a 429). The bar deliberately
+  // stays put rather than flickering out, so say so on hover instead of
+  // presenting old numbers as live ones.
+  const title = `${snapshot.displayName} ${selectedWindow.label}: ${roundedPercent}% used · ${fullResetLabel(selectedWindow.resetsAt, now)}${snapshot.stale ? " · last known — usage is temporarily unavailable" : ""}${canToggle ? ` · Click for ${nextKind} usage` : ""}`;
 
   return (
     <button
-      className="title-usage-meter"
+      className={`title-usage-meter${snapshot.stale ? " is-stale" : ""}`}
       type="button"
       title={title}
       aria-label={title}

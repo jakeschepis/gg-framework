@@ -81,6 +81,159 @@ Live (12 turns/arm):
 - Residual issue is provider-side random full-misses (~1–2 per 6-turn run, both
   arms) — exactly why hit-rate observability in the UI is worth shipping.
 
+## E — Model-switch prompt-cache cost (27 July 2026)  → NO measurable cache win
+
+`bench/e-model-switch-cache.mjs`. Anthropic `claude-sonnet-5`, real GG Coder system
+prompt (~4.7k tok cached prefix), 3 turns per arm with a model switch between turn 2
+and turn 3. Arms differ only in WHERE the model-dependent async-orchestration block
+lives: inside the `cache_control` block (`prefix-mutation`, the old composition) vs
+after the `<!-- uncached -->` marker (`tail-only`, current).
+
+| arm | cacheRead (turn after switch) | cacheWrite | fresh input |
+|---|---|---|---|
+| prefix-mutation | 4,671 | 262 | 2 |
+| tail-only | 4,671 | 273 | 2 |
+
+**cache-read delta: +0 tokens (0.0%).** The hypothesis was that mutating the cached
+block on a model switch forces a full re-write. It does not: the old composition
+appended the model-dependent block at the very END of the system prompt, and
+Anthropic's prefix matching still served the unchanged head — the same effect bench D
+found for the date suffix. Only the ~230-token tail is re-written either way.
+
+- The composition change **still ships**: model-dependent content is now deterministically
+  placed behind the cache marker instead of being spliced into `messages[0]` on every
+  switch, and the switch itself is recorded as a durable marker plus a standalone
+  trailing message (replayable on resume) rather than a silent prompt mutation.
+- The justification is correctness and replayability, **not** token savings. Do not
+  claim a cache win for it.
+
+## F — Durable-memory prompt-tail cost (27 July 2026)  → bounded; default stays OFF
+
+Per-turn cost of `buildMemoryPromptTail` at the default wake budget (12 lines / 2,000
+chars), measured on a synthetic log of realistic notes. Tokens estimated at 3.5 chars/token.
+
+| notes in log | tail chars | ≈ tokens/turn |
+|---|---|---|
+| 0 | 0 | 0 |
+| 1 | 268 | 77 |
+| 10 | 1,127 | 322 |
+| 50 | 1,460 | 418 |
+| 200 | 1,473 | 421 |
+| 1,000 | 1,473 | **421** |
+
+- **Cost plateaus at ~420 tokens/turn** and does not grow with the log — that is the
+  whole point of decoupling the read budget from storage. A 1,000-note project costs
+  the same per turn as a 200-note one.
+- An empty log costs exactly 0, so the feature is free until a note is written.
+- ~420 tokens/turn is real recurring spend (uncached, by design). **`memoryEnabled`
+  ships defaulting to off**; flipping it is a product call that should be made against
+  a real multi-session project, not this synthetic log.
+
+## G — Does injected memory suppress verification? (27 July 2026)  → YES; keep default OFF
+
+`bench/f-memory-staleness.mjs`. gpt-5.5, 5 trials/arm. The model is asked which test
+runner the project uses and is given a `read` tool it may call to check. Arms differ
+only in the injected memory tail.
+
+| arm | verified (called a tool) | asserted the false fact |
+|---|---|---|
+| none — no memory | **5/5** | 0/5 |
+| fresh — note is TRUE | 0/5 | 0/5 |
+| stale — note is FALSE | 0/5 | **5/5** |
+| stale + note ages shown | 0/5 | **5/5** |
+| stale + "unverified, verify first" header | 0/5 | **5/5** |
+| stale + ages + hedged header | 0/5 | **5/5** |
+| fresh + ages + hedged header | 0/5 | 0/5 |
+
+**Memory does not add a fact — it replaces the act of checking.** With no memory the
+model investigated the repo 5/5 times. With *any* memory present it investigated 0/5
+times, whether the note was true or false. The mechanism that makes memory useful is
+the same one that makes it dangerous.
+
+**Prompt-level mitigation does not work.** Neither showing each note's age, nor a
+header explicitly stating the notes are unverified and may be outdated, nor both
+together, restored verification even once or prevented a single false assertion.
+
+Consequences:
+
+- Notes that **cannot become false** are safe — historical events ("worked on X",
+  "changed files Y"). Suppressing re-verification of a past event costs nothing.
+  The compaction-written notes are already exactly this shape.
+- Notes that **assert current state** ("the test runner is jest") decay silently and
+  are then asserted with full confidence while suppressing the check that would have
+  caught them. The free-form `memory note` action is what invites these.
+- `memoryEnabled` **stays default off** pending a decision on whether to keep
+  free-form notes at all (see Verdict).
+
+### Harness bug found while running this
+
+`bench/lib.mjs` listened for a `toolcall_end` event that gg-ai never emits (the real
+event is `toolcall_done`, with `{id, name, args}` inline), so `toolCalls` was always
+empty. The first run of this bench therefore reported "0 verifications" in *every*
+arm, including the control — the finding above only appeared after the fix. Any
+earlier bench conclusion that relied on counting tool calls should be re-checked.
+
+## H — LIVE end-to-end journal test + redundancy audit (27 July 2026)
+
+`bench/g-journal-live.mjs`. Real `AgentSession`, real credentials
+(`anthropic/claude-sonnet-5`), scratch project: 5 real turns → real compaction →
+inspect `.gg/memory.md` → **new session** → ask a question only the journal can answer.
+
+| check | result |
+|---|---|
+| journal file created by a real compaction | **YES** |
+| reached the new session's prompt | **YES** |
+| placed in the uncached tail (cache-safe) | **YES** |
+| new session answered from it | **YES** |
+
+Three bugs this found that unit tests could not:
+
+1. **The feature silently never fired.** Compaction keeps ~8K tokens of recent history
+   verbatim and only summarizes what is older, so short conversations produce
+   `compacted: false` and write nothing. The first two live attempts wrote no file at
+   all. Only a genuinely long session exercises this path.
+2. **Entries were raw markdown.** The compactor's summary is authored for a transcript
+   (`### Primary Request and Intent`, lists, backticks, `<read-files>` blocks) and was
+   being pasted verbatim into a one-line entry.
+3. **Entries were badly redundant** — see below.
+
+### Redundancy audit
+
+Measured on the live output. Two sources of pure waste, both fixed:
+
+| | before | after |
+|---|---|---|
+| written per compaction | 508 chars / 146 tok | **202 chars / 58 tok** (−60%) |
+| recurring prompt tail (1 compaction) | — | 132 tok/turn |
+| recurring prompt tail (13 compactions) | — | **282 tok/turn, plateaus** |
+| empty journal | — | **0** |
+
+- **Summary duplicated the request entry.** 64% of the `request` entry's words already
+  appeared inside the summary blob. The compactor emits seven labelled sections; only
+  `What Was Done` and `Errors and Fixes` are now journalled. `Primary Request and
+  Intent` / `User Messages` duplicate the `request` entry, `Files Touched` duplicates
+  the `files` entry, and `Current Work` / `Next Step` are in-flight state that bench G
+  proves would be asserted as current fact forever.
+- **Turn-budget continuation echoed text already in context.** It re-sent up to 600
+  chars of the "original request" — read out of the very `messages` array being sent,
+  so the model already had it verbatim. Worse, after a compaction the first user
+  message *is* the compaction summary, so the echo quoted the summary back instead of
+  the request. Removed entirely; the continuation is now instruction-only (<400 chars).
+
+### Truncation quality
+
+Entries were hard-sliced at the budget, mid-word (`…read src/router.ts in fu…`).
+Replaced with one shared boundary-aware clamp (sentence → word → hard cut), used by
+both writers instead of two duplicate `clamp` copies. On the real live string:
+
+| | tail of entry |
+|---|---|
+| before | `… suffix, differing only by index. - Read src/router.ts in fu…` |
+| after | `… suffix, differing only by index. …` |
+
+Periods inside code (`input.toLowerCase()`) are correctly not treated as sentence
+ends. Cost of the cleaner ending: 25 chars (~7 tokens) per truncated entry.
+
 ## Verdict
 
 | bench | verdict | expected gain |
@@ -89,6 +242,12 @@ Live (12 turns/arm):
 | B flush 100ms | implement | −49% streaming CPU (TUI); same fix for webview rAF batching |
 | C partial preservation | implement | no re-billed output on transport retries; ~0.4–2.5k tok/drop |
 | D steering/cache | no change needed | ship cache-hit% in ActivityBar (uses existing `cacheRead`) |
+| E model-switch cache | ship for correctness | **no token gain (+0%)** — do not claim one |
+| F memory cost | bounded | ~420 tok/turn, plateaus regardless of log size |
+| G memory suppresses verification | **default OFF; open question** | 5/5 → 0/5 verification; wording fixes do not work |
+| H live journal + de-dup | ship (default OFF) | works end-to-end; −60% written/compaction, tail plateaus at 282 tok |
 
 Reproduce: `node bench/a-mcp-tools.mjs` · `node bench/b-render-cpu.mjs` ·
-`node bench/c-partial-loss.mjs` · `node bench/d-cache-audit.mjs` (from repo root).
+`node bench/c-partial-loss.mjs` · `node bench/d-cache-audit.mjs` ·
+`node bench/e-model-switch-cache.mjs` · `node bench/f-memory-staleness.mjs` ·
+`node bench/g-journal-live.mjs` (from repo root; H needs real credentials).

@@ -3,10 +3,12 @@ import type { Dispatch, MutableRefObject, SetStateAction } from "react";
 import { theme } from "./theme";
 import {
   listCommands,
+  listModels,
   type SidecarEvent,
   type SubAgentStatePayload,
   type AgentState,
   type BackgroundTask,
+  type ModelOption,
   type ProjectTask,
   type SlashCommand,
 } from "./agent";
@@ -137,6 +139,7 @@ export interface AgentEventsDeps {
   setQueuedCount: Dispatch<SetStateAction<number>>;
   setAttachments: Dispatch<SetStateAction<PendingAttachment[]>>;
   setCommands: Dispatch<SetStateAction<SlashCommand[]>>;
+  setModels: Dispatch<SetStateAction<ModelOption[]>>;
 
   stateRef: MutableRefObject<AgentState | null>;
   planDoneRef: MutableRefObject<Set<number>>;
@@ -179,6 +182,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
     setQueuedCount,
     setAttachments,
     setCommands,
+    setModels,
     stateRef,
     planDoneRef,
     planTotalRef,
@@ -1017,6 +1021,14 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           subagentGroupIdRef.current = null;
           subagentGroupByAgentRef.current.clear();
           break;
+        case "models_change":
+          // Local-model discovery finished (boot scan, manual scan, or an
+          // endpoint added/removed). Without this the models found on the
+          // user's machine wouldn't reach the picker until the next restart.
+          void listModels().then((available) => {
+            if (available.length > 0) setModels(available);
+          });
+          break;
         case "extras":
           // Context window / git status refresh (model switch, run end).
           setState((s) =>
@@ -1040,6 +1052,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
                     d.gitHubRepoUrl !== undefined
                       ? (d.gitHubRepoUrl as string | null)
                       : s.gitHubRepoUrl,
+                  additionalRoots: (d.additionalRoots as string[] | undefined) ?? s.additionalRoots,
                 }
               : s,
           );
@@ -1080,6 +1093,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
       setQueuedCount,
       setAttachments,
       setCommands,
+      setModels,
       stateRef,
       planDoneRef,
       planTotalRef,

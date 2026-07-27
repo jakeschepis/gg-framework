@@ -46,8 +46,19 @@ describe("SubAgentStore", () => {
     const filePath = store.pathFor("/project", "parent-a");
     const stat = await fs.stat(filePath);
     const directoryStat = await fs.stat(path.dirname(filePath));
-    expect(stat.mode & 0o777).toBe(0o600);
-    expect(directoryStat.mode & 0o777).toBe(0o700);
+    // POSIX permission bits don't exist on Windows: chmod there can only
+    // toggle the read-only attribute, so Node reports 0666/0777 whatever we
+    // ask for. The 0600 intent is still correct and enforced on POSIX; on
+    // Windows the file is protected by the ACL it inherits from the user
+    // profile instead. Assert what the platform can actually deliver rather
+    // than dropping the check.
+    if (process.platform === "win32") {
+      expect(stat.isFile()).toBe(true);
+      expect(directoryStat.isDirectory()).toBe(true);
+    } else {
+      expect(stat.mode & 0o777).toBe(0o600);
+      expect(directoryStat.mode & 0o777).toBe(0o700);
+    }
     expect(await fs.readFile(filePath, "utf-8")).not.toContain(secret);
     const loaded = await store.load("/project", "parent-a");
     expect(loaded).toHaveLength(20);

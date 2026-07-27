@@ -1,5 +1,81 @@
 # @kenkaiiii/ggcoder
 
+## 5.25.0
+
+### Minor Changes
+
+- Add local model support (Ollama, LM Studio, llama.cpp, vLLM) with runtime discovery, capability-gated tool/thinking support, and per-endpoint auth; add `/remove-dir` workspace command; keep the subscription usage meter from blanking on transient provider rate limits.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.25.0
+- @kenkaiiii/gg-agent@5.25.0
+- @kenkaiiii/gg-core@5.25.0
+
+## 5.24.0
+
+### Minor Changes
+
+- Add Markdown chat transcript export, network egress allowlist, multi-root `/add-dir`, and OpenAI-compatible reasoning-field detection
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.24.0
+- @kenkaiiii/gg-agent@5.24.0
+- @kenkaiiii/gg-core@5.24.0
+
+## 5.23.3
+
+### Patch Changes
+
+- 1be7250: Fix Windows compatibility across project discovery, shell execution, MCP and LSP.
+  - **Projects and sessions were invisible on Windows.** Every cwd extractor in
+    project discovery gated on `cwd.startsWith("/")`, so a `C:\…` session header
+    was rejected, discovery fell back to the lossy directory-name decode, and the
+    project silently vanished from the picker. Absolute-path detection is now
+    platform-agnostic (`C:\…`, `\\server\share\…`, `/…`), and both fallback
+    decoders reconstruct real Windows paths.
+  - **Extended-length paths no longer duplicate a project.** A cwd recorded as
+    `\\?\C:\proj` (what Rust's `canonicalize()` produces) is normalized to its
+    plain form on read, matching what `encodeCwd` already did on write.
+  - **`persist` bash mode was completely broken on Windows.** It spawned a bare
+    `bash`, but Git for Windows puts `cmd\` on PATH and `bash.exe` in `bin\`, so
+    the spawn was always ENOENT. It now reuses the resolved shell, and no longer
+    detaches on Windows (which only orphaned the shell past a crash).
+  - **MCP stdio servers configured with `npx` never connected.** The MCP SDK
+    spawns with `shell: false` and Windows' `CreateProcess` ignores `PATHEXT`, so
+    the near-universal `{"command": "npx"}` config failed with an opaque
+    "Connection closed". The command is now resolved across PATH × PATHEXT.
+  - **LSP inline diagnostics never appeared on Windows.** Diagnostics are cached
+    by `file://` URI; ours kept the drive letter's case while servers emit the
+    lowercase form, so every lookup missed and LSP degraded silently.
+  - **Background processes survived cancellation.** `killProcessTree` used a
+    POSIX-only negative pid, leaving a timed-out command's whole descendant tree
+    running. It now uses `taskkill /T /F`, resolved from `SystemRoot` rather than
+    PATH.
+  - `find`/`grep` glob patterns containing backslashes now match (backslash is
+    picomatch's escape character, never a separator).
+  - **Session persistence was broken on Windows.** `syncFile` opened the file
+    read-only (`"r"`) and then called `fsync`, but Windows implements fsync as
+    `FlushFileBuffers`, which requires a handle with WRITE access and fails with
+    `EPERM` on a read-only one. Every durable session write funnels through that
+    helper, so saving sessions, archiving cold sessions and writing redirects all
+    threw. It now opens `"r+"`, and a failed flush is non-fatal (network shares
+    and container overlays can reject fsync outright — losing durability there is
+    acceptable, refusing to save the user's session is not).
+  - @kenkaiiii/gg-ai@5.23.3
+  - @kenkaiiii/gg-agent@5.23.3
+  - @kenkaiiii/gg-core@5.23.3
+
+## 5.23.2
+
+### Patch Changes
+
+- Fix named sub-agents receiving no MCP tools: a session with a `tools:` allow-list skipped MCP entirely unless an MCP whitelist was also set, so an agent listing `mcp__kencode-search__searchCode` silently fell back to training data. The whitelist is now derived from the agent definition and forwarded through every spawn path. Also removes the v5.22.6 seeded `auditor.md`/`skeptic.md` that shadowed the richer bundled agents, with hash-gated cleanup that leaves user-edited files untouched.
+  - @kenkaiiii/gg-ai@5.23.2
+  - @kenkaiiii/gg-agent@5.23.2
+  - @kenkaiiii/gg-core@5.23.2
+
 ## 5.23.1
 
 ### Patch Changes

@@ -30,6 +30,18 @@ export const MOONSHOT_OAUTH_KEY = "moonshot-oauth";
 export const XIAOMI_CREDITS_KEY = "xiaomi-credits";
 
 /**
+ * Prefix for local-endpoint credentials (`local:ollama`, `local:lmstudio`, …).
+ * One entry per endpoint, each carrying that endpoint's `baseUrl`, so the
+ * existing `resolveCredentials({ storageKeys })` override resolves a local model
+ * with no new code path. Kept in sync with `localAuthStorageKey()` in
+ * local-models.ts.
+ */
+export const LOCAL_AUTH_KEY_PREFIX = "local:";
+
+/** A century — local endpoints have no token lifetime, so never expire them. */
+const LOCAL_CREDENTIAL_LIFETIME_MS = 100 * 365 * 24 * 60 * 60 * 1000;
+
+/**
  * The credential entry whose baseUrl applies right now. For `moonshot` this
  * mirrors resolveCredentials' preference: the Kimi OAuth entry, sidelined to
  * the Moonshot API key only while its usage window is exhausted and a key is
@@ -104,6 +116,8 @@ const STATIC_API_KEY_PROVIDERS = new Set([
   "openrouter",
   "sakana",
   "xai",
+  // Local endpoints: a fixed (usually placeholder) key, never refreshable.
+  "local",
 ]);
 
 export class AuthStorage {
@@ -159,7 +173,38 @@ export class AuthStorage {
     if (provider === "xiaomi") {
       return Boolean(this.data["xiaomi"] || this.data[XIAOMI_CREDITS_KEY]);
     }
+    // `local` has no single credential — any configured endpoint counts.
+    if (provider === "local") {
+      return Object.keys(this.data).some((key) => key.startsWith(LOCAL_AUTH_KEY_PREFIX));
+    }
     return Boolean(this.data[provider]);
+  }
+
+  /** Endpoint ids that currently have a `local:<id>` credential stored. */
+  async listLocalEndpointIds(): Promise<string[]> {
+    await this.ensureLoaded();
+    return Object.keys(this.data)
+      .filter((key) => key.startsWith(LOCAL_AUTH_KEY_PREFIX))
+      .map((key) => key.slice(LOCAL_AUTH_KEY_PREFIX.length));
+  }
+
+  /**
+   * Write (or refresh) the credential for one local endpoint. The `baseUrl` is
+   * what `effectiveBaseUrl` later picks up, and `accessToken` is the endpoint's
+   * key — a placeholder for the servers that ignore it.
+   */
+  async setLocalEndpoint(endpointId: string, baseUrl: string, apiKey?: string): Promise<void> {
+    await this.setCredentials(`${LOCAL_AUTH_KEY_PREFIX}${endpointId}`, {
+      accessToken: apiKey && apiKey.length > 0 ? apiKey : "local",
+      refreshToken: "",
+      expiresAt: Date.now() + LOCAL_CREDENTIAL_LIFETIME_MS,
+      baseUrl,
+    });
+  }
+
+  /** Remove one local endpoint's credential. No-op when it isn't stored. */
+  async removeLocalEndpoint(endpointId: string): Promise<void> {
+    await this.clearCredentials(`${LOCAL_AUTH_KEY_PREFIX}${endpointId}`);
   }
 
   /**

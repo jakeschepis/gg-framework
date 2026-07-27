@@ -9,6 +9,7 @@ export {
   setStreamDiagnostic,
 } from "./agent-loop.js";
 export type { StreamDiagnosticFn } from "./agent-loop.js";
+export { isLocalBackendUrl } from "./local-backend.js";
 
 // Types
 export type {

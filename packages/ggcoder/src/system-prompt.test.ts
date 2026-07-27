@@ -109,6 +109,11 @@ describe("buildSystemPrompt", () => {
     );
     expect(prompt).toContain("Woops I just farted!");
     expect(prompt).toContain("never repeat, never force, never explain");
+    // The one-approach rule must carve out command flows that ship their own
+    // A/B/C option list, or the model second-guesses those prompts.
+    expect(prompt).toContain(
+      "Recommend ONE approach, not a menu — unless a command's flow defines its own options.",
+    );
     expect(prompt).not.toContain(
       "Do not default to generic tests, scripts, screenshots, benchmarks, or simulations",
     );
@@ -467,6 +472,26 @@ describe("buildSystemPrompt", () => {
 
     // Non-Windows hosts (and Windows with Git Bash) run POSIX bash.
     expect(prompt).toContain("- Shell: bash (POSIX)");
+  });
+
+  it("lists additional roots and the network allowlist in the Environment section", async () => {
+    const cwd = await makeProject();
+    const plain = await buildSystemPrompt(cwd, undefined, false, undefined, ["read"]);
+    expect(plain).not.toContain("Additional roots:");
+    expect(plain).not.toContain("Network allowlist:");
+
+    const scoped = await buildSystemPrompt(
+      cwd,
+      undefined,
+      false,
+      undefined,
+      ["read"],
+      undefined,
+      undefined,
+      { additionalRoots: ["/work/sdk"], networkAllow: ["*.github.com"] },
+    );
+    expect(scoped).toContain("- Additional roots: /work/sdk");
+    expect(scoped).toContain("- Network allowlist: *.github.com");
   });
 
   it("states the nearest-wins precedence rule in the project context section", async () => {

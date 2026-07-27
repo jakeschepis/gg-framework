@@ -38,6 +38,30 @@ describe("resolveWriteGuard", () => {
     expect(result.allowed).toBe(true); // tmpdir root still allows it
   });
 
+  it("allows writes under an additional root", () => {
+    const extra = path.join(os.homedir(), "sibling-sdk");
+    const target = path.join(extra, "src", "index.ts");
+    expect(resolveWriteGuard(cwd, target).allowed).toBe(false);
+    expect(resolveWriteGuard(cwd, target, { additionalRoots: [extra] }).allowed).toBe(true);
+  });
+
+  it("still blocks paths outside every root and names them all", () => {
+    const extra = path.join(os.homedir(), "sibling-sdk");
+    const target = path.join(os.homedir(), "Documents", "outside.txt");
+    const result = resolveWriteGuard(cwd, target, { additionalRoots: [extra] });
+    expect(result.allowed).toBe(false);
+    expect(result.reason).toContain(cwd);
+    expect(result.reason).toContain(extra);
+  });
+
+  it("does not treat a shared-prefix sibling of an additional root as inside", () => {
+    const extra = path.join(os.homedir(), "sibling-sdk");
+    const result = resolveWriteGuard(path.join(os.homedir(), "project"), `${extra}-evil/file.txt`, {
+      additionalRoots: [extra],
+    });
+    expect(result.allowed).toBe(false);
+  });
+
   it("allows everything when allowOutsideWorkspaceWrites is enabled", () => {
     const target = path.join(os.homedir(), "Documents", "outside.txt");
     expect(resolveWriteGuard(cwd, target, { allowOutsideWorkspaceWrites: true }).allowed).toBe(

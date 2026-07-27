@@ -189,7 +189,18 @@ export class LspManager {
       this.clients.set(key, Promise.resolve({ status: "server_failed" }));
       return this.outcome("server_failed", filePath);
     }
-    if (diagnostics === null) return this.outcome("timeout", filePath);
+    if (diagnostics === null) {
+      // A timeout carries no other evidence and is indistinguishable from
+      // "clean" in the tool output. Log the server's own stderr alongside it —
+      // usually the only thing that explains why a server accepted the document
+      // and then never reported on it.
+      log("WARN", "lsp", `${spec.id} diagnostics timed out`, {
+        file: filePath,
+        budgetMs,
+        stderr: client.stderrTail() || "(none)",
+      });
+      return this.outcome("timeout", filePath);
+    }
 
     if (diagnostics.length > 0) {
       const relPath = path.relative(this.cwd, filePath);
@@ -214,9 +225,16 @@ export class LspManager {
         log("INFO", "lsp", `${spec.id} language server not available`, { root });
         return { status: "unavailable" };
       }
+      // `client` is declared outside the try so one that fails to initialize
+      // can still be killed. `new LspClient` SPAWNS the process, so discarding
+      // the reference on a throw leaked the server forever — one orphan per
+      // (server, root) every time initialize timed out, for the life of the
+      // session. Invisible on POSIX; on Windows the orphan keeps handles open
+      // in the project directory.
+      let client: LspClient | undefined;
       try {
         const startedAt = Date.now();
-        const client = new LspClient(spec, root, command);
+        client = new LspClient(spec, root, command);
         await client.initialize(INIT_TIMEOUT_MS);
         if (!client.isAlive) return { status: "server_failed" };
         log("INFO", "lsp", `${spec.id} server initialized`, {
@@ -228,7 +246,11 @@ export class LspManager {
         log("WARN", "lsp", `${spec.id} server failed to start`, {
           root,
           error: error instanceof Error ? error.message : String(error),
+          // The server's own last words — usually the only explanation of why
+          // the handshake never completed.
+          stderr: client?.stderrTail() || "(none)",
         });
+        client?.terminate();
         return { status: "server_failed" };
       }
     })();

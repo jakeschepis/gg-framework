@@ -7,6 +7,7 @@ import type * as CompactorModule from "./compaction/compactor.js";
 import type * as GgAgentModule from "@kenkaiiii/gg-agent";
 import type * as McpModule from "./mcp/index.js";
 import { normalizeAppMarkersForHistory } from "./session-history.js";
+import { useFakeHome } from "../test-support/fake-home.js";
 
 const shouldCompactMock = vi.hoisted(() => vi.fn());
 const compactMock = vi.hoisted(() => vi.fn());
@@ -42,7 +43,7 @@ vi.mock("./mcp/index.js", async () => {
   };
 });
 
-let originalHome: string | undefined;
+let restoreHome: (() => void) | undefined;
 let tmpHome: string;
 let tmpProject: string;
 
@@ -64,10 +65,9 @@ async function findSessionFile(): Promise<string> {
 }
 
 beforeEach(async () => {
-  originalHome = process.env.HOME;
   tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "marker-anchor-home-"));
   tmpProject = await fs.mkdtemp(path.join(os.tmpdir(), "marker-anchor-project-"));
-  process.env.HOME = tmpHome;
+  restoreHome = useFakeHome(tmpHome);
 
   shouldCompactMock.mockReset().mockReturnValue(false);
   compactMock.mockReset();
@@ -87,8 +87,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  restoreHome?.();
   await fs.rm(tmpHome, { recursive: true, force: true });
   await fs.rm(tmpProject, { recursive: true, force: true });
   vi.clearAllMocks();

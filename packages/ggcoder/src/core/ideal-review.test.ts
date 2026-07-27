@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import path from "node:path";
 import {
   buildIdealReviewMessage,
   buildReviewCoverageMessage,
@@ -130,9 +131,13 @@ describe("buildIdealReviewMessage", () => {
 
 describe("detectTestDrift", () => {
   const cwd = "/proj";
+  // Fixture paths are written POSIX-style for readability, but the code under
+  // test builds candidates with path.join/path.resolve — which on Windows
+  // yields `D:\proj\src\foo.test.ts`. Resolve BOTH sides so the lookup compares
+  // like with like instead of silently never matching.
   const exists = (files: string[]) => {
-    const set = new Set(files);
-    return (p: string) => set.has(p);
+    const set = new Set(files.map((f) => path.resolve(cwd, f)));
+    return (p: string) => set.has(path.resolve(cwd, p));
   };
 
   it("flags a changed source whose sibling test exists but was not touched", () => {

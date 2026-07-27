@@ -167,6 +167,8 @@ export interface AgentState {
   gitHubPRs?: number | null;
   /** Web URL of the project's GitHub origin repo (title-bar chip links). */
   gitHubRepoUrl?: string | null;
+  /** Extra workspace roots added with /add-dir. Absent on older sidecars. */
+  additionalRoots?: string[];
   /** True when the active model can accept native video input. */
   supportsVideo?: boolean;
   /** Autopilot (auto-review) toggle for this window's project. Per-window,
@@ -253,6 +255,16 @@ export interface ModelOption {
   id: string;
   name: string;
   provider: string;
+  /** True for a locally hosted model (Ollama / LM Studio / llama.cpp / vLLM). */
+  local?: boolean;
+  /** Display name of the local endpoint serving it, e.g. "Ollama". */
+  endpoint?: string;
+  /** Local models only: false means it can't call tools, so it can't run the agent. */
+  supportsTools?: boolean;
+  contextWindow?: number;
+  /** False when the local server didn't report a real context length (we guessed). */
+  contextWindowKnown?: boolean;
+  supportsThinking?: boolean;
 }
 
 export interface SlashCommand {
@@ -360,6 +372,9 @@ export interface SubscriptionUsageProviderSnapshot {
   windows: SubscriptionUsageWindow[];
   fetchedAt: number;
   error?: string;
+  /** True when the sidecar is replaying its last good snapshot because the
+   *  provider's quota endpoint is currently failing (usually a 429). */
+  stale?: boolean;
 }
 
 /** Fetch OAuth subscription quota. Tokens never leave the sidecar. */
@@ -682,6 +697,29 @@ export async function listHistory(): Promise<HistoryEntry[]> {
   }
 }
 
+// ── Transcript export ──────────────────────────────────────
+
+/** Suggested filename for this session's Markdown export, e.g.
+ *  `your-chat-2026-07-26-1402.md`. Fetched before the save dialog opens. */
+export async function exportTranscriptName(): Promise<string | null> {
+  try {
+    await waitForReady();
+    const res = await invoke<{ filename: string }>("agent_export_transcript", { path: null });
+    return res.filename ?? null;
+  } catch (e) {
+    await logError(`agent_export_transcript(name) failed: ${String(e)}`);
+    return null;
+  }
+}
+
+/** Write this session's Markdown transcript to `path`. Rust does the fetch and
+ *  the write, so the transcript itself never crosses the IPC bridge. Throws
+ *  with a user-facing message so the caller can surface it in a toast. */
+export async function saveTranscript(path: string): Promise<{ path: string; bytes: number }> {
+  await waitForReady();
+  return invoke<{ path: string; bytes: number }>("agent_export_transcript", { path });
+}
+
 // ── Provider auth (login) ──────────────────────────────────
 export type AuthMethod = "oauth" | "apikey";
 
@@ -860,14 +898,38 @@ export async function listModels(): Promise<ModelOption[]> {
   }
 }
 
-/** Switch the active model by id. Returns the new provider/model + thinking state. */
-export async function switchModel(model: string): Promise<SwitchModelResult | null> {
+/**
+ * Switch the active model by id. Returns the new provider/model + thinking
+ * state, or `{ error }` when the switch was refused.
+ *
+ * A refusal is a message worth showing, not just logging: the sidecar
+ * deliberately explains *why* ("Ollama isn't running at …", "has no tool
+ * calling, so it can't run the agent"), and it arrives in the response body
+ * rather than as a thrown IPC error — so unpack it here and let the caller
+ * surface it.
+ */
+export async function switchModel(model: string): Promise<SwitchModelResult | { error: string }> {
   try {
-    return await invoke<SwitchModelResult>("agent_switch_model", { model });
+    const res = await invoke<SwitchModelResult & { error?: string }>("agent_switch_model", {
+      model,
+    });
+    if (res.error) {
+      await logError(`agent_switch_model refused: ${res.error}`);
+      return { error: res.error };
+    }
+    return res;
   } catch (e) {
-    await logError(`agent_switch_model failed: ${String(e)}`);
-    return null;
+    const message = e instanceof Error ? e.message : String(e);
+    await logError(`agent_switch_model failed: ${message}`);
+    return { error: message };
   }
+}
+
+/** Narrow a {@link switchModel} result to the refusal case. */
+export function isSwitchModelError(
+  result: SwitchModelResult | { error: string },
+): result is { error: string } {
+  return "error" in result;
 }
 
 /** Pin Ken (mentor + autopilot) to a model, or pass null to clear the pin so
@@ -1162,6 +1224,91 @@ export interface WindowOrderEvent {
 export async function onWindowOrder(cb: (e: WindowOrderEvent) => void): Promise<() => void> {
   const un = await appWindow.listen<WindowOrderEvent>("window-order", (e) => cb(e.payload));
   return un;
+}
+
+// ── Local models (Ollama / LM Studio / llama.cpp / vLLM) ──
+
+/** One model as reported by a local server, with its probed capabilities. */
+export interface LocalModelRow {
+  /** Full registry id (`local/<endpoint>/<rawId>`) — what `switchModel` takes. */
+  id: string;
+  /** Id on the wire, as the server names it. */
+  rawId: string;
+  contextWindow: number;
+  contextWindowKnown: boolean;
+  supportsTools: boolean;
+  supportsImages: boolean;
+  supportsThinking: boolean;
+  /** LM Studio only: whether the model is currently loaded in memory. */
+  loaded?: boolean;
+}
+
+export interface LocalEndpointRow {
+  id: string;
+  label: string;
+  baseUrl: string;
+  kind: "ollama" | "lmstudio" | "llamacpp" | "vllm" | "custom";
+  /** User-added endpoints can be removed; built-in ones can't. */
+  custom: boolean;
+  reachable: boolean;
+  /** Why it's unreachable, e.g. "Not running at http://127.0.0.1:11434/v1". */
+  reason?: string;
+  models: LocalModelRow[];
+}
+
+export interface LocalModelsState {
+  endpoints: LocalEndpointRow[];
+}
+
+/**
+ * The Rust proxies pass the sidecar's response body through verbatim, so a
+ * validation failure arrives as `{ error }` with no thrown exception. Turn it
+ * into a real error here — once — so every caller can just try/catch.
+ */
+function unwrapLocalState(res: LocalModelsState & { error?: string }): LocalModelsState {
+  if (res.error) throw new Error(res.error);
+  return { endpoints: res.endpoints ?? [] };
+}
+
+/** Last scan's endpoints + models. Cheap — does not probe. */
+export async function getLocalModels(): Promise<LocalModelsState> {
+  try {
+    await waitForReady();
+    const res = await invoke<LocalModelsState>("agent_local");
+    return unwrapLocalState(res);
+  } catch (e) {
+    await logError(`agent_local failed: ${String(e)}`);
+    return { endpoints: [] };
+  }
+}
+
+/** Re-probe every local endpoint. Throws with a user-facing message on failure. */
+export async function scanLocalModels(): Promise<LocalModelsState> {
+  await waitForReady();
+  const res = await invoke<LocalModelsState>("agent_local_scan");
+  return unwrapLocalState(res);
+}
+
+/** Add a custom endpoint, then re-scan. Throws the validation message on a bad URL. */
+export async function addLocalEndpoint(
+  baseUrl: string,
+  label?: string,
+  apiKey?: string,
+): Promise<LocalModelsState> {
+  await waitForReady();
+  const res = await invoke<LocalModelsState>("agent_local_endpoint_add", {
+    baseUrl,
+    label: label ?? null,
+    apiKey: apiKey ?? null,
+  });
+  return unwrapLocalState(res);
+}
+
+/** Remove a custom endpoint (and its stored credential), then re-scan. */
+export async function removeLocalEndpoint(id: string): Promise<LocalModelsState> {
+  await waitForReady();
+  const res = await invoke<LocalModelsState>("agent_local_endpoint_remove", { id });
+  return unwrapLocalState(res);
 }
 
 // ── Telegram serve (remote control via Telegram) ───────────

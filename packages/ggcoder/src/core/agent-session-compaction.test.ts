@@ -9,6 +9,7 @@ import type * as GgAgentModule from "@kenkaiiii/gg-agent";
 import { MODELS } from "./model-registry.js";
 import { estimateConversationTokens } from "./compaction/token-estimator.js";
 import type * as McpModule from "./mcp/index.js";
+import { useFakeHome } from "../test-support/fake-home.js";
 
 const shouldCompactMock = vi.hoisted(() => vi.fn());
 const compactMock = vi.hoisted(() => vi.fn());
@@ -44,7 +45,7 @@ vi.mock("./mcp/index.js", async () => {
   };
 });
 
-let originalHome: string | undefined;
+let restoreHome: (() => void) | undefined;
 let tmpHome: string;
 let tmpProject: string;
 
@@ -73,10 +74,9 @@ const providerModels = MODELS.filter(
 ).map((model) => ({ provider: model.provider, model: model.id }));
 
 beforeEach(async () => {
-  originalHome = process.env.HOME;
   tmpHome = await fs.mkdtemp(path.join(os.tmpdir(), "agent-session-home-"));
   tmpProject = await fs.mkdtemp(path.join(os.tmpdir(), "agent-session-project-"));
-  process.env.HOME = tmpHome;
+  restoreHome = useFakeHome(tmpHome);
 
   shouldCompactMock.mockReset();
   compactMock.mockReset();
@@ -117,8 +117,7 @@ beforeEach(async () => {
 });
 
 afterEach(async () => {
-  if (originalHome === undefined) delete process.env.HOME;
-  else process.env.HOME = originalHome;
+  restoreHome?.();
   await fs.rm(tmpHome, { recursive: true, force: true });
   await fs.rm(tmpProject, { recursive: true, force: true });
   vi.clearAllMocks();

@@ -1,5 +1,5 @@
 // Core entry point
-export { stream } from "./stream.js";
+export { stream, localWireModelId } from "./stream.js";
 
 // Provider registry
 export { providerRegistry } from "./provider-registry.js";

@@ -1,9 +1,11 @@
 import { useCallback, useEffect, useState } from "react";
+import { Cpu } from "lucide-react";
 import { theme } from "./theme";
 import { authStatus, type AuthProvider } from "./agent";
 import { Badge } from "./Badge";
 import { BackButton } from "./BackButton";
 import { ProviderLoginModal } from "./ProviderLoginModal";
+import { LocalModelsModal } from "./LocalModelsModal";
 import { providerLogo } from "./provider-logos";
 
 interface Props {
@@ -19,6 +21,7 @@ export function LoginScreen({ onClose }: Props): React.ReactElement {
   const [providers, setProviders] = useState<AuthProvider[]>([]);
   const [loading, setLoading] = useState(true);
   const [active, setActive] = useState<AuthProvider | null>(null);
+  const [localOpen, setLocalOpen] = useState(false);
 
   const refresh = useCallback(async (): Promise<void> => {
     const list = await authStatus();
@@ -91,6 +94,26 @@ export function LoginScreen({ onClose }: Props): React.ReactElement {
               </button>
             );
           })}
+          {/* Local models aren't a provider you log into — they're whatever the
+              user already runs. Same tile shape so the hub stays one grid. */}
+          {!loading && (
+            <button
+              className="login-tile"
+              onClick={() => setLocalOpen(true)}
+              title="Ollama, LM Studio, llama.cpp, vLLM — running on this machine"
+            >
+              {/* A chip, not a house: these models run on this machine's own
+                  hardware. Sized to fill the 48px logo box like the provider
+                  logos, instead of a glyph sized for a single letter. */}
+              <span className="login-tile-logo">
+                <Cpu size={44} strokeWidth={1.25} color={theme.text} aria-hidden="true" />
+              </span>
+              <span className="login-tile-name">Local models</span>
+              <span className="login-tile-methods">
+                <Badge>No key needed</Badge>
+              </span>
+            </button>
+          )}
         </div>
       </div>
 
@@ -101,6 +124,8 @@ export function LoginScreen({ onClose }: Props): React.ReactElement {
           onChanged={() => void refresh()}
         />
       )}
+
+      {localOpen && <LocalModelsModal onClose={() => setLocalOpen(false)} />}
     </div>
   );
 }

@@ -1688,12 +1688,38 @@ body {
   line-height: 1.5;
   padding: 8px 2px;
 }
+/* One local model per row: elastic name, right-aligned figure. Informational
+   only — models are selected in the footer picker. Capabilities live in the
+   row's tooltip; a chip per capability overflowed the modal on real names. */
+.local-model-row {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto;
+  align-items: center;
+  gap: 8px;
+  width: 100%;
+  padding: 3px 6px 3px 20px;
+  font-size: 12px;
+  text-align: left;
+}
+.local-model-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.local-model-meta {
+  font-size: 11px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
 .mcp-list {
   display: flex;
   flex-direction: column;
   gap: 2px;
   max-height: min(44vh, 320px);
   overflow-y: auto;
+  /* No rubber-band bounce at the ends, and no scroll chaining to whatever sits
+     behind the modal. */
+  overscroll-behavior: none;
   scrollbar-gutter: stable;
   padding-right: 4px;
   margin: 2px 0 14px;
@@ -2032,6 +2058,87 @@ body {
      spills onto the chat-head border or the tool panel/footer beyond this
      frame. */
   overflow: hidden;
+}
+
+/* ── Export-chat pill (hover-revealed) ───────────────────────────────────
+   Floats in the bottom-right of the chat viewport, anchored to
+   `.transcript-frame` — the NON-scrolling sibling. Anchoring to `.transcript`
+   would pin it to the top of the scrolled content instead of what's on screen
+   (same trap the Ken power banner comment above documents).
+
+   Always in the DOM so the exit transition can play; `visibility` joins the
+   transition (delayed on the way out, instant on the way in) so the hidden
+   button is fully inert rather than an invisible click target. */
+.export-chat {
+  position: absolute;
+  right: 16px;
+  bottom: 12px;
+  z-index: 3;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 11px;
+  border: 1px solid var(--border);
+  border-radius: var(--radius-pill);
+  background: var(--surface-2);
+  color: var(--text-secondary);
+  font-family: var(--sans);
+  font-size: 12px;
+  line-height: 1;
+  cursor: pointer;
+  /* Hidden state: faded, nudged down, and untouchable. */
+  opacity: 0;
+  visibility: hidden;
+  transform: translateY(6px);
+  pointer-events: none;
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease,
+    background var(--t-fast),
+    border-color var(--t-fast),
+    color var(--t-fast),
+    visibility 0s linear 0.18s;
+}
+.export-chat.visible {
+  opacity: 1;
+  visibility: visible;
+  transform: translateY(0);
+  pointer-events: auto;
+  transition:
+    opacity 0.18s ease,
+    transform 0.18s ease,
+    background var(--t-fast),
+    border-color var(--t-fast),
+    color var(--t-fast),
+    visibility 0s;
+}
+.export-chat.visible:hover {
+  background: color-mix(in srgb, var(--surface-2) 88%, var(--primary));
+  border-color: var(--border-strong);
+  color: var(--text);
+}
+.export-chat:disabled {
+  cursor: default;
+  color: var(--text-muted);
+}
+.export-chat:disabled:hover {
+  background: var(--surface-2);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+@media (prefers-reduced-motion: reduce) {
+  .export-chat {
+    transform: none;
+    transition:
+      opacity 0.18s ease,
+      visibility 0s linear 0.18s;
+  }
+  .export-chat.visible {
+    transform: none;
+    transition:
+      opacity 0.18s ease,
+      visibility 0s;
+  }
 }
 .transcript {
   flex: 1 1 auto;
@@ -4181,6 +4288,8 @@ body {
   max-width: min(640px, 90vw);
   max-height: 50vh;
   overflow-y: auto;
+  /* No rubber-band bounce, and no scroll chaining to the transcript behind. */
+  overscroll-behavior: none;
   padding: 8px;
   border: 1px solid;
   border-radius: var(--radius-card);
@@ -4190,6 +4299,18 @@ body {
   padding: 2px 6px 6px;
   font-size: 11px;
   letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+/* Per-provider group heading. Quieter than the menu title so the hierarchy
+   reads title > provider > model. */
+.model-menu-section + .model-menu-section {
+  margin-top: 6px;
+}
+.model-menu-subtitle {
+  padding: 2px 6px 3px;
+  font-size: 10px;
+  font-weight: 600;
+  letter-spacing: 0.07em;
   text-transform: uppercase;
 }
 .model-menu-grid {

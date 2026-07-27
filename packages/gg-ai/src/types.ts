@@ -14,7 +14,9 @@ export type Provider =
   | "openrouter"
   | "sakana"
   | "xai"
-  | "palsu";
+  | "palsu"
+  /** Locally hosted OpenAI-compatible server (Ollama, LM Studio, llama.cpp, vLLM). */
+  | "local";
 
 // ── Thinking ───────────────────────────────────────────────
 

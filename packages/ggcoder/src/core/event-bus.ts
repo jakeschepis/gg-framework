@@ -32,6 +32,8 @@ export interface BusEventMap {
     };
   };
   max_turns: { totalTurns: number; maxTurns: number };
+  /** Turn budget was exhausted but extended because the run showed progress. */
+  turn_budget_extended: { turn: number; grantedTurns: number; extension: number };
   truncated: { reason: "max_tokens" | "refusal" | "provider_error"; continued: boolean };
   error: { error: Error };
 
@@ -156,6 +158,13 @@ export class EventBus {
         this.emit("max_turns", {
           totalTurns: event.totalTurns,
           maxTurns: event.maxTurns,
+        });
+        break;
+      case "turn_budget_extended":
+        this.emit("turn_budget_extended", {
+          turn: event.turn,
+          grantedTurns: event.grantedTurns,
+          extension: event.extension,
         });
         break;
       case "truncated":

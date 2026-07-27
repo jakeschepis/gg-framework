@@ -5,7 +5,8 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 
 import type * as ConfigModule from "../config.js";
 import { encodeCwd } from "./encode-cwd.js";
-import { discoverProjects, listRecentSessions } from "./project-discovery.js";
+import { discoverProjects, isAbsoluteCwd, listRecentSessions } from "./project-discovery.js";
+import { SessionManager } from "./session-manager.js";
 import { archiveColdSession, archiveSessionPath } from "./session-storage.js";
 
 // Holder the hoisted mock reads at call time (vi.mock is hoisted above imports,
@@ -314,6 +315,26 @@ describe("discoverProjects (ggcoder store)", () => {
     expect(sessions[0]?.preview).toBe("Replace title generation with project context");
   });
 
+  // Windows regression: the cwd extractors used to accept only POSIX absolute
+  // paths (`startsWith("/")`), so every `C:\…` header was rejected, discovery
+  // fell through to the lossy directory-name decode, and the project vanished
+  // from the picker. Runs on every platform — the header guard is under test.
+  it("accepts a Windows-style absolute cwd header", async () => {
+    const projectPath = path.join(tmp, "projects", "winapp");
+    await fs.mkdir(projectPath, { recursive: true });
+    await writeSession(path.join(state.sessionsDir, "C_Users_dev_winapp"), projectPath);
+
+    // The guard itself must accept every absolute form we can be handed.
+    expect(isAbsoluteCwd("C:\\Users\\dev\\winapp")).toBe(true);
+    expect(isAbsoluteCwd("c:/Users/dev/winapp")).toBe(true);
+    expect(isAbsoluteCwd("\\\\server\\share\\winapp")).toBe(true);
+    expect(isAbsoluteCwd("/Users/dev/winapp")).toBe(true);
+    expect(isAbsoluteCwd("relative/winapp")).toBe(false);
+
+    const projects = await discoverProjects();
+    expect(projects.find((p) => p.path === projectPath)).toBeDefined();
+  });
+
   // The best-effort decode only round-trips for underscore-free absolute paths
   // (that's the whole point of the header fix). macOS's own os.tmpdir() contains
   // a literal underscore, so this test roots its project under posix /tmp to get
@@ -342,4 +363,101 @@ describe("discoverProjects (ggcoder store)", () => {
       }
     },
   );
+});
+
+/**
+ * REAL Windows round-trip — runs only on an actual Windows host (the CI
+ * `windows-latest` matrix leg), skipped everywhere else.
+ *
+ * Every other test in this file fakes Windows by feeding in `C:\…` strings on a
+ * POSIX host, which cannot catch the class of bug that actually bit users: the
+ * cwd the OS hands us, the folder name `encodeCwd` derives from it, and the
+ * path discovery reconstructs must agree on a REAL filesystem with real drive
+ * letters, real backslashes, and case-insensitive lookups. This drives the
+ * genuine writer (`SessionManager.create`) rather than hand-written JSON, so
+ * the write side and the read side are proven against each other.
+ */
+describe.skipIf(process.platform !== "win32")("real Windows session round-trip", () => {
+  let tmp: string;
+
+  beforeEach(async () => {
+    tmp = await fs.mkdtemp(path.join(os.tmpdir(), "gg-win-rt-"));
+    state.sessionsDir = path.join(tmp, ".gg", "sessions");
+    await fs.mkdir(state.sessionsDir, { recursive: true });
+    vi.spyOn(os, "homedir").mockReturnValue(path.join(tmp, "home"));
+  });
+
+  afterEach(async () => {
+    vi.restoreAllMocks();
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("a session written by SessionManager is discoverable at its real C:\\ path", async () => {
+    const projectPath = path.join(tmp, "projects", "win-app");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    // Sanity-check the premise: on Windows this really is a drive-letter path.
+    expect(projectPath).toMatch(/^[A-Za-z]:\\/);
+
+    const manager = new SessionManager(state.sessionsDir);
+    const created = await manager.create(projectPath, "anthropic", "claude-sonnet-5", {
+      preview: "windows round trip",
+    });
+    // listRecentSessions deliberately skips header-only sessions, so a real
+    // session needs at least one message to be resumable from the picker.
+    await manager.appendEntry(created.path, {
+      type: "message",
+      id: "33333333-3333-3333-3333-333333333333",
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      message: { role: "user", content: "hi" },
+    });
+    // The real writer must have produced a folder name with no illegal
+    // characters — a stray `:` or `\` here is an ENOENT at session-create time.
+    expect(path.dirname(created.path)).toBe(path.join(state.sessionsDir, encodeCwd(projectPath)));
+    expect(path.basename(path.dirname(created.path))).not.toMatch(/[<>:"|?*\\/]/);
+
+    const projects = await discoverProjects();
+    const found = projects.find((p) => p.path === projectPath);
+    expect(found).toBeDefined();
+    expect(found?.name).toBe("win-app");
+    expect(found?.sources).toContain("ggcoder");
+
+    // …and the same path resolves back to the session for the picker's
+    // "recent sessions" list.
+    const recent = await listRecentSessions(projectPath, 5, state.sessionsDir);
+    expect(recent.map((s) => s.id)).toContain(created.id);
+  });
+
+  it("survives a path with spaces and a literal underscore", async () => {
+    // `C:\Users\<name>\…` routinely contains spaces; the underscore is the
+    // separator `encodeCwd` uses, so a literal one is the lossy-decode trap.
+    const projectPath = path.join(tmp, "My Projects", "gg_app");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const manager = new SessionManager(state.sessionsDir);
+    await manager.create(projectPath, "anthropic", "claude-sonnet-5");
+
+    const projects = await discoverProjects();
+    expect(projects.find((p) => p.path === projectPath)?.name).toBe("gg_app");
+  });
+
+  it("normalizes an extended-length cwd so it isn't a duplicate project", async () => {
+    // Rust's canonicalize() ALWAYS produces `\\?\C:\…`, so that's what shipped
+    // builds recorded in session headers. encodeCwd normalizes the prefix away,
+    // so both forms already share ONE store directory — but the header cwd is
+    // read back verbatim, so without matching normalization on the read side
+    // the same project surfaced twice: `C:\proj` AND `\\?\C:\proj`.
+    const projectPath = path.join(tmp, "projects", "extended");
+    await fs.mkdir(projectPath, { recursive: true });
+
+    const manager = new SessionManager(state.sessionsDir);
+    await manager.create(`\\\\?\\${projectPath}`, "anthropic", "claude-sonnet-5");
+    await manager.create(projectPath, "anthropic", "claude-sonnet-5");
+
+    const projects = await discoverProjects();
+    expect(projects.filter((p) => p.path === projectPath)).toHaveLength(1);
+    // A prefixed path must never reach the picker.
+    expect(projects.every((p) => !p.path.startsWith("\\\\?\\"))).toBe(true);
+  });
 });

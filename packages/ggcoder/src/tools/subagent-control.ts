@@ -24,7 +24,9 @@ export function createSubAgentControlTools(
   const spawnTool: AgentTool<typeof spawnParams> = {
     name: "spawn_agent",
     description:
-      "Start an isolated persistent child agent and return immediately after launch. Start all independent agents before waiting; shared files are not isolated.",
+      "Start an isolated persistent child agent and return immediately after launch. " +
+      "Start all independent agents, then keep working \u2014 each child announces its own " +
+      "completion to you, so you do not need to wait or poll. Shared files are not isolated.",
     parameters: spawnParams,
     executionMode: "parallel",
     async execute(args) {
@@ -77,7 +79,10 @@ export function createSubAgentControlTools(
   });
   const waitTool: AgentTool<typeof waitParams> = {
     name: "wait_agent",
-    description: "Wait for any or all requested child agents and return bounded result snapshots.",
+    description:
+      "Block until child agents finish and return their bounded output snapshots. " +
+      "Completions already arrive on their own \u2014 use this only when you need a child's " +
+      "actual output before you can continue, or to collect results before finishing.",
     parameters: waitParams,
     async execute(args) {
       return json(await manager.wait(args.agent_ids, args.condition, args.timeout_ms));

@@ -100,7 +100,10 @@ describe("session entry storage normalization", () => {
 
     const raw = await readFile(created.path, "utf8");
     expect(raw).not.toContain(base64);
-    expect(raw).toContain(sourcePath);
+    // The session file is JSONL, so the path is JSON-ESCAPED inside it: on
+    // Windows a raw `C:\Users\…` never appears, it is stored as `C:\\Users\\…`.
+    // Compare against the encoded form so this means the same on every OS.
+    expect(raw).toContain(JSON.stringify(sourcePath).slice(1, -1));
     expect(existsSync(sessionAssetDir(created.path))).toBe(false);
     const loaded = await manager.load(created.path);
     const toolMessage = manager.getMessages(loaded.entries)[0] as {

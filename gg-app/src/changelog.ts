@@ -22,6 +22,47 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.30.0",
+    date: "2026-07-27",
+    items: [
+      "Your own models are really here this time. `Ollama`, `LM Studio`, llama.cpp and vLLM get found on their usual ports with no setup, and I read each one's true context size straight off your server. A model that can't call tools gets greyed out with the reason instead of quietly wasting your turn.",
+      "Picking a model is no longer a wall of names. Everything is grouped under its provider now, your local machine pinned at the bottom, so you spot the one you want instantly.",
+      "Changed your mind about a folder? `/remove-dir` drops it from the workspace, and running it bare lists exactly what you can remove. Fire it off mid-run and I queue it up rather than losing it.",
+      "Your usage bar stopped playing hide and seek. It used to vanish for minutes whenever the provider got moody about being asked, so now I hold the last real reading and tell you plainly when it's not fresh.",
+    ],
+  },
+  {
+    version: "0.29.0",
+    date: "2026-07-26",
+    items: [
+      "Every model you already run on your machine now shows up in the picker. I look for Ollama, LM Studio, llama.cpp and vLLM on their usual ports, read each model's real context size, and refuse the ones that can't call tools instead of letting them waste your turn. No key, no cost, and you can add your own endpoint if you moved a port.",
+      "You can save any chat now. Hover over the conversation and an `Export chat` button glides into the corner, one click drops a clean Markdown file wherever you want it, and I remember your folder for next time. It reads like a real document, not a machine dump.",
+      "You can point me at a second folder without leaving your project. Run `/add-dir` and I work across both repos at once, with a `+1 root` badge up top so you always know what I can reach.",
+      "You can lock down exactly which sites I am allowed to touch. Flip on the network allowlist in your settings and everything I fetch, search, clone, or install gets checked against your list first.",
+      "Local and self-hosted models were silently losing their thinking. I now catch the reasoning no matter what the endpoint calls it, so you finally see the whole train of thought — and a model that doesn't reason never gets asked to.",
+      "Local models get room to breathe. A big prompt on your own machine can take minutes to warm up, and I used to give up and retry forever. Now I wait it out, and a runaway search can no longer freeze me solid.",
+    ],
+  },
+  {
+    version: "0.28.3",
+    date: "2026-07-25",
+    items: [
+      "Windows finally feels like home. Your projects and recent sessions show up the moment you open the app, and you stay signed in instead of landing on an empty picker. I was hunting for your files in a folder Windows never actually uses.",
+      "Your work on Windows now genuinely saves. Every session write, resume, and archive was quietly failing behind the scenes, so your history could vanish when you closed the app. Nothing slips away anymore.",
+      "Inline error checking is live on Windows. I spot type errors the instant I create them and fix them in the same turn, exactly like on Mac. Before this I was getting nothing back and never knew it.",
+      "Your `MCP` servers connect on Windows. Anything set up through `npx`, which is very nearly all of them, died with a dead end error before it ever started. They boot properly now.",
+      "No more black console windows flashing when you launch or quit. I also make sure a cancelled command takes its entire process tree down with it, so runaway dev servers stop quietly piling up in the background.",
+    ],
+  },
+  {
+    version: "0.28.2",
+    date: "2026-07-25",
+    items: [
+      "Your specialist agents now research with real, live code instead of guessing from memory. Anything you point at `kencode-search` can finally reach it, so answers come back grounded in code that actually exists today. They were quietly cut off from it before.",
+      "`/bullet-proof` got its sharpest reviewers back. The deep `auditor` and `skeptic` agents were being shadowed by weaker stand-ins, so your security reports now come from the real thing again. Anything you wrote yourself stays exactly as you left it.",
+    ],
+  },
+  {
     version: "0.28.1",
     date: "2026-07-24",
     items: [

@@ -748,3 +748,57 @@ describe("createWebFetchTool", () => {
     expect(result).toContain("Fallback page");
   });
 });
+
+describe("web_fetch network allowlist", () => {
+  const allowlist = () => ({ mode: "allowlist" as const, allow: ["docs.example.com"] });
+
+  it("is a no-op when the policy is off", async () => {
+    globalThis.fetch = vi.fn(
+      async () => new Response("<html><body><p>ok</p></body></html>", { status: 200 }),
+    ) as typeof fetch;
+
+    const result = await createWebFetchTool(() => ({ mode: "off", allow: [] })).execute(
+      { url: "https://anything.example/page" },
+      context(),
+    );
+    expect(result).not.toContain("network allowlist");
+  });
+
+  it("blocks a disallowed initial URL before any request", async () => {
+    const fetchMock = vi.fn(async () => new Response("nope", { status: 200 }));
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await createWebFetchTool(allowlist).execute(
+      { url: "https://evil.example/page" },
+      context(),
+    );
+
+    expect(result).toContain("network allowlist");
+    expect(result).toContain("evil.example");
+    expect(fetchMock).not.toHaveBeenCalled();
+  });
+
+  it("blocks a disallowed redirect target", async () => {
+    const fetchMock = vi.fn(async (input: string | URL | Request) => {
+      const url = typeof input === "string" ? input : input.toString();
+      if (url.startsWith("https://docs.example.com")) {
+        return new Response(null, {
+          status: 302,
+          headers: { location: "https://evil.example/payload" },
+        });
+      }
+      return new Response("<html><body><p>secret</p></body></html>", { status: 200 });
+    });
+    globalThis.fetch = fetchMock as unknown as typeof fetch;
+
+    const result = await createWebFetchTool(allowlist).execute(
+      { url: "https://docs.example.com/start", prefer_llms_txt: false },
+      context(),
+    );
+
+    expect(result).toContain("network allowlist");
+    expect(result).toContain("evil.example");
+    // The first hop happened; the redirect target was never requested.
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+  });
+});

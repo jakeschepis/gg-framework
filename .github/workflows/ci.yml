@@ -39,7 +39,16 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      # `shell: bash` on EVERY multi-line step is load-bearing, not cosmetic.
+      # On Windows the default shell is PowerShell, which does not abort a
+      # multi-line script when an intermediate command exits non-zero — only the
+      # LAST line decides the step's outcome. So `ggcoder test` failing was
+      # silently swallowed by `gg-boss test` succeeding right after it, and the
+      # Windows leg reported SUCCESS while 72 ggcoder tests were failing. Every
+      # Windows bug this suite was supposed to catch shipped through that gap.
+      # bash's `-e` (set by the runner) makes each line fail the step.
       - name: Build framework packages
+        shell: bash
         run: |
           pnpm --filter @kenkaiiii/gg-ai build
           pnpm --filter @kenkaiiii/gg-agent build
@@ -47,6 +56,7 @@ jobs:
           pnpm --filter @kenkaiiii/gg-boss build
 
       - name: Typecheck
+        shell: bash
         run: |
           pnpm --filter @kenkaiiii/gg-ai check
           pnpm --filter @kenkaiiii/gg-agent check
@@ -54,11 +64,20 @@ jobs:
           pnpm --filter @kenkaiiii/gg-boss check
 
       - name: Test framework packages
+        shell: bash
         run: |
           pnpm --filter @kenkaiiii/gg-ai test
           pnpm --filter @kenkaiiii/gg-agent test
-          pnpm --filter @kenkaiiii/ggcoder test
           pnpm --filter @kenkaiiii/gg-boss test
+
+      # Blocking on every OS, Windows included. This started as a 72-failure
+      # Windows backlog that had been invisible because the default PowerShell
+      # shell swallowed it (see above); it is now zero, so the leg is a real
+      # gate again. Do NOT reintroduce continue-on-error to get a red build
+      # green — a non-blocking Windows leg is how the original bugs shipped.
+      - name: Test ggcoder
+        shell: bash
+        run: pnpm --filter @kenkaiiii/ggcoder test
 
       - name: ggboss CLI smoke (extra belt-and-braces)
         run: node packages/gg-boss/dist/cli.js --help
@@ -90,6 +109,13 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@stable
 
+      # Both `cargo test` and the Windows packaged build compile the same large
+      # Tauri dependency tree; without a cache the packaged smoke would rebuild
+      # it from scratch on every run.
+      - uses: Swatinem/rust-cache@v2
+        with:
+          workspaces: gg-app/src-tauri
+
       - name: Linux system deps (tauri)
         if: runner.os == 'Linux'
         run: |
@@ -99,7 +125,11 @@ jobs:
       - name: Install
         run: pnpm install --frozen-lockfile
 
+      # shell: bash for the same reason as the `test` job — on Windows a
+      # PowerShell multi-line step only reports the LAST line's exit code, so a
+      # failing build here would pass silently.
       - name: Build framework packages
+        shell: bash
         run: |
           pnpm --filter @kenkaiiii/gg-ai build
           pnpm --filter @kenkaiiii/gg-agent build
@@ -121,3 +151,20 @@ jobs:
       - name: Rust unit tests (path + window-chrome resolution)
         working-directory: gg-app/src-tauri
         run: cargo test
+
+      # Windows-only, and the ONLY job that exercises real installer output.
+      # `smoke-sidecar` above proves the bundled runtime loads, but it launches
+      # the sidecar directly — it cannot catch what actually breaks for a
+      # Windows user who installed the app: the shell failing to find
+      # `ggnode.exe` beside the exe, the sidecar resource missing from the MSI,
+      # or the app starting with no visible window. This builds an MSI,
+      # administratively extracts it (installs nothing), launches it with a
+      # throwaway user profile, and requires a visible window plus a packaged
+      # ggnode child running the packaged bundle.
+      #
+      # Only the Windows matrix leg pays the release-build cost; the macOS and
+      # Linux legs run in parallel and stay fast.
+      - name: Packaged app smoke (MSI build + launch)
+        if: runner.os == 'Windows'
+        working-directory: gg-app
+        run: pnpm smoke:packaged
