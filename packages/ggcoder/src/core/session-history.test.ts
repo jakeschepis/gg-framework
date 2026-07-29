@@ -12,6 +12,8 @@ import {
   normalizeKenTurnsForHistory,
   restoreUserRow,
   restoreAssistantTexts,
+  detectPromptCommand,
+  resolveRestoredCommand,
 } from "./session-history.js";
 
 describe("normalizeAutopilotMarkersForHistory", () => {
@@ -79,6 +81,28 @@ describe("restoreUserRow", () => {
     expect(row.text).not.toContain("[Autopilot]");
   });
 
+  it("flags autopilot-injected turns so resume can skip the bubble live never showed", () => {
+    const injected = restoreUserRow(frameAutopilotInjection("Fix the failing test."));
+    expect(injected.autopilotInjected).toBe(true);
+
+    // The same body typed by a human keeps its user bubble.
+    expect(restoreUserRow("Fix the failing test.").autopilotInjected).toBe(false);
+  });
+
+  it("detects the autopilot preamble under a steering wrapper and in block content", () => {
+    const steered = restoreUserRow(
+      `${STEERING_PREFIX}${frameAutopilotInjection("Retry the deploy.")}`,
+    );
+    expect(steered.autopilotInjected).toBe(true);
+    expect(steered.text).toBe("Retry the deploy.");
+
+    const blocks = restoreUserRow([
+      { type: "text", text: frameAutopilotInjection("Retry the deploy.") },
+    ]);
+    expect(blocks.autopilotInjected).toBe(true);
+    expect(blocks.text).toBe("Retry the deploy.");
+  });
+
   it("drops attachment notes and the attached-files block, keeps typed text + images", () => {
     const row = restoreUserRow([
       {
@@ -103,6 +127,52 @@ describe("restoreUserRow", () => {
     ]);
     expect(row.text).toBe("summarize this clip");
     expect(row.videoWarning).toBe(true);
+  });
+});
+
+describe("resolveRestoredCommand", () => {
+  const candidates = [
+    { name: "release", prompt: "# Release\n\nShip the thing." },
+    { name: "commit", prompt: "# Commit\n\nWrite a commit." },
+  ];
+
+  it("reverses an expanded template body back to its /name chip", () => {
+    expect(detectPromptCommand("# Release\n\nShip the thing.", candidates)).toBe("/release");
+    expect(resolveRestoredCommand(null, "# Release\n\nShip the thing.", candidates)).toBe(
+      "/release",
+    );
+  });
+
+  it("keeps the user's trailing args", () => {
+    const body = "# Release\n\nShip the thing.\n\n## User Instructions\n\npatch only";
+    expect(resolveRestoredCommand(null, body, candidates)).toBe("/release patch only");
+  });
+
+  it("leaves an ordinary message alone", () => {
+    expect(resolveRestoredCommand(null, "just a normal question", candidates)).toBeNull();
+  });
+
+  // The reported bug: editing a command template (or the app-vs-CLI wording of a
+  // built-in) made the body match fail, so reopening the session rendered the
+  // whole raw template instead of the `/name` chip.
+  it("uses the persisted invocation when the template has drifted since", () => {
+    const bodyFromOldTemplate = "# Release\n\nShip the thing the OLD way.";
+    // Body matching alone can no longer recognise it.
+    expect(detectPromptCommand(bodyFromOldTemplate, candidates)).toBeNull();
+    // The invocation recorded at send time still restores the chip.
+    expect(resolveRestoredCommand("/release", bodyFromOldTemplate, candidates)).toBe("/release");
+  });
+
+  it("prefers the persisted invocation over a body match, args included", () => {
+    expect(
+      resolveRestoredCommand("/release patch only", "# Release\n\nShip the thing.", candidates),
+    ).toBe("/release patch only");
+  });
+
+  it("ignores a blank persisted invocation and falls back to the body", () => {
+    expect(resolveRestoredCommand("   ", "# Commit\n\nWrite a commit.", candidates)).toBe(
+      "/commit",
+    );
   });
 });
 

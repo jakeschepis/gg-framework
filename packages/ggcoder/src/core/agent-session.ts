@@ -44,7 +44,8 @@ import {
 } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
-import { shouldCompact, compact } from "./compaction/compactor.js";
+import { shouldCompact, compact, type CompactionAnchorRemap } from "./compaction/compactor.js";
+import { remapAnchorForCompaction, stripRecordedPosition } from "./session-history.js";
 import {
   getAuthStorageKeys,
   getContextWindow,
@@ -62,10 +63,19 @@ import {
   type ProcessManager,
 } from "../tools/index.js";
 import type { BackgroundProcess } from "./process-manager.js";
+import { buildProcessCompletionFollowUp } from "./process-gate.js";
 import { buildSubAgentCompletionFollowUp, type SubAgentManager } from "./subagent-manager.js";
 import { applyAsyncSubagentPolicy } from "./subagent-policy.js";
+import { z } from "zod";
 import { MCPClientManager, getAllMcpServers } from "./mcp/index.js";
+import type { MCPServerConfig } from "./mcp/types.js";
 import { DeferredToolCatalog } from "./mcp/deferred-catalog.js";
+import { McpCatalogCache, type CachedTool } from "./mcp/catalog-cache.js";
+import {
+  describeDropped,
+  importForeignSession,
+  type ImportForeignTranscriptResult,
+} from "./foreign-session-import.js";
 import { createToolSearchTool } from "../tools/tool-search.js";
 import { log } from "./logger.js";
 import { setEstimatorModel, calibrateEstimatorFromUsage } from "./compaction/token-estimator.js";
@@ -94,8 +104,6 @@ import {
 import { buildRegroundingMessage } from "./regrounding.js";
 import { wrapSteeringText, buildNotificationSteeringText, STEERING_PREFIX } from "./steering.js";
 import { AgentNotificationQueue } from "./agent-notifications.js";
-import { ProjectJournal, buildJournalPromptTail } from "./memory/journal.js";
-import { buildCompactionNotes } from "./memory/compaction-notes.js";
 
 import { findUserSessionPrompt, getUserSessionPrompt } from "./session-preview.js";
 import { normalizeMessageImages } from "./message-images.js";
@@ -272,13 +280,6 @@ export function resolveSessionTurnToolResultCharLimit(
 }
 
 /** Marker the compactor prepends to the summary message it injects. */
-const COMPACTION_SUMMARY_MARKER = "[Previous conversation summary]";
-
-/** The compactor's summary text, identified by its marker. */
-function isCompactionSummary(content: Message["content"]): content is string {
-  return typeof content === "string" && content.startsWith(COMPACTION_SUMMARY_MARKER);
-}
-
 /**
  * True when an assistant message ends a turn with tool calls still awaiting
  * their results. Inserting a user message there would orphan the tool_use
@@ -369,6 +370,10 @@ export class AgentSession {
   /** 0 = none; 1 = first nudge sent; 2 = final stop-and-report injected. */
   private loopBreakInjected: 0 | 1 | 2 = 0;
   private regroundingInjected = false;
+  /** Wall-clock start of the current run; scopes the background-process gate. */
+  private runStartedAt = 0;
+  /** Gate injections spent this run, capped by MAX_PROCESS_GATE_INJECTIONS. */
+  private processGateInjected = 0;
   private compactionOccurred = false;
   private lastCompactionCompacted = false;
   private compactionRetryAfter = 0;
@@ -379,7 +384,12 @@ export class AgentSession {
   // mid-loop steering boundary (user steering wins over the hooks), mirroring
   // the TUI's getSteeringMessages. Each entry carries its own attachments so a
   // user can queue media (images/video/files) mid-run, not just plain text.
-  private userQueue: Array<{ text: string; attachments: SessionAttachment[] }> = [];
+  // Each entry carries a stable id so a client can cancel one specific pending
+  // message by identity. Index-based removal would race: the queue drains at
+  // every turn boundary, so an index captured by the UI can point at a
+  // different message (or past the end) by the time the cancel arrives.
+  private userQueue: Array<{ id: string; text: string; attachments: SessionAttachment[] }> = [];
+  private queueSeq = 0;
   private processManager?: ProcessManager;
   private lspManager?: LspManager;
   private subAgentManager?: SubAgentManager;
@@ -389,12 +399,6 @@ export class AgentSession {
    * live turn so the agent never has to spend a turn asking.
    */
   private readonly notifications = new AgentNotificationQueue();
-  /**
-   * Durable cross-session journal at `<project>/.gg/memory.md`. Written only by
-   * the compactor, and only as past-tense history — see `memory/journal.ts` for
-   * why nothing else may write it. Undefined when `memoryEnabled` is off.
-   */
-  private journal?: ProjectJournal;
   private managerAbortSignal?: AbortSignal;
   private readonly managerAbortHandler = () => {
     void this.subAgentManager?.interruptAll();
@@ -402,6 +406,11 @@ export class AgentSession {
   private mcpManager?: MCPClientManager;
   /** Deferred MCP tools awaiting discovery via tool_search (bench A win). */
   private mcpCatalog?: DeferredToolCatalog;
+  /** Live (connected) MCP tools by name — the reconcile target for cached stubs. */
+  private liveMcpTools = new Map<string, AgentTool>();
+  /** Server name for each cached-only tool, so a stub knows what to wait on. */
+  private cachedMcpToolServers = new Map<string, string>();
+  private readonly mcpCatalogCache = new McpCatalogCache();
   private provider: Provider;
   private model: string;
   private cwd: string;
@@ -500,13 +509,6 @@ export class AgentSession {
     this.authStorage = new AuthStorage(paths.authFile);
     await this.authStorage.load();
 
-    // Opt-in: it is the only feature here that adds tokens to every turn.
-    // Transient sessions (Ken, sub-agents) never write a project's journal —
-    // their compactions are not the project's history.
-    if (this.settingsManager.get("memoryEnabled") && !this.opts.transient) {
-      this.journal = new ProjectJournal(this.cwd);
-    }
-
     // Session manager. Agent-specific roots keep chat and coder histories isolated.
     this.sessionManager = new SessionManager(this.opts.sessionRootDir ?? paths.sessionsDir);
 
@@ -603,7 +605,10 @@ export class AgentSession {
     // its listening handshake until this resolves), `backgroundMcpConnect`
     // moves the connect off the critical path so the session becomes usable
     // immediately and tools are appended whenever the servers come up.
-    this.mcpManager = new MCPClientManager();
+    this.mcpManager = new MCPClientManager({
+      catalogCache: this.mcpCatalogCache,
+      modernProtocol: this.settingsManager.get("mcpModernProtocol"),
+    });
     if (this.opts.backgroundMcpConnect) {
       void this.connectMcpServers();
     } else {
@@ -780,6 +785,12 @@ export class AgentSession {
       if (this.opts.allowedTools && mcpWhitelist) {
         servers = servers.filter((s) => mcpWhitelist.includes(s.name));
       }
+      // Seed the catalog from the on-disk cache BEFORE connecting. With
+      // `backgroundMcpConnect` the first turns would otherwise run against an
+      // empty catalog and tool_search would answer "the catalog is empty" for
+      // capabilities that genuinely exist — a wrong answer, not a slow one.
+      await this.seedMcpCatalogFromCache(servers);
+
       const connected = await this.mcpManager.connectAll(servers);
       // Defense-in-depth: even from a whitelisted server, only push tools that
       // pass the allow-list (no-op when there's no allow-list).
@@ -818,26 +829,152 @@ export class AgentSession {
    */
   private addMcpTools(mcpTools: AgentTool[]): void {
     if (mcpTools.length === 0) return;
+    for (const tool of mcpTools) {
+      this.liveMcpTools.set(tool.name, tool);
+      this.cachedMcpToolServers.delete(tool.name);
+    }
     const defer = !this.opts.allowedTools && this.settingsManager.get("deferredMcpTools");
     if (!defer) {
-      this.tools.push(...mcpTools);
+      this.replaceOrPushTools(mcpTools);
       return;
     }
     this.mcpCatalog ??= new DeferredToolCatalog();
+    // `add` is name-keyed, so live definitions replace cached stubs in place.
     this.mcpCatalog.add(mcpTools);
-    if (!this.tools.some((t) => t.name === "tool_search")) {
-      this.tools.push(
-        createToolSearchTool(this.mcpCatalog, (promoted) => {
+    // A stub the model already promoted lives in `this.tools`; swap it for the
+    // live tool so later calls dispatch directly instead of through the stub.
+    this.replaceLivePromotedTools(mcpTools);
+    this.ensureToolSearchTool();
+  }
+
+  /**
+   * Register `tool_search` once. Promotion of a cached-only entry waits for its
+   * server so the model is told immediately when that capability turns out to
+   * be unreachable, instead of promoting a tool that fails on first call.
+   */
+  private ensureToolSearchTool(): void {
+    if (!this.mcpCatalog) return;
+    if (this.tools.some((t) => t.name === "tool_search")) return;
+    this.tools.push(
+      createToolSearchTool(
+        this.mcpCatalog,
+        (promoted) => {
           this.tools.push(...promoted);
-        }),
-      );
+        },
+        async (toolName) => {
+          if (this.liveMcpTools.has(toolName)) return undefined;
+          const serverName = this.cachedMcpToolServers.get(toolName);
+          if (!serverName) return undefined;
+          const outcome = (await this.mcpManager?.whenConnected(serverName)) ?? {
+            ok: false as const,
+            error: "MCP is disabled for this session",
+          };
+          return outcome.ok
+            ? { serverName, ok: true }
+            : { serverName, ok: false, error: outcome.error };
+        },
+      ),
+    );
+  }
+
+  /** Append tools, replacing any same-named entry (cached stub → live tool). */
+  private replaceOrPushTools(tools: AgentTool[]): void {
+    for (const tool of tools) {
+      const index = this.tools.findIndex((t) => t.name === tool.name);
+      if (index >= 0) this.tools[index] = tool;
+      else this.tools.push(tool);
+    }
+  }
+
+  /** Swap already-promoted cached stubs for their live equivalents, in place. */
+  private replaceLivePromotedTools(tools: AgentTool[]): void {
+    for (const tool of tools) {
+      const index = this.tools.findIndex((t) => t.name === tool.name);
+      if (index >= 0) this.tools[index] = tool;
     }
   }
 
   /**
-   * Process user input. Handles slash commands or runs agent loop.
+   * Publish cached tool definitions into the deferred catalog so `tool_search`
+   * answers correctly on turn 1. A cached stub carries the real name, one-line
+   * description and input schema; calling it waits for the live connection and
+   * then dispatches against the real client, or returns a clear error when that
+   * server ultimately failed. Live tools replace stubs on connect.
    */
-  async prompt(content: string): Promise<void> {
+  private async seedMcpCatalogFromCache(servers: MCPServerConfig[]): Promise<void> {
+    if (!this.opts.backgroundMcpConnect) return;
+    if (this.opts.allowedTools || !this.settingsManager.get("deferredMcpTools")) return;
+    let entries: Awaited<ReturnType<McpCatalogCache["entriesFor"]>>;
+    try {
+      entries = await this.mcpCatalogCache.entriesFor(servers);
+    } catch {
+      return;
+    }
+    const stubs: AgentTool[] = [];
+    for (const [serverName, entry] of entries) {
+      for (const cached of entry.tools) {
+        if (this.liveMcpTools.has(cached.name)) continue;
+        this.cachedMcpToolServers.set(cached.name, serverName);
+        stubs.push(this.buildCachedMcpTool(serverName, cached));
+      }
+    }
+    if (stubs.length === 0) return;
+    log("INFO", "mcp", "Seeded deferred tool catalog from cache", {
+      tools: String(stubs.length),
+      servers: String(entries.size),
+    });
+    this.addCachedMcpTools(stubs);
+  }
+
+  /** Catalog-only registration for cached stubs — never marks them live. */
+  private addCachedMcpTools(stubs: AgentTool[]): void {
+    this.mcpCatalog ??= new DeferredToolCatalog();
+    this.mcpCatalog.add(stubs);
+    this.ensureToolSearchTool();
+  }
+
+  private buildCachedMcpTool(serverName: string, cached: CachedTool): AgentTool {
+    return {
+      name: cached.name,
+      description: cached.description,
+      parameters: z.record(z.string(), z.unknown()),
+      rawInputSchema: cached.rawInputSchema,
+      execute: async (args, context) => {
+        const live = this.liveMcpTools.get(cached.name);
+        if (live) return live.execute(args, context);
+        const outcome = (await this.mcpManager?.whenConnected(serverName)) ?? {
+          ok: false as const,
+          error: "MCP is disabled for this session",
+        };
+        if (!outcome.ok) {
+          return (
+            `MCP tool ${cached.name} is unavailable: server "${serverName}" did not connect ` +
+            `(${outcome.error}). This tool was offered from a cached catalog. ` +
+            `Use a different approach or ask the user to check their MCP configuration.`
+          );
+        }
+        const connected = this.liveMcpTools.get(cached.name);
+        if (!connected) {
+          return (
+            `MCP tool ${cached.name} no longer exists: server "${serverName}" connected but ` +
+            `does not expose it. The cached catalog entry was stale.`
+          );
+        }
+        return connected.execute(args, context);
+      },
+    };
+  }
+
+  /**
+   * Resolve a `/name [args]` input to the prompt template it expands into, or
+   * null when it isn't a prompt-template command for THIS session (an ordinary
+   * message, a registry/action command, or any slash input on a non-coder
+   * agent). Shared by {@link prompt} and {@link willExpandPromptTemplate} so
+   * callers can't drift from the expansion that actually happens.
+   */
+  private async resolveSlashInput(
+    content: string,
+  ): Promise<{ kind: "template"; fullPrompt: string } | { kind: "command" } | null> {
     const parsedInput = this.slashCommands.parse(content);
     const coderCommands = this.opts.coderSlashCommands !== false;
     // Non-coder agents only intercept commands registered in their own registry.
@@ -846,29 +983,51 @@ export class AgentSession {
       parsedInput && (coderCommands || this.slashCommands.get(parsedInput.name))
         ? parsedInput
         : null;
-    if (parsed) {
-      // GG Coder alone can resolve its prompt-template and project commands.
-      const builtinPromptCmd = coderCommands ? getPromptCommand(parsed.name) : undefined;
-      const customCmds = coderCommands ? await loadCustomCommands(this.cwd) : [];
-      const customPromptCmd = !builtinPromptCmd
-        ? customCmds.find((c) => c.name === parsed.name)
-        : undefined;
-      const promptText = builtinPromptCmd?.prompt ?? customPromptCmd?.prompt;
+    if (!parsed) return null;
+    // GG Coder alone can resolve its prompt-template and project commands.
+    const builtinPromptCmd = coderCommands ? getPromptCommand(parsed.name) : undefined;
+    const customCmds = coderCommands ? await loadCustomCommands(this.cwd) : [];
+    const customPromptCmd = !builtinPromptCmd
+      ? customCmds.find((c) => c.name === parsed.name)
+      : undefined;
+    const promptText = builtinPromptCmd?.prompt ?? customPromptCmd?.prompt;
+    // No template body — a registry/action command that runs and returns text
+    // instead of becoming a user message.
+    if (!promptText) return { kind: "command" };
+    return {
+      kind: "template",
+      fullPrompt: parsed.args
+        ? `${promptText}\n\n## User Instructions\n\n${parsed.args}`
+        : promptText,
+    };
+  }
 
-      if (promptText) {
-        // Inject the prompt-template command as a user message to the agent
-        const fullPrompt = parsed.args
-          ? `${promptText}\n\n## User Instructions\n\n${parsed.args}`
-          : promptText;
-        // Run as a normal prompt (push message + agent loop)
-        const userMessage: Message = { role: "user", content: fullPrompt };
-        this.messages.push(userMessage);
-        await this.persistMessage(userMessage);
-        this.lastPersistedIndex = this.messages.length;
-        await this.runLoop();
-        return;
-      }
+  /**
+   * Whether {@link prompt} would expand this input into a template body and
+   * persist it as a user message. Hosts use it to record the typed `/name` for
+   * transcript restore — gating on anything looser risks tagging an unrelated
+   * message when the command turns out NOT to expand.
+   */
+  async willExpandPromptTemplate(content: string): Promise<boolean> {
+    return (await this.resolveSlashInput(content))?.kind === "template";
+  }
 
+  /**
+   * Process user input. Handles slash commands or runs agent loop.
+   */
+  async prompt(content: string): Promise<void> {
+    const slash = await this.resolveSlashInput(content);
+    if (slash?.kind === "template") {
+      // Inject the prompt-template command as a user message to the agent, then
+      // run as a normal prompt (push message + agent loop).
+      const userMessage: Message = { role: "user", content: slash.fullPrompt };
+      this.messages.push(userMessage);
+      await this.persistMessage(userMessage);
+      this.lastPersistedIndex = this.messages.length;
+      await this.runLoop();
+      return;
+    }
+    if (slash?.kind === "command") {
       const cmdContext = this.createSlashCommandContext();
       const result = await this.slashCommands.execute(content, cmdContext);
       if (result) {
@@ -989,6 +1148,8 @@ export class AgentSession {
     this.idealReviewPhase = "idle";
     this.loopBreakInjected = 0;
     this.regroundingInjected = false;
+    this.runStartedAt = Date.now();
+    this.processGateInjected = 0;
     this.compactionOccurred = false;
     this.originalRequest = originalRequest;
   }
@@ -1082,6 +1243,11 @@ export class AgentSession {
     // agent sees them mid-loop instead of after it stops.
     if (this.userQueue.length > 0) {
       const queued = this.userQueue.splice(0);
+      // The agent has now consumed these. Announce the new depth immediately so
+      // clients can drop the "queued" affordance at the turn boundary rather
+      // than holding it until the whole run ends — the message is already in
+      // the loop, and showing it as still-pending for minutes is a lie.
+      this.eventBus.emit("queue_drained", { count: this.userQueue.length });
       // Frame each queued item as concurrent steering — without this wrapper
       // the model treats a mid-run message as a fresh request that supersedes
       // the original task and silently drops it. ONE message per queued item
@@ -1194,6 +1360,23 @@ export class AgentSession {
   private getHookFollowUpMessages(): Message[] | null {
     const childCompletionFollowUp = buildSubAgentCompletionFollowUp(this.subAgentManager);
     if (childCompletionFollowUp) return childCompletionFollowUp;
+
+    // Background processes started this run and never read block completion:
+    // their progress/exit checkpoints only land on the steering path, which an
+    // agent about to stop never reaches.
+    const processFollowUp = buildProcessCompletionFollowUp(
+      this.processManager?.list() ?? [],
+      this.runStartedAt,
+      this.processGateInjected,
+    );
+    if (processFollowUp) {
+      this.processGateInjected += 1;
+      log("INFO", "process-gate", "Injecting background-process completion gate", {
+        injected: String(this.processGateInjected),
+      });
+      return processFollowUp;
+    }
+
     if (this.opts.selfCorrectionHooks === false || this.idealReviewSuppressed) return null;
 
     if (this.idealReviewPhase === "reviewing") {
@@ -1710,6 +1893,8 @@ export class AgentSession {
           // re-adding. Some tools may already have been promoted out of the catalog.
           this.tools = this.tools.filter((t) => !t.name.startsWith("mcp__"));
           this.mcpCatalog?.removeWhere((name) => name.startsWith("mcp__"));
+          this.liveMcpTools.clear();
+          this.cachedMcpToolServers.clear();
           this.addMcpTools(mcpTools);
         } catch (err) {
           log(
@@ -1762,8 +1947,6 @@ export class AgentSession {
       accountId: creds.accountId,
     });
     this.eventBus.emit("compaction_start", { messageCount: this.messages.length });
-    const messagesBefore = [...this.messages];
-
     const result = await compact(this.messages, {
       provider: this.provider,
       model: this.model,
@@ -1775,10 +1958,6 @@ export class AgentSession {
       signal: this.opts.signal,
     });
 
-    // Messages the summary is about to replace, identified by reference:
-    // compaction keeps the retained tail as the same objects it was handed.
-    const retained = new Set(result.messages);
-    const droppedMessages = messagesBefore.filter((message) => !retained.has(message));
     this.messages = result.messages;
     this.lastCompactionCompacted = result.result.compacted;
 
@@ -1792,7 +1971,12 @@ export class AgentSession {
     }
 
     this.providerContext = null;
-    await this.writeCompactionJournal(droppedMessages);
+
+    // Compaction rewrote the message list, so every transcript anchor recorded
+    // against the old indices must move with it — otherwise the markers are
+    // re-persisted pointing at positions that no longer mean anything and
+    // replay far below where they happened (or past the end).
+    this.remapMarkerAnchors(result.result.anchorRemap);
 
     // Transient sessions (Ken chat/autopilot, subagent spawns) must NEVER touch
     // the session store: without this guard, the first auto-compaction called
@@ -1984,8 +2168,25 @@ export class AgentSession {
    *  as steering. Returns the new queue length. No-op semantics are the caller's
    *  concern. */
   queueMessage(text: string, attachments: SessionAttachment[] = []): number {
-    this.userQueue.push({ text, attachments });
+    this.queueSeq += 1;
+    this.userQueue.push({ id: `q${this.queueSeq}`, text, attachments });
     return this.userQueue.length;
+  }
+
+  /** Pending queued messages (id + text), oldest first, for client display. */
+  listQueuedMessages(): Array<{ id: string; text: string }> {
+    return this.userQueue.map((m) => ({ id: m.id, text: m.text }));
+  }
+
+  /** Cancel one pending message by id. Returns true if it was still queued.
+   *  A false return is the normal race rather than an error: the message drained
+   *  into the run between the client rendering the cancel affordance and the
+   *  click arriving. */
+  cancelQueuedMessage(id: string): boolean {
+    const index = this.userQueue.findIndex((m) => m.id === id);
+    if (index === -1) return false;
+    this.userQueue.splice(index, 1);
+    return true;
   }
 
   /** Number of messages currently queued. */
@@ -1998,7 +2199,12 @@ export class AgentSession {
    *  reviewing (no run in flight to steer it into) — unlike {@link drainQueue},
    *  attachments survive so queued media isn't silently dropped. */
   takeNextQueuedMessage(): { text: string; attachments: SessionAttachment[] } | null {
-    return this.userQueue.shift() ?? null;
+    const next = this.userQueue.shift();
+    if (next === undefined) return null;
+    // Strip the internal queue id: it exists only so clients can cancel a
+    // specific pending message, and callers here feed the result straight into
+    // a run.
+    return { text: next.text, attachments: next.attachments };
   }
 
   /** Clear the queue, returning the combined text (to restore to the composer).
@@ -2159,14 +2365,6 @@ export class AgentSession {
     const tailParts: string[] = [];
     const orchestration = this.orchestrationPolicyTail();
     if (orchestration) tailParts.push(orchestration);
-    // Journal is re-read on every refresh, so an entry written this turn (or a
-    // human edit to .gg/memory.md) is visible on the next one. Uncached by
-    // construction: it changes as work proceeds and must never sit in the
-    // cached prefix.
-    if (this.journal) {
-      const journalTail = buildJournalPromptTail(this.journal);
-      if (journalTail) tailParts.push(journalTail);
-    }
     const hostTail = this.opts.getSystemPromptTail?.();
     if (hostTail) tailParts.push(hostTail);
     if (tailParts.length === 0) return basePrompt;
@@ -2256,6 +2454,30 @@ export class AgentSession {
     return this.autopilotMarkers;
   }
 
+  /** Non-system messages that are actually on disk. Transcript markers anchor
+   *  against this (not the in-memory list, which can run ahead after a failed
+   *  run), so hosts computing marker-derived values must use the same base. */
+  getPersistedTranscriptCount(): number {
+    return this.persistedTranscriptCount();
+  }
+
+  /**
+   * Rebase every transcript anchor (Ken turns, autopilot verdicts, app markers)
+   * onto a freshly compacted message list. Called right after `this.messages`
+   * is replaced and before the markers are re-persisted into the continuation
+   * file, so the new file carries positions that match its own transcript.
+   */
+  private remapMarkerAnchors(remap: CompactionAnchorRemap | undefined): void {
+    if (!remap) return;
+    const move = <T extends { afterMessageCount: number }>(payload: T): T => ({
+      ...payload,
+      afterMessageCount: remapAnchorForCompaction(payload.afterMessageCount, remap),
+    });
+    this.kenTurns = this.kenTurns.map(move);
+    this.autopilotMarkers = this.autopilotMarkers.map(move);
+    this.appMarkers = this.appMarkers.map(move);
+  }
+
   /**
    * Record one Ken Kai (mentor agent) turn against this build session: the
    * user's question + Ken's reply. Kept in memory for the live transcript and
@@ -2295,7 +2517,7 @@ export class AgentSession {
         id: crypto.randomUUID(),
         parentId: null,
         timestamp: new Date().toISOString(),
-        data: payload,
+        data: stripRecordedPosition(payload),
       };
       await this.sessionManager.appendEntry(this.sessionPath, entry);
     }
@@ -2346,7 +2568,7 @@ export class AgentSession {
         id: crypto.randomUUID(),
         parentId: null,
         timestamp: new Date().toISOString(),
-        data: payload,
+        data: stripRecordedPosition(payload),
       };
       await this.sessionManager.appendEntry(this.sessionPath, entry);
     }
@@ -2388,32 +2610,6 @@ export class AgentSession {
     await this.sessionManager.appendEntry(this.sessionPath, entry);
   }
 
-  /**
-   * Record what this compaction is about to discard as past-tense journal
-   * entries. Compaction is one-way — without this the specifics are gone for
-   * good, which is precisely the hole the journal exists to fill. No-op when
-   * memory is off, and bounded to a few entries so the file stays readable.
-   */
-  private async writeCompactionJournal(dropped: Message[]): Promise<void> {
-    if (!this.journal || dropped.length === 0) return;
-    const summary = this.messages.map((message) => message.content).find(isCompactionSummary) ?? "";
-    const notes = buildCompactionNotes(dropped, summary);
-    if (notes.length === 0) return;
-    try {
-      const written = await this.journal.append(notes);
-      if (written > 0) {
-        log("INFO", "memory", "Recorded compaction history", {
-          entries: String(written),
-          file: this.journal.filePath,
-        });
-      }
-    } catch (error) {
-      log("WARN", "memory", "Failed to write journal entries", {
-        error: error instanceof Error ? error.message : String(error),
-      });
-    }
-  }
-
   /** Re-append the in-memory app markers to the current session file. Mirrors
    *  `rePersistKenTurns` — called after a continuation/compaction file is
    *  created so display-only rows survive the rewrite. */
@@ -2426,7 +2622,7 @@ export class AgentSession {
         id: crypto.randomUUID(),
         parentId: null,
         timestamp: new Date().toISOString(),
-        data: payload,
+        data: stripRecordedPosition(payload),
       };
       await this.sessionManager.appendEntry(this.sessionPath, entry);
     }
@@ -2567,11 +2763,17 @@ export class AgentSession {
       legacyLabel || loaded.header.preview || findUserSessionPrompt(loadedMessages);
     // Restore Ken's advisory turns (custom entries, not on the message branch) so
     // they reappear in the transcript and survive into the continuation file.
-    this.kenTurns = this.sessionManager.getKenTurns(loaded.entries);
+    // The leaf is passed so each marker also carries its FILE-order position,
+    // the fallback used when a legacy anchor is out of range (see
+    // RecordedPosition).
+    this.kenTurns = this.sessionManager.getKenTurns(loaded.entries, loaded.header.leafId);
     // Restore autopilot verdict markers the same way (not on the message DAG).
-    this.autopilotMarkers = this.sessionManager.getAutopilotMarkers(loaded.entries);
+    this.autopilotMarkers = this.sessionManager.getAutopilotMarkers(
+      loaded.entries,
+      loaded.header.leafId,
+    );
     // Restore app transcript markers (plan banner / task header / errors / hints).
-    this.appMarkers = this.sessionManager.getAppMarkers(loaded.entries);
+    this.appMarkers = this.sessionManager.getAppMarkers(loaded.entries, loaded.header.leafId);
     this.turnMetrics = this.sessionManager.getTurnMetrics(loaded.entries);
 
     // Track the current leaf for subsequent entries
@@ -2625,6 +2827,9 @@ export class AgentSession {
         signal: this.opts.signal,
       });
       this.messages = compacted.messages;
+      // Same anchor rebase as compact(): the restored markers were recorded
+      // against the pre-compaction transcript.
+      this.remapMarkerAnchors(compacted.result.anchorRemap);
       log("INFO", "session", `Auto-compaction complete`, {
         before: String(compacted.result.originalCount),
         after: String(compacted.result.newCount),
@@ -2743,4 +2948,50 @@ export class AgentSession {
       getAdditionalRoots: () => this.getAdditionalRoots(),
     };
   }
+
+  /**
+   * Import a Claude Code / Codex / Cursor transcript as a resumable GG Coder
+   * session in this session's sessions directory. Never throws — a bad path or
+   * an unrecognized format comes back as `{ ok: false, error }` so both the CLI
+   * and the desktop app can show it verbatim.
+   */
+  async importForeignTranscript(
+    filePath: string,
+    opts: { cwd?: string } = {},
+  ): Promise<ImportForeignTranscriptResult> {
+    try {
+      const imported = await importForeignSession({
+        filePath: resolveHomePath(filePath),
+        sessionManager: this.sessionManager,
+        provider: this.provider,
+        model: this.model,
+        cwd: opts.cwd ?? undefined,
+      });
+      log("INFO", "import", "Imported foreign transcript", {
+        format: imported.format,
+        messages: String(imported.messageCount),
+      });
+      return {
+        ok: true,
+        sessionId: imported.sessionId,
+        sessionPath: imported.sessionPath,
+        cwd: imported.cwd,
+        format: imported.format,
+        messageCount: imported.messageCount,
+        dropped: describeDropped(imported.dropped),
+        ...(imported.preview ? { preview: imported.preview } : {}),
+      };
+    } catch (err) {
+      return { ok: false, error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+}
+
+/** Expand a leading `~` so `/import ~/.codex/...` works from any shell. */
+function resolveHomePath(filePath: string): string {
+  if (filePath === "~") return os.homedir();
+  if (filePath.startsWith("~/") || filePath.startsWith("~\\")) {
+    return path.join(os.homedir(), filePath.slice(2));
+  }
+  return filePath;
 }

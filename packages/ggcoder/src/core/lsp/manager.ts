@@ -16,6 +16,8 @@ export interface LspManagerOptions {
   warmBudgetMs?: number;
   /** Hard budget for a client's very first file (spawn + init + indexing). */
   firstBudgetMs?: number;
+  /** Grace period for a corrected publish after an empty cold-load result. */
+  settleMs?: number;
   /** Maximum number of per-file latest outcomes retained. */
   snapshotLimit?: number;
 }
@@ -51,6 +53,15 @@ type ClientResolution =
 
 const DEFAULT_WARM_BUDGET_MS = 3000;
 const DEFAULT_FIRST_BUDGET_MS = 8000;
+/**
+ * How long to wait for a corrected publish after a server's FIRST result for a
+ * project comes back empty. tsserver ends its project-load progress, publishes
+ * an empty set for the open file, and only then type-checks and publishes for
+ * real, so that first empty publish means "not analysed yet" rather than
+ * "clean". Only paid on a cold client that reported progress, and only when the
+ * answer would otherwise have been `clean`.
+ */
+const DEFAULT_SETTLE_MS = 1500;
 const DEFAULT_SNAPSHOT_LIMIT = 100;
 const INIT_TIMEOUT_MS = 10_000;
 
@@ -63,6 +74,7 @@ export class LspManager {
   private readonly catalog: readonly LspServerSpec[];
   private readonly warmBudgetMs: number;
   private readonly firstBudgetMs: number;
+  private readonly settleMs: number;
   private readonly snapshotLimit: number;
   /** (serverId\0root) → in-flight or settled client resolution. */
   private readonly clients = new Map<string, Promise<ClientResolution>>();
@@ -78,6 +90,7 @@ export class LspManager {
     this.catalog = options?.catalog ?? LSP_SERVER_CATALOG;
     this.warmBudgetMs = options?.warmBudgetMs ?? DEFAULT_WARM_BUDGET_MS;
     this.firstBudgetMs = options?.firstBudgetMs ?? DEFAULT_FIRST_BUDGET_MS;
+    this.settleMs = Math.max(0, options?.settleMs ?? DEFAULT_SETTLE_MS);
     this.snapshotLimit = Math.max(1, options?.snapshotLimit ?? DEFAULT_SNAPSHOT_LIMIT);
   }
 
@@ -173,6 +186,10 @@ export class LspManager {
     content: string,
     budgetMs: number,
   ): Promise<LspDiagnosticOutcome> {
+    // The caller races this whole function against `budgetMs`, so every wait in
+    // here has to fit inside the same deadline or a good answer arrives after
+    // the caller has already given up and reported a timeout.
+    const deadline = Date.now() + budgetMs;
     const resolution = await this.ensureClient(key, spec, root);
     if (resolution.status !== "ready") return this.outcome(resolution.status, filePath);
     const { client } = resolution;
@@ -182,8 +199,11 @@ export class LspManager {
       return this.outcome("server_failed", filePath);
     }
 
+    // Sampled BEFORE the collect: a cold client is the one that has to load the
+    // project, and therefore the only one that can answer prematurely.
+    const wasCold = !this.warmKeys.has(key);
     const uri = client.syncDocument(filePath, content);
-    const diagnostics = await client.collectDiagnostics(uri, budgetMs);
+    let diagnostics = await client.collectDiagnostics(uri, budgetMs);
     this.warmKeys.add(key);
     if (!client.isAlive) {
       this.clients.set(key, Promise.resolve({ status: "server_failed" }));
@@ -200,6 +220,20 @@ export class LspManager {
         stderr: client.stderrTail() || "(none)",
       });
       return this.outcome("timeout", filePath);
+    }
+
+    // An empty FIRST answer from a server that was loading the project is not a
+    // verdict yet: tsserver ends its load progress and publishes an empty set
+    // before it type-checks, so this used to report a broken file as clean and
+    // inline diagnostics silently did nothing on the first edit in a project.
+    // Give it a bounded moment to correct itself. A follow-up that is ALSO empty
+    // changes nothing, so a genuinely clean file still lands on `clean`.
+    if (diagnostics.length === 0 && wasCold && client.hasReportedProgress && client.isAlive) {
+      const settleMs = Math.min(this.settleMs, deadline - Date.now());
+      if (settleMs > 0) {
+        const corrected = await client.awaitNextPublish(uri, settleMs);
+        if (corrected !== null && corrected.length > 0) diagnostics = corrected;
+      }
     }
 
     if (diagnostics.length > 0) {

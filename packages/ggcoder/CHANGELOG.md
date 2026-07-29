@@ -1,5 +1,68 @@
 # @kenkaiiii/ggcoder
 
+## 5.28.0
+
+### Minor Changes
+
+- List Claude Code and Codex sessions alongside GG Coder's own for a project, tagged with their source and resumable on open, replacing the `/import` slash command
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.28.0
+- @kenkaiiii/gg-agent@5.28.0
+- @kenkaiiii/gg-core@5.28.0
+
+## 5.27.0
+
+### Minor Changes
+
+- Add `/import` for resuming Claude Code, Codex and Cursor transcripts, gate turn completion on unread background processes, and migrate MCP to SDK v2 with an on-disk tool catalog cache
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.27.0
+- @kenkaiiii/gg-agent@5.27.0
+- @kenkaiiii/gg-core@5.27.0
+
+## 5.26.3
+
+### Patch Changes
+
+- Fix session transcript restore: rebase marker anchors when compaction rewrites a session, heal stale anchors in existing session files, skip duplicate autopilot-injected user bubbles, and restore slash commands from the persisted invocation instead of matching drifted templates
+  - @kenkaiiii/gg-ai@5.26.3
+  - @kenkaiiii/gg-agent@5.26.3
+  - @kenkaiiii/gg-core@5.26.3
+
+## 5.26.2
+
+### Patch Changes
+
+- Fix concurrent prompts starting two runs on the same session, and announce queue depth the moment the agent consumes queued steering.
+  - @kenkaiiii/gg-ai@5.26.2
+  - @kenkaiiii/gg-agent@5.26.2
+  - @kenkaiiii/gg-core@5.26.2
+
+## 5.26.1
+
+### Patch Changes
+
+- Remove the project memory journal: it duplicated what the repo already tells the agent and suppressed real verification.
+  - @kenkaiiii/gg-ai@5.26.1
+  - @kenkaiiii/gg-agent@5.26.1
+  - @kenkaiiii/gg-core@5.26.1
+
+## 5.26.0
+
+### Minor Changes
+
+- Keep long tasks running and carry project history across sessions: the agent loop can now extend an exhausted turn budget when it is still making progress, finished sub-agents and background processes announce themselves instead of needing to be polled, mid-session model switches are recorded as durable replayable state, and compaction writes past-tense project history to `.gg/memory.md` (on by default, `/memory-off` to disable).
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.26.0
+- @kenkaiiii/gg-agent@5.26.0
+- @kenkaiiii/gg-core@5.26.0
+
 ## 5.25.0
 
 ### Minor Changes

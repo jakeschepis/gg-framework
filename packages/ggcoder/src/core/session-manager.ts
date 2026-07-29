@@ -155,6 +155,26 @@ export interface KenTurnPayload {
   question: string;
   reply: string;
   afterMessageCount: number;
+  /** Read-only: branch messages that preceded this entry in FILE order. Never
+   *  persisted — see {@link RecordedPosition}. */
+  recordedAfterMessageCount?: number;
+}
+
+/**
+ * Read-time position rescue for transcript markers.
+ *
+ * `afterMessageCount` is authoritative, but historical sessions were rewritten
+ * by compaction without rebasing it (markers were re-persisted carrying indices
+ * from the much longer pre-compaction transcript). Those anchors then replay far
+ * too late or past the end — the "everything bunched at the bottom" symptom.
+ *
+ * File order gives an independent, always-in-range estimate: the number of
+ * branch messages already written when the marker line was appended. It's only
+ * consulted when the stored anchor is out of range, so healthy sessions are
+ * untouched.
+ */
+export interface RecordedPosition {
+  recordedAfterMessageCount?: number;
 }
 
 /** Custom-entry kind for an autopilot verdict marker. Mirrors `ken_turn`:
@@ -166,7 +186,7 @@ export interface KenTurnPayload {
  *  keyword (e.g. `ALL_CLEAR`) the model actually replied with. */
 export const AUTOPILOT_MARKER_CUSTOM_KIND = "autopilot_marker";
 
-export interface AutopilotMarkerPayload {
+export interface AutopilotMarkerPayload extends RecordedPosition {
   version: 1;
   phase: "prompted" | "done" | "human" | "capped" | "plan_approved";
   reason?: string;
@@ -181,7 +201,7 @@ export interface AutopilotMarkerPayload {
  *  interleave it back into the transcript on resume. */
 export const APP_MARKER_CUSTOM_KIND = "app_transcript_marker";
 
-export interface AppMarkerPayload {
+export interface AppMarkerPayload extends RecordedPosition {
   version: 1;
   kind:
     | "plan"
@@ -191,7 +211,11 @@ export interface AppMarkerPayload {
     | "compaction"
     | "agent_handoff"
     /** Mid-session model/provider change; `data` carries { from, to, provider }. */
-    | "model_switch";
+    | "model_switch"
+    /** Transcript imported from another agent; `data` carries
+     *  { source, sourcePath, messageCount, dropped }. Import is lossy, so this
+     *  marker is the record of what the imported thread is missing. */
+    | "import";
   afterMessageCount: number;
   /** Kind-specific display fields (reason/title/headline/kenSent/counts/…). */
   data: Record<string, unknown>;
@@ -774,54 +798,93 @@ export class SessionManager {
     });
   }
 
+  /**
+   * Walk entries in file order, tracking how many branch (non-system) messages
+   * have been written so far, and hand each custom entry that count. This is
+   * the independent position estimate behind {@link RecordedPosition}.
+   */
+  private mapCustomEntriesInFileOrder<T>(
+    entries: SessionEntry[],
+    leafId: string | null | undefined,
+    project: (entry: SessionEntry & { type: "custom" }, recordedAfterMessageCount: number) => T[],
+  ): T[] {
+    // Only branch messages count — an off-branch fork's entries are not part of
+    // the restored transcript the anchors are measured against.
+    const onBranch = leafId
+      ? new Set(this.getBranch(entries, leafId).map((e) => e.id))
+      : new Set(entries.map((e) => e.id));
+    const out: T[] = [];
+    let messagesSoFar = 0;
+    for (const entry of entries) {
+      if (entry.type === "message") {
+        if (onBranch.has(entry.id) && entry.message.role !== "system") messagesSoFar++;
+        continue;
+      }
+      if (entry.type !== "custom") continue;
+      out.push(...project(entry, messagesSoFar));
+    }
+    return out;
+  }
+
   /** Read all persisted Ken turns in file order. Returns them regardless of
    *  branch (Ken turns are not chained into the DAG), validated + normalized. */
-  getKenTurns(entries: SessionEntry[]): KenTurnPayload[] {
-    return entries.flatMap((entry): KenTurnPayload[] => {
-      if (entry.type !== "custom" || entry.kind !== KEN_TURN_CUSTOM_KIND) return [];
-      const p = entry.data as Partial<KenTurnPayload> | undefined;
-      if (p?.version === 1 && typeof p.question === "string" && typeof p.reply === "string") {
-        return [
-          {
-            version: 1,
-            question: p.question,
-            reply: p.reply,
-            afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
-          },
-        ];
-      }
-      return [];
-    });
+  getKenTurns(entries: SessionEntry[], leafId?: string | null): KenTurnPayload[] {
+    return this.mapCustomEntriesInFileOrder<KenTurnPayload>(
+      entries,
+      leafId,
+      (entry, recordedAfterMessageCount) => {
+        if (entry.kind !== KEN_TURN_CUSTOM_KIND) return [];
+        const p = entry.data as Partial<KenTurnPayload> | undefined;
+        if (p?.version === 1 && typeof p.question === "string" && typeof p.reply === "string") {
+          return [
+            {
+              version: 1,
+              question: p.question,
+              reply: p.reply,
+              afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
+              recordedAfterMessageCount,
+            },
+          ];
+        }
+        return [];
+      },
+    );
   }
 
   /** Read all persisted app transcript markers in file order, validated +
    *  normalized (same not-on-the-DAG treatment as Ken turns). */
-  getAppMarkers(entries: SessionEntry[]): AppMarkerPayload[] {
-    return entries.flatMap((entry): AppMarkerPayload[] => {
-      if (entry.type !== "custom" || entry.kind !== APP_MARKER_CUSTOM_KIND) return [];
-      const p = entry.data as Partial<AppMarkerPayload> | undefined;
-      const kind = p?.kind;
-      if (
-        p?.version === 1 &&
-        (kind === "plan" ||
-          kind === "task" ||
-          kind === "error" ||
-          kind === "user_hint" ||
-          kind === "compaction" ||
-          kind === "agent_handoff" ||
-          kind === "model_switch")
-      ) {
-        return [
-          {
-            version: 1,
-            kind,
-            afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
-            data: typeof p.data === "object" && p.data !== null ? p.data : {},
-          },
-        ];
-      }
-      return [];
-    });
+  getAppMarkers(entries: SessionEntry[], leafId?: string | null): AppMarkerPayload[] {
+    return this.mapCustomEntriesInFileOrder<AppMarkerPayload>(
+      entries,
+      leafId,
+      (entry, recordedAfterMessageCount) => {
+        if (entry.kind !== APP_MARKER_CUSTOM_KIND) return [];
+        const p = entry.data as Partial<AppMarkerPayload> | undefined;
+        const kind = p?.kind;
+        if (
+          p?.version === 1 &&
+          (kind === "plan" ||
+            kind === "task" ||
+            kind === "error" ||
+            kind === "user_hint" ||
+            kind === "compaction" ||
+            kind === "agent_handoff" ||
+            kind === "model_switch" ||
+            kind === "import")
+        ) {
+          return [
+            {
+              version: 1,
+              kind,
+              afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
+              data: typeof p.data === "object" && p.data !== null ? p.data : {},
+              recordedAfterMessageCount,
+            },
+          ];
+        }
+        return [];
+      },
+    );
   }
 
   /** Read validated per-turn usage and timing records in file order. */
@@ -835,31 +898,36 @@ export class SessionManager {
 
   /** Read all persisted autopilot markers in file order, validated + normalized
    *  (same not-on-the-DAG treatment as Ken turns). */
-  getAutopilotMarkers(entries: SessionEntry[]): AutopilotMarkerPayload[] {
-    return entries.flatMap((entry): AutopilotMarkerPayload[] => {
-      if (entry.type !== "custom" || entry.kind !== AUTOPILOT_MARKER_CUSTOM_KIND) return [];
-      const p = entry.data as Partial<AutopilotMarkerPayload> | undefined;
-      const phase = p?.phase;
-      if (
-        p?.version === 1 &&
-        (phase === "prompted" ||
-          phase === "done" ||
-          phase === "human" ||
-          phase === "capped" ||
-          phase === "plan_approved")
-      ) {
-        return [
-          {
-            version: 1,
-            phase,
-            ...(typeof p.reason === "string" ? { reason: p.reason } : {}),
-            ...(typeof p.body === "string" ? { body: p.body } : {}),
-            afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
-          },
-        ];
-      }
-      return [];
-    });
+  getAutopilotMarkers(entries: SessionEntry[], leafId?: string | null): AutopilotMarkerPayload[] {
+    return this.mapCustomEntriesInFileOrder<AutopilotMarkerPayload>(
+      entries,
+      leafId,
+      (entry, recordedAfterMessageCount) => {
+        if (entry.kind !== AUTOPILOT_MARKER_CUSTOM_KIND) return [];
+        const p = entry.data as Partial<AutopilotMarkerPayload> | undefined;
+        const phase = p?.phase;
+        if (
+          p?.version === 1 &&
+          (phase === "prompted" ||
+            phase === "done" ||
+            phase === "human" ||
+            phase === "capped" ||
+            phase === "plan_approved")
+        ) {
+          return [
+            {
+              version: 1,
+              phase,
+              ...(typeof p.reason === "string" ? { reason: p.reason } : {}),
+              ...(typeof p.body === "string" ? { body: p.body } : {}),
+              afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
+              recordedAfterMessageCount,
+            },
+          ];
+        }
+        return [];
+      },
+    );
   }
 
   /**

@@ -1,6 +1,6 @@
 [package]
 name = "gg-app"
-version = "0.30.0"
+version = "0.36.0"
 description = "A Tauri App"
 authors = ["you"]
 edition = "2021"
@@ -18,7 +18,14 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-tauri = { version = "2", features = ["macos-private-api"] }
+# `tray-icon` + `image-png` are NOT default tauri features: the first adds the
+# macOS menu-bar status item, the second lets `Image::from_bytes` decode the PNG
+# tray mark (icons/tray-mac.png).
+tauri = { version = "2", features = [
+  "macos-private-api",
+  "tray-icon",
+  "image-png",
+] }
 tauri-plugin-opener = "2"
 tauri-plugin-log = "2"
 tauri-plugin-dialog = "2"

@@ -7,6 +7,7 @@ import { getAppPaths } from "../config.js";
 import { encodeCwd, stripExtendedLengthPrefix } from "./encode-cwd.js";
 import { getUserSessionPrompt } from "./session-preview.js";
 import { isSessionPath, openSessionReadStream, resolveSessionPath } from "./session-storage.js";
+import { parseForeignTranscript } from "./foreign-session-import.js";
 
 export type ProjectSource = "ggcoder" | "claude-code" | "codex";
 
@@ -485,6 +486,12 @@ export interface RecentSession {
   /** Relative "3h ago" string from last activity. */
   lastActiveDisplay: string;
   messageCount: number;
+  /**
+   * Which store this row came from. Absent means `ggcoder` — a session that is
+   * already resumable as-is. A foreign value means `path` points at that tool's
+   * own transcript, which the host imports before opening.
+   */
+  source?: ProjectSource;
 }
 
 /**
@@ -514,6 +521,127 @@ export async function listRecentSessions(
     out.push(session);
   }
   return out;
+}
+
+/**
+ * List the most recent Claude Code and Codex conversations for a project cwd.
+ *
+ * The project picker has always surfaced these stores (`discoverProjects`), so a
+ * project can appear *because* it has Claude Code history — and then show an
+ * empty session list, because that only read GG Coder's own directory. These
+ * rows close that gap: each one points at the foreign transcript, tagged with
+ * its `source`, and the host imports it on click.
+ *
+ * Cheap by construction: a transcript is only opened if its cwd matches, and
+ * both the per-store file walk and the preview read are line-capped.
+ */
+export async function listForeignSessions(
+  cwd: string,
+  limit = 5,
+  homeDir = os.homedir(),
+): Promise<RecentSession[]> {
+  const [claude, codex] = await Promise.all([
+    listClaudeSessions(cwd, limit, homeDir),
+    listCodexSessions(cwd, limit, homeDir),
+  ]);
+  return [...claude, ...codex]
+    .sort((left, right) => right.lastActiveMs - left.lastActiveMs)
+    .slice(0, limit)
+    .map(({ lastActiveMs: _lastActiveMs, ...session }) => session);
+}
+
+/** A foreign row plus the raw mtime the caller sorts on before discarding it. */
+type DatedForeignSession = RecentSession & { lastActiveMs: number };
+
+async function listClaudeSessions(
+  cwd: string,
+  limit: number,
+  homeDir: string,
+): Promise<DatedForeignSession[]> {
+  const projectsDir = path.join(homeDir, ".claude", "projects");
+  if (!(await isDirectory(projectsDir))) return [];
+
+  // Claude's directory encoding is ambiguous (every "/" becomes "-", colliding
+  // with real dashes), so we cannot map cwd → directory. Instead walk the files
+  // newest-first and keep the ones whose recorded cwd matches.
+  const files = await collectJsonlFiles(projectsDir, 3);
+  return collectMatchingForeignSessions(files, cwd, limit, "claude-code", claudeCwdExtractor);
+}
+
+async function listCodexSessions(
+  cwd: string,
+  limit: number,
+  homeDir: string,
+): Promise<DatedForeignSession[]> {
+  const sessionsDir = path.join(homeDir, ".codex", "sessions");
+  if (!(await isDirectory(sessionsDir))) return [];
+  // Layout is YYYY/MM/DD/*.jsonl — depth 4 covers it.
+  const files = await collectJsonlFiles(sessionsDir, 4);
+  return collectMatchingForeignSessions(files, cwd, limit, "codex", codexCwdExtractor);
+}
+
+/**
+ * Newest-first scan for transcripts belonging to `cwd`. Stops as soon as
+ * `limit` matches are found so a large history costs only the files it reads.
+ */
+async function collectMatchingForeignSessions(
+  files: { path: string; mtime: number }[],
+  cwd: string,
+  limit: number,
+  source: ProjectSource,
+  extractor: LineExtractor,
+): Promise<DatedForeignSession[]> {
+  if (files.length === 0) return [];
+  files.sort((left, right) => right.mtime - left.mtime);
+  const target = path.resolve(stripExtendedLengthPrefix(cwd));
+
+  const out: DatedForeignSession[] = [];
+  for (const file of files) {
+    if (out.length >= limit) break;
+    const recorded = await readFirstFromFile(file.path, extractor);
+    if (!recorded) continue;
+    if (path.resolve(stripExtendedLengthPrefix(recorded)) !== target) continue;
+
+    const summary = await readForeignSessionSummary(file.path, source);
+    if (!summary) continue;
+    out.push({
+      ...summary,
+      lastActiveDisplay: formatRelativeTime(file.mtime),
+      lastActiveMs: file.mtime,
+    });
+  }
+  return out;
+}
+
+/**
+ * Preview + message count for a foreign transcript, using the same parsers the
+ * importer uses — so the row's title is exactly the title the imported session
+ * ends up with (notably Cursor's `<user_query>` unwrapping).
+ */
+async function readForeignSessionSummary(
+  file: string,
+  source: ProjectSource,
+): Promise<Omit<RecentSession, "lastActiveDisplay"> | null> {
+  let text: string;
+  try {
+    text = await fs.readFile(file, "utf-8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed = parseForeignTranscript(text, source === "codex" ? "codex" : "claude");
+    if (parsed.messages.length === 0) return null;
+    return {
+      id: path.basename(file).replace(/\.jsonl$/, ""),
+      path: file,
+      preview: parsed.preview ?? "(no prompt)",
+      messageCount: parsed.messages.length,
+      source,
+    };
+  } catch {
+    // An unreadable transcript is skipped, never surfaced as a broken row.
+    return null;
+  }
 }
 
 interface ParsedRecentSession extends RecentSession {

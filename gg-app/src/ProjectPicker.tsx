@@ -6,6 +6,7 @@ import {
   listProjects,
   listSessions,
   selectProject,
+  importTranscript,
   getSettings,
   focusWindowByOffset,
   arrangeAllWindows,
@@ -18,6 +19,14 @@ import { BackButton } from "./BackButton";
 import { WindowLayoutButton } from "./WindowLayoutButton";
 import { RadioButton } from "./RadioButton";
 import { NewProjectModal } from "./NewProjectModal";
+
+/**
+ * Does this row point at another tool's transcript rather than a GG Coder
+ * session? Those need an import before they can be opened.
+ */
+function isForeignSession(session: RecentSession): boolean {
+  return session.source === "claude-code" || session.source === "codex";
+}
 
 interface Props {
   /** Called after the agent has been re-pointed at `cwd` (+ optional session). */
@@ -139,6 +148,41 @@ export function ProjectPicker({
           message
             .replace(/Run ["'`]?ggcoder login["'`]?/gi, "Use AI Providers to sign in")
             .replace(/ggcoder login/gi, "AI Providers"),
+        );
+        setBusy(false);
+      });
+  }
+
+  /**
+   * Open a session row. A native row resumes directly; a Claude Code / Codex row
+   * is imported into a real GG Coder session first, then opened by its new path.
+   * The import is silent — from the user's side this is just "open that
+   * conversation", which is why there is no separate import affordance.
+   */
+  function chooseSession(cwd: string, session: RecentSession): void {
+    if (busy) return;
+    if (!isForeignSession(session)) {
+      choose(cwd, session.path);
+      return;
+    }
+    setBusy(true);
+    setResumeError(null);
+    void importTranscript(session.path, cwd)
+      .then((result) => {
+        if (!result.ok) {
+          setResumeError(`Could not import that conversation: ${result.error}`);
+          setBusy(false);
+          return;
+        }
+        // Re-enter the normal resume path with the freshly written session.
+        setBusy(false);
+        choose(cwd, result.sessionPath);
+      })
+      .catch((reason: unknown) => {
+        setResumeError(
+          `Could not import that conversation: ${
+            reason instanceof Error ? reason.message : String(reason)
+          }`,
         );
         setBusy(false);
       });
@@ -295,7 +339,12 @@ export function ProjectPicker({
                   key={s.id}
                   className="picker-item"
                   disabled={busy}
-                  onClick={() => choose(selected.path, s.path)}
+                  onClick={() => chooseSession(selected.path, s)}
+                  title={
+                    isForeignSession(s)
+                      ? `From ${sourceStyle(s.source ?? "").label} — opens as a GG Coder session`
+                      : undefined
+                  }
                 >
                   <span className="picker-row">
                     <span className="picker-name picker-preview" style={{ color: theme.text }}>
@@ -304,6 +353,14 @@ export function ProjectPicker({
                     <Badge>{s.lastActiveDisplay}</Badge>
                   </span>
                   <span className="picker-meta" style={{ color: theme.textMuted }}>
+                    {isForeignSession(s) && (
+                      <span
+                        className="picker-source-tag"
+                        style={{ color: sourceStyle(s.source ?? "").color }}
+                      >
+                        {sourceStyle(s.source ?? "").label}
+                      </span>
+                    )}
                     {`${s.messageCount} msgs`}
                   </span>
                 </button>

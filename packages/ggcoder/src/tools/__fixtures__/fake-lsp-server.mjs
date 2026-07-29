@@ -12,6 +12,10 @@
  *   --shutdown-file=PATH write PATH when the shutdown request arrives
  *   --progress            begin indexing progress and leave it active
  *   --progress-end        end indexing progress after publishing
+ *   --premature-empty     reproduce tsserver's cold-project-load sequence: end
+ *                         progress, publish an EMPTY set before the file has
+ *                         actually been analysed, then publish the real
+ *                         diagnostics shortly after
  *   --init-error          fail initialization
  *   --crash-on-open       exit after initialization when a document opens
  *   --silent              never publish diagnostics
@@ -24,8 +28,10 @@ const args = process.argv.slice(2);
 const hasPull = args.includes("--pull");
 const delayMs = Number(args.find((a) => a.startsWith("--delay-ms="))?.split("=")[1] ?? 0);
 const shutdownFile = args.find((a) => a.startsWith("--shutdown-file="))?.split("=")[1];
-const hasProgress = args.includes("--progress") || args.includes("--progress-end");
-const endsProgress = args.includes("--progress-end");
+const prematureEmpty = args.includes("--premature-empty");
+const hasProgress =
+  args.includes("--progress") || args.includes("--progress-end") || prematureEmpty;
+const endsProgress = args.includes("--progress-end") || prematureEmpty;
 const initError = args.includes("--init-error");
 const crashOnOpen = args.includes("--crash-on-open");
 const silent = args.includes("--silent");
@@ -72,6 +78,25 @@ function publish(uri) {
         method: "$/progress",
         params: { token: "index", value: { kind: "end" } },
       });
+    }
+    // What real tsserver does on a cold project load: it ends the load progress
+    // and immediately publishes an EMPTY set for the open file, then publishes
+    // the actual diagnostics once it has type-checked. Treating that first empty
+    // publish as "clean" is the Windows CI failure this reproduces.
+    if (prematureEmpty) {
+      send({
+        jsonrpc: "2.0",
+        method: "textDocument/publishDiagnostics",
+        params: { uri, diagnostics: [] },
+      });
+      setTimeout(() => {
+        send({
+          jsonrpc: "2.0",
+          method: "textDocument/publishDiagnostics",
+          params: { uri, diagnostics: diagnosticsFor(text) },
+        });
+      }, 120);
+      return;
     }
     send({
       jsonrpc: "2.0",

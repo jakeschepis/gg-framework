@@ -954,6 +954,21 @@ body {
   flex-direction: column;
   border-bottom: 1px solid var(--border);
 }
+/* Per-project accent identity. `--project-accent` is set inline per window by
+   WorkspaceHeader (derived from the project folder name, see projectAccent.ts).
+   Deliberately restrained: a single dot by the project name, nothing more. The
+   header keeps the standard `--border` hairline so the chrome stays neutral. */
+.chat-head-accent-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  margin-right: 7px;
+  border-radius: 50%;
+  background: var(--project-accent);
+  /* The title row is baseline-aligned, so nudge the dot onto the text's optical
+     centre instead of letting it sit on the baseline. */
+  transform: translateY(-1px);
+}
 .chat-head-strip {
   display: flex;
   align-items: center;
@@ -1877,6 +1892,17 @@ body {
 .picker-meta {
   font-family: var(--mono);
   font-size: 11px;
+}
+/* Origin tag on a session row that came from another coding tool. Sits inline
+   ahead of the message count; the hue is the signal, matching the project
+   list's source colors. */
+.picker-source-tag {
+  font-weight: 600;
+}
+.picker-source-tag::after {
+  content: " \00b7 ";
+  color: var(--text-dim);
+  font-weight: 400;
 }
 
 /* ── Reusable pill badge ── */
@@ -5296,4 +5322,357 @@ body {
   clip: rect(0, 0, 0, 0);
   white-space: nowrap;
   border: 0;
+}
+
+/* ── /schedule argument hint (reuses .slash-menu chrome + anchor) ── */
+.schedule-hint {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 8px;
+}
+/* The signature line: `/schedule <prompt> | <every> | [times]`. Wraps rather
+   than clipping so the grammar stays fully readable in a narrow window. */
+.schedule-sig {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 6px;
+  font-family: var(--mono);
+  font-size: 13px;
+  padding: 0 2px;
+}
+.schedule-sig-cmd {
+  font-weight: 600;
+}
+.schedule-sig-slot {
+  display: inline-flex;
+  align-items: baseline;
+  gap: 6px;
+}
+.schedule-sig-bar {
+  opacity: 0.7;
+}
+/* Active slot is marked by weight + an underline, never by color alone —
+   color-only state fails for low-vision and monochrome users. */
+.schedule-slot {
+  padding: 1px 4px;
+  border-radius: var(--radius-button);
+  transition:
+    color var(--t-fast),
+    background-color var(--t-fast);
+}
+.schedule-slot.active {
+  font-weight: 600;
+  background: var(--surface-1);
+  text-decoration: underline;
+  text-underline-offset: 3px;
+}
+.schedule-status {
+  padding: 0 2px;
+}
+/* Echo of the user's text with the rejected span underlined in place. Wraps and
+   breaks so a long prompt can't force the popover wider than the composer. */
+.schedule-echo {
+  font-family: var(--mono);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+  margin-bottom: 3px;
+}
+.schedule-echo-bad {
+  text-decoration: underline wavy;
+  text-underline-offset: 3px;
+  font-weight: 600;
+}
+.schedule-msg {
+  font-size: 12px;
+  line-height: 1.45;
+  overflow-wrap: anywhere;
+}
+/* Interval presets: one-click fills for the segment users mistype most. */
+.schedule-presets {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px;
+  padding: 2px 2px 0;
+  border-top: 1px solid var(--border);
+  padding-top: 8px;
+}
+.schedule-presets-label {
+  font-size: 11px;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+}
+.schedule-preset {
+  background: transparent;
+  border: 1px solid;
+  border-radius: var(--radius-pill);
+  font-family: var(--mono);
+  font-size: 12px;
+  padding: 1px 9px;
+  cursor: pointer;
+  transition:
+    background-color var(--t-fast),
+    border-color var(--t-fast);
+}
+.schedule-preset:hover {
+  background: var(--surface-1);
+}
+/* Malformed schedule: tint the composer border so the invalid state is visible
+   even when the eye is on the textarea rather than the hint above it. Overrides
+   the focus-within/window-focused borders, which would otherwise mask it. */
+.app .inputwrap.schedule-invalid,
+.app.window-focused .inputwrap.schedule-invalid,
+.inputwrap.schedule-invalid:focus-within {
+  border-color: var(--error);
+}
+
+/* Schedule popover rows carry an extra cadence column vs. background tasks. */
+.schedules-menu {
+  max-width: min(520px, calc(100vw - 32px));
+}
+.schedules-cadence {
+  font-family: var(--mono);
+  font-size: 11px;
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+/* ── Footer responsiveness ──
+   The right cluster is `flex: 0 0 auto` at full width so its controls stay at
+   natural size. Below 900px that cluster plus a schedules/tasks pill overflows,
+   so the controls are allowed to shrink and the left cluster yields first. */
+@media (max-width: 900px) {
+  .footer {
+    gap: 8px;
+    padding: 8px 12px;
+  }
+  .footer-right {
+    flex: 0 1 auto;
+    gap: 10px;
+    overflow: hidden;
+  }
+  .footer-left {
+    flex: 1 1 0;
+  }
+}
+/* Narrow windows: the left cluster's pills and the right cluster's controls no
+   longer fit on one line, and `.footer-left` clips with `overflow: hidden` — so
+   a schedules/tasks pill would silently vanish rather than wrap. Give each
+   cluster its own full-width row instead. `:has()` keeps the footer a single
+   row when the left cluster is empty (the common case), which is why this is
+   not simply `flex-wrap: wrap` for everyone. */
+@media (max-width: 620px) {
+  .footer:has(.footer-left > *) {
+    flex-wrap: wrap;
+    row-gap: 6px;
+  }
+  .footer:has(.footer-left > *) .footer-left {
+    flex: 1 1 100%;
+    /* Scroll rather than clip if even a full row is too narrow for several
+       pills, so nothing becomes unreachable. */
+    overflow-x: auto;
+    scrollbar-width: none;
+  }
+  .footer:has(.footer-left > *) .footer-left::-webkit-scrollbar {
+    display: none;
+  }
+  .footer:has(.footer-left > *) .footer-right {
+    flex: 1 1 100%;
+    justify-content: flex-end;
+  }
+  .footer-right {
+    gap: 8px;
+    font-size: 12px;
+  }
+  .schedules-menu {
+    min-width: 0;
+    max-width: calc(100vw - 24px);
+  }
+  .schedules-cadence {
+    display: none;
+  }
+}
+
+/* ── Queued steering strip (above the composer) ──
+   Messages waiting to be injected into the running turn, each cancellable.
+   Note the wording: these land at the next TURN boundary, not after the run. */
+.queued-bar {
+  border: 1px solid;
+  border-radius: var(--radius-card);
+  padding: 6px 8px;
+  margin-bottom: 6px;
+  font-size: 12px;
+  overflow: hidden;
+  /* Enter: slide up from under the composer and settle. Animating max-height
+     alongside opacity means the composer is pushed smoothly rather than
+     jumping the moment a message queues. */
+  animation: ggqueuedin 260ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+/* Exit: reverse, and collapse the box so the composer glides back down instead
+   of snapping. Held on screen for EXIT_MS by QueuedBar before it unmounts. */
+.queued-bar.leaving {
+  animation: ggqueuedout 220ms cubic-bezier(0.4, 0, 1, 1) forwards;
+  pointer-events: none;
+}
+@keyframes ggqueuedin {
+  from {
+    opacity: 0;
+    transform: translateY(6px);
+    max-height: 0;
+    margin-bottom: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+    max-height: 220px;
+    margin-bottom: 6px;
+    padding-top: 6px;
+    padding-bottom: 6px;
+  }
+}
+@keyframes ggqueuedout {
+  from {
+    opacity: 1;
+    transform: translateY(0);
+    max-height: 220px;
+  }
+  to {
+    opacity: 0;
+    transform: translateY(4px);
+    max-height: 0;
+    margin-bottom: 0;
+    padding-top: 0;
+    padding-bottom: 0;
+    border-width: 0;
+  }
+}
+.queued-bar-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.queued-dot {
+  flex: 0 0 auto;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  animation: ggqueuedpulse 2s ease-in-out infinite;
+}
+.queued-bar-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.queued-bar-when {
+  flex: 0 0 auto;
+  font-size: 11px;
+  opacity: 0.7;
+}
+.queued-toggle,
+.queued-cancel {
+  flex: 0 0 auto;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 0 2px;
+  font-family: var(--mono);
+  transition: color var(--t-fast);
+}
+.queued-toggle {
+  font-size: 11px;
+}
+/* Generous hit target: this is a destructive control on a small glyph. */
+.queued-cancel {
+  font-size: 15px;
+  line-height: 1;
+  padding: 2px 6px;
+}
+.queued-toggle:hover,
+.queued-cancel:hover {
+  color: var(--error);
+}
+.queued-list {
+  margin-top: 6px;
+  padding-top: 6px;
+  border-top: 1px solid var(--border);
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  animation: ggqueuedlist 200ms cubic-bezier(0.22, 1, 0.36, 1);
+}
+@keyframes ggqueuedlist {
+  from {
+    opacity: 0;
+    max-height: 0;
+    margin-top: 0;
+    padding-top: 0;
+  }
+  to {
+    opacity: 1;
+    max-height: 180px;
+    margin-top: 6px;
+    padding-top: 6px;
+  }
+}
+/* Rows fade in with a short stagger so the list reads as unfolding rather than
+   appearing all at once. Capped at 4 — beyond that the wait to see the last row
+   would be more annoying than the effect is pleasant. */
+.queued-list-item {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  animation: ggqueuedrow 220ms cubic-bezier(0.22, 1, 0.36, 1) backwards;
+}
+.queued-list-item:nth-child(2) {
+  animation-delay: 40ms;
+}
+.queued-list-item:nth-child(3) {
+  animation-delay: 80ms;
+}
+.queued-list-item:nth-child(n + 4) {
+  animation-delay: 120ms;
+}
+@keyframes ggqueuedrow {
+  from {
+    opacity: 0;
+    transform: translateX(-4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateX(0);
+  }
+}
+/* Respect reduced-motion: keep the state changes, drop the movement. */
+@media (prefers-reduced-motion: reduce) {
+  .queued-bar,
+  .queued-bar.leaving,
+  .queued-list,
+  .queued-list-item {
+    animation: none;
+  }
+}
+.queued-index {
+  flex: 0 0 auto;
+  font-family: var(--mono);
+  font-size: 11px;
+  width: 12px;
+}
+.queued-list-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  font-family: var(--mono);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }

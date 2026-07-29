@@ -100,6 +100,7 @@ function setup(
       planReview = typeof u === "function" ? u(planReview) : u;
     }) as AgentEventsDeps["setPlanReview"],
     setQueuedCount: noop as unknown as AgentEventsDeps["setQueuedCount"],
+    setQueuedMessages: noop as unknown as AgentEventsDeps["setQueuedMessages"],
     setAttachments: noop as unknown as AgentEventsDeps["setAttachments"],
     setCommands: noop as unknown as AgentEventsDeps["setCommands"],
     setModels,
@@ -116,6 +117,9 @@ function setup(
     hook,
     deps,
     getItems: () => items,
+    pushUserItem: (text: string, queued: boolean): void => {
+      setItems((prev) => [...prev, { kind: "user", id: nextId(), text, queued } as Item]);
+    },
     getLiveToolFeed: () => liveToolFeed,
     getPlanReview: () => planReview,
     getState: () => agentState,
@@ -127,6 +131,180 @@ function setup(
 
 describe("useAgentEvents", () => {
   beforeEach(() => vi.clearAllMocks());
+
+  describe("queued pill lifecycle", () => {
+    it("clears a bubble's queued pill as soon as the agent consumes it, mid-run", () => {
+      const { hook, getItems, pushUserItem, setRunning } = setup();
+      act(() => setRunning(true));
+      pushUserItem("first queued", true);
+      pushUserItem("second queued", true);
+
+      // The sidecar acknowledges both enqueues.
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 2,
+            messages: [
+              { id: "a", text: "first queued" },
+              { id: "b", text: "second queued" },
+            ],
+          }),
+        );
+      });
+      // The agent drains ONE message at the turn boundary: the sidecar
+      // re-broadcasts queue_drained as `queued` with the remaining list.
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", { count: 1, messages: [{ id: "b", text: "second queued" }] }),
+        );
+      });
+
+      const users = getItems().filter((it) => it.kind === "user");
+      expect(users[0]?.queued).toBe(false);
+      // The still-pending one keeps its pill.
+      expect(users[1]?.queued).toBe(true);
+    });
+
+    it("clears the rest once the queue fully drains, still mid-run", () => {
+      const { hook, getItems, pushUserItem, setRunning } = setup();
+      act(() => setRunning(true));
+      pushUserItem("first queued", true);
+      pushUserItem("second queued", true);
+
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 2,
+            messages: [
+              { id: "a", text: "first queued" },
+              { id: "b", text: "second queued" },
+            ],
+          }),
+        );
+      });
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", { count: 1, messages: [{ id: "b", text: "second queued" }] }),
+        );
+      });
+      act(() => {
+        hook.result.current.handleEvent(ev("queued", { count: 0, messages: [] }));
+      });
+
+      expect(
+        getItems()
+          .filter((it) => it.kind === "user")
+          .every((it) => it.queued === false),
+      ).toBe(true);
+    });
+
+    it("keeps the pill while the message is still pending", () => {
+      const { hook, getItems, pushUserItem, setRunning } = setup();
+      act(() => setRunning(true));
+      pushUserItem("still waiting", true);
+
+      // A fresh enqueue (depth grew) must not clear anything.
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", { count: 1, messages: [{ id: "a", text: "still waiting" }] }),
+        );
+      });
+
+      expect(getItems().find((it) => it.kind === "user")?.queued).toBe(true);
+    });
+
+    it("clears exactly one of two identical queued messages", () => {
+      // Set membership would leave BOTH lit here: the text is still present in
+      // the pending list, so nothing would ever clear until the queue emptied.
+      const { hook, getItems, pushUserItem, setRunning } = setup();
+      act(() => setRunning(true));
+      pushUserItem("same text", true);
+      pushUserItem("same text", true);
+
+      // Both acknowledged as queued.
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", {
+            count: 2,
+            messages: [
+              { id: "a", text: "same text" },
+              { id: "b", text: "same text" },
+            ],
+          }),
+        );
+      });
+      // One consumed.
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", { count: 1, messages: [{ id: "b", text: "same text" }] }),
+        );
+      });
+
+      const users = getItems().filter((it) => it.kind === "user");
+      // FIFO: the older bubble is the one the agent took.
+      expect(users[0]?.queued).toBe(false);
+      expect(users[1]?.queued).toBe(true);
+    });
+
+    it("keeps the pill on a message the sidecar has not acknowledged yet", () => {
+      // The bubble is marked queued optimistically. A queue snapshot that
+      // predates the enqueue must not clear it, because nothing re-sets the flag.
+      const { hook, getItems, pushUserItem, setRunning } = setup();
+      act(() => setRunning(true));
+      pushUserItem("first", true);
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", { count: 1, messages: [{ id: "a", text: "first" }] }),
+        );
+      });
+
+      // User sends a second message; its bubble exists before the sidecar acks.
+      pushUserItem("second", true);
+      // A stale snapshot arrives listing only the first message.
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", { count: 1, messages: [{ id: "a", text: "first" }] }),
+        );
+      });
+
+      const users = getItems().filter((it) => it.kind === "user");
+      expect(users[1]?.queued).toBe(true);
+    });
+
+    it("forgets acknowledged queue texts on session reset", () => {
+      const { hook, getItems, pushUserItem, setRunning } = setup();
+      act(() => setRunning(true));
+      pushUserItem("recycled", true);
+      act(() => {
+        hook.result.current.handleEvent(
+          ev("queued", { count: 1, messages: [{ id: "a", text: "recycled" }] }),
+        );
+      });
+      act(() => {
+        hook.result.current.handleEvent(ev("session_reset"));
+      });
+
+      // Same text queued again in the FRESH session, not yet acked.
+      pushUserItem("recycled", true);
+      act(() => {
+        hook.result.current.handleEvent(ev("queued", { count: 0, messages: [] }));
+      });
+
+      expect(getItems().find((it) => it.kind === "user")?.queued).toBe(true);
+    });
+
+    it("leaves already-sent bubbles untouched", () => {
+      const { hook, getItems, pushUserItem, setRunning } = setup();
+      act(() => setRunning(true));
+      pushUserItem("sent normally", false);
+
+      act(() => {
+        hook.result.current.handleEvent(ev("queued", { count: 0, messages: [] }));
+      });
+
+      expect(getItems().find((it) => it.kind === "user")?.queued).toBe(false);
+    });
+  });
 
   it("removes the notice when compaction is skipped", () => {
     const { hook, getItems } = setup();

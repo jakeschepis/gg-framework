@@ -18,6 +18,13 @@ export interface BackgroundProcess {
   startedAt: number;
   exitCode: number | null;
   lastReadOffset: number;
+  /**
+   * Last known size of `logFile` in bytes. Kept current by the progress
+   * watcher, the exit handler and every `readOutput`, so consumers (notably
+   * the pre-stop process gate) can tell "output was never consumed" from
+   * "output was read" without an fs stat per check.
+   */
+  logSize: number;
 }
 
 export interface StartResult {
@@ -121,6 +128,7 @@ export class ProcessManager {
       startedAt: Date.now(),
       exitCode: null,
       lastReadOffset: 0,
+      logSize: 0,
     };
 
     this.processes.set(id, proc);
@@ -130,7 +138,9 @@ export class ProcessManager {
       proc.exitCode = code ?? 1;
       this.children.delete(id);
       this.disposeWatcher(id);
-      this.notifyExit(proc);
+      // Refresh unconditionally: the gate needs a final size even when no
+      // notification queue is wired and notifyExit is a no-op.
+      void this.refreshLogSize(proc).then(() => this.notifyExit(proc));
     });
 
     this.armWatcher(proc);
@@ -165,15 +175,20 @@ export class ProcessManager {
     this.watchers.set(proc.id, timer);
   }
 
+  /** Stat the log once and cache its size on the record. Returns 0 if unreadable. */
+  private async refreshLogSize(proc: BackgroundProcess): Promise<number> {
+    try {
+      proc.logSize = (await fsp.stat(proc.logFile)).size;
+    } catch {
+      // Log may be gone (pruned, or never created); keep the last known size.
+    }
+    return proc.logSize;
+  }
+
   private async emitProgress(proc: BackgroundProcess): Promise<void> {
     const queue = this.ops.notifications;
     if (!queue) return;
-    let size: number;
-    try {
-      size = (await fsp.stat(proc.logFile)).size;
-    } catch {
-      return;
-    }
+    const size = await this.refreshLogSize(proc);
     const previous = this.watchedSizes.get(proc.id) ?? 0;
     if (size <= previous) return;
     this.watchedSizes.set(proc.id, size);
@@ -193,12 +208,7 @@ export class ProcessManager {
     const queue = this.ops.notifications;
     if (!queue) return;
     void (async () => {
-      let size = 0;
-      try {
-        size = (await fsp.stat(proc.logFile)).size;
-      } catch {
-        // Log may already be gone; the exit code is still worth reporting.
-      }
+      const size = proc.logSize;
       const tail = size > 0 ? await this.readTail(proc.logFile, size) : "";
       queue.enqueue(
         "process",
@@ -258,6 +268,7 @@ export class ProcessManager {
 
     try {
       const stat = await fsp.stat(proc.logFile);
+      proc.logSize = stat.size;
       if (stat.size > offset) {
         const buf = Buffer.alloc(stat.size - offset);
         const fh = await fsp.open(proc.logFile, "r");

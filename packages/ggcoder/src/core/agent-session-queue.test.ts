@@ -131,3 +131,71 @@ describe("AgentSession queue — takeNextQueuedMessage", () => {
     }
   });
 });
+
+describe("AgentSession queue — per-message cancellation", () => {
+  it("lists pending messages with stable ids", async () => {
+    const session = await makeSession();
+    try {
+      session.queueMessage("first");
+      session.queueMessage("second");
+      const listed = session.listQueuedMessages();
+      expect(listed.map((m) => m.text)).toEqual(["first", "second"]);
+      // Ids must be distinct and stable across reads, since the client holds
+      // them between rendering a cancel affordance and the click arriving.
+      expect(new Set(listed.map((m) => m.id)).size).toBe(2);
+      expect(session.listQueuedMessages().map((m) => m.id)).toEqual(listed.map((m) => m.id));
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  it("cancels one message by id and leaves the rest in order", async () => {
+    const session = await makeSession();
+    try {
+      session.queueMessage("first");
+      session.queueMessage("second");
+      session.queueMessage("third");
+      const [, middle] = session.listQueuedMessages();
+
+      expect(session.cancelQueuedMessage(middle!.id)).toBe(true);
+      expect(session.listQueuedMessages().map((m) => m.text)).toEqual(["first", "third"]);
+      expect(session.getQueuedCount()).toBe(2);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  it("reports false for an id that already drained, rather than throwing", async () => {
+    const session = await makeSession();
+    try {
+      session.queueMessage("first");
+      const [only] = session.listQueuedMessages();
+      session.takeNextQueuedMessage();
+
+      // The normal race: the agent consumed it between render and click.
+      expect(session.cancelQueuedMessage(only!.id)).toBe(false);
+      expect(session.getQueuedCount()).toBe(0);
+    } finally {
+      await session.dispose();
+    }
+  });
+
+  it("does not reuse ids after a cancel, so a stale click cannot hit a new message", async () => {
+    const session = await makeSession();
+    try {
+      session.queueMessage("first");
+      const [first] = session.listQueuedMessages();
+      session.cancelQueuedMessage(first!.id);
+      session.queueMessage("second");
+
+      const [second] = session.listQueuedMessages();
+      expect(second!.id).not.toBe(first!.id);
+      // A late click carrying the old id must be a no-op, not a cancel of the
+      // message that happens to occupy the same position now.
+      expect(session.cancelQueuedMessage(first!.id)).toBe(false);
+      expect(session.listQueuedMessages().map((m) => m.text)).toEqual(["second"]);
+    } finally {
+      await session.dispose();
+    }
+  });
+});

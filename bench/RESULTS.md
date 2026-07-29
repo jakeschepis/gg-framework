@@ -234,6 +234,54 @@ both writers instead of two duplicate `clamp` copies. On the real live string:
 Periods inside code (`input.toLowerCase()`) are correctly not treated as sentence
 ends. Cost of the cleaner ending: 25 chars (~7 tokens) per truncated entry.
 
+## I — Why project memory was REMOVED (27 July 2026)
+
+The durable project journal (`.gg/memory.md`, benches F/G/H) shipped in `ggcoder@5.26.0`
+/ app `v0.31.0` and was **removed the same day**. Recording why, so it is not rebuilt.
+
+**What it did:** on every compaction, wrote past-tense entries ("Was asked to X",
+"Edited Y", plus the summary's What Was Done / Errors and Fixes) into `.gg/memory.md`,
+and auto-injected the recent ones into every later session's prompt.
+
+**Why that is the wrong design for a *coding* agent:**
+
+1. **It duplicated the repo.** Everything it recorded — what was asked, what changed,
+   what the code now does — is already in `git log`, `git diff`, and the source, in
+   exact rather than paraphrased form. An ETH Zurich ablation on auto-generated
+   context files measured **~3% lower success rate and >20% higher cost**, attributed
+   specifically to duplicating what the agent can already discover. The test it
+   proposes — *can the agent find this by reading the code?* — was "yes" for every
+   entry this feature wrote.
+2. **It suppressed verification** (bench G): 5/5 → 0/5 tool checks, and a stale entry
+   was then asserted as fact 5/5. Neither note ages nor an explicit "unverified"
+   header fixed it. Independently corroborated: uncurated auto-memory accumulates
+   stale assumptions the agent then applies with full confidence.
+3. **It cost ~282 tok/turn** for the above.
+4. **It was cross-task noise.** A new session on an unrelated task still received the
+   previous task's history.
+
+**What the field actually does** (surveyed 27 July 2026):
+
+| agent | cross-session memory | what it stores |
+|---|---|---|
+| opencode (189k★) | **none** — open feature requests only | — |
+| gemini-cli | GEMINI.md, edited only on explicit request | instructions |
+| claude-code | auto-memory, on by default | **selective insights**: build commands, debugging insights, architecture notes, preferences |
+| codex | memories, **off** by default | summaries + entries |
+| MiMo-Code | SQLite FTS5 + checkpoint subagent | layered |
+
+The distinction that matters: Claude Code stores *insights* and explicitly **does not
+save every session** — it judges whether something would be useful later. This feature
+dumped *event history* unconditionally on a compaction timer. Different mechanism,
+different value.
+
+**If memory is rebuilt, build the other shape:** agent-judged capture of what is NOT
+recoverable from the repo — approaches tried and abandoned (dead ends are never
+committed, so they are genuinely lost), tooling gotchas, verified commands, and *why*
+an architecture is the way it is. Written when something is worth keeping, not on a
+timer. Bench G still applies: anything injected will suppress verification, so only
+inject what cannot go stale.
+
 ## Verdict
 
 | bench | verdict | expected gain |
@@ -245,9 +293,10 @@ ends. Cost of the cleaner ending: 25 chars (~7 tokens) per truncated entry.
 | E model-switch cache | ship for correctness | **no token gain (+0%)** — do not claim one |
 | F memory cost | bounded | ~420 tok/turn, plateaus regardless of log size |
 | G memory suppresses verification | **default OFF; open question** | 5/5 → 0/5 verification; wording fixes do not work |
-| H live journal + de-dup | ship (default OFF) | works end-to-end; −60% written/compaction, tail plateaus at 282 tok |
+| H live journal + de-dup | ~~ship~~ **superseded by I** | worked end-to-end, but see I |
+| I project memory | **REMOVED** | duplicated the repo; that shape measures −3% success / +20% cost |
 
 Reproduce: `node bench/a-mcp-tools.mjs` · `node bench/b-render-cpu.mjs` ·
 `node bench/c-partial-loss.mjs` · `node bench/d-cache-audit.mjs` ·
-`node bench/e-model-switch-cache.mjs` · `node bench/f-memory-staleness.mjs` ·
-`node bench/g-journal-live.mjs` (from repo root; H needs real credentials).
+`node bench/e-model-switch-cache.mjs` · `node bench/f-memory-staleness.mjs`
+(from repo root).

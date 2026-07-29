@@ -145,6 +145,7 @@ export class LspClient {
   private waiters: DiagnosticWaiter[] = [];
   private hasPullDiagnostics = false;
   private readonly activeProgressTokens = new Set<string>();
+  private sawProgress = false;
   private alive = true;
 
   private readonly initializationOptions: unknown;
@@ -202,8 +203,10 @@ export class LspClient {
       const progress = params as ProgressParams;
       if (progress?.token === undefined) return;
       const key = progressTokenKey(progress.token);
-      if (progress.value?.kind === "begin") this.activeProgressTokens.add(key);
-      else if (progress.value?.kind === "end") this.activeProgressTokens.delete(key);
+      if (progress.value?.kind === "begin") {
+        this.activeProgressTokens.add(key);
+        this.sawProgress = true;
+      } else if (progress.value?.kind === "end") this.activeProgressTokens.delete(key);
     });
   }
 
@@ -214,6 +217,42 @@ export class LspClient {
   /** True while the server reports indexing/analysis through LSP work progress. */
   get hasActiveProgress(): boolean {
     return this.activeProgressTokens.size > 0;
+  }
+
+  /**
+   * True once the server has reported ANY work progress, even if it has since
+   * ended. A server that loads a project this way can publish an empty
+   * diagnostic set the instant loading finishes but before the open file has
+   * actually been analysed, so an empty FIRST result from one is not yet
+   * trustworthy. Servers that never report progress never pay for this.
+   */
+  get hasReportedProgress(): boolean {
+    return this.sawProgress;
+  }
+
+  /**
+   * Wait for the NEXT publishDiagnostics for `uri`, deliberately ignoring what
+   * is already cached. Resolves null when none arrives inside `timeoutMs`,
+   * which means "no correction came", not a failure.
+   */
+  awaitNextPublish(uri: string, timeoutMs: number): Promise<LspDiagnostic[] | null> {
+    const key = normalizeUri(uri);
+    if (!this.alive) return Promise.resolve(null);
+    return new Promise<LspDiagnostic[] | null>((resolve) => {
+      const waiter: DiagnosticWaiter = {
+        uri: key,
+        resolve: (diagnostics) => {
+          clearTimeout(timer);
+          resolve(diagnostics);
+        },
+      };
+      const timer = setTimeout(() => {
+        this.waiters = this.waiters.filter((w) => w !== waiter);
+        resolve(null);
+      }, timeoutMs);
+      timer.unref();
+      this.waiters.push(waiter);
+    });
   }
 
   /**

@@ -110,6 +110,32 @@ describe("LspManager", () => {
     expect(outcome.kind).toBe("clean");
   });
 
+  // Regression guard for the Windows CI failure in `windows.test.ts`: on a cold
+  // project load tsserver ends its load progress and publishes an EMPTY set for
+  // the open file BEFORE type-checking it, then publishes the real diagnostics.
+  // Taking that first publish at face value reported a broken file as clean, so
+  // inline diagnostics silently did nothing on the first edit in a project.
+  it("does not report clean on a server's premature empty publish during cold load", async () => {
+    const manager = makeManager(fakeSpec(["--premature-empty"]));
+    const outcome = await manager.diagnosticsAfterWriteDetailed(
+      path.join(tmpDir, "premature.fake"),
+      "ERROR\n",
+    );
+    expect(outcome.kind).toBe("diagnostics");
+  });
+
+  // The settle window must not turn a genuinely clean cold file into a stall or
+  // a wrong verdict: no follow-up publish ever arrives here, so it still has to
+  // land on `clean`.
+  it("still reports clean when the follow-up publish never comes", async () => {
+    const manager = makeManager(fakeSpec(["--progress-end"]));
+    const outcome = await manager.diagnosticsAfterWriteDetailed(
+      path.join(tmpDir, "cold-clean.fake"),
+      "all good\n",
+    );
+    expect(outcome.kind).toBe("clean");
+  });
+
   it("works with pull-diagnostics servers", async () => {
     const manager = makeManager(fakeSpec(["--pull"]));
     const filePath = path.join(tmpDir, "pull.fake");

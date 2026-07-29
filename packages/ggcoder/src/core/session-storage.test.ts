@@ -259,7 +259,12 @@ describe("cold session archive safety", () => {
     expect((await readdir(directory)).some((name) => name.includes(SESSION_TEMP_MARKER))).toBe(
       false,
     );
-  });
+    // ~0.5s on a dev SSD, but this writes 16 MB, gzips it, and then polls the
+    // directory — on the Windows CI runner (slower disk + antivirus on every
+    // write) that overran vitest's 5s default and failed as a timeout rather
+    // than a real assertion. Generous explicit budget; a genuine hang still
+    // fails, just later.
+  }, 60_000);
 
   it("ignores partial maintenance files in listing and removes old ones during maintenance", async () => {
     const root = await makeTempDir();

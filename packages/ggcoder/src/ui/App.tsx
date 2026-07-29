@@ -31,6 +31,7 @@ import {
   type SubAgentManager,
   type SubAgentSnapshot,
 } from "../core/subagent-manager.js";
+import { buildProcessCompletionFollowUp } from "../core/process-gate.js";
 import { useAgentLoop, type StreamSnapshot, type UserContent } from "./hooks/useAgentLoop.js";
 import { useTranscriptHistory } from "./hooks/useTranscriptHistory.js";
 import type { PasteInfo } from "./components/InputArea.js";
@@ -513,6 +514,13 @@ export function App(props: AppProps) {
   // new [DONE:n] marker advances progress (see onTurnText). Caps at 2 nudges
   // so a genuinely stuck agent surfaces instead of looping forever.
   const followUpNudgesRef = useRef<{ step: number; count: number }>({ step: 0, count: 0 });
+  // Background-process completion gate bookkeeping. Keyed by the loop's run
+  // start timestamp so the injection budget resets itself on each new run
+  // without needing a run-start callback.
+  const processGateRef = useRef<{ runStartedAt: number; injected: number }>({
+    runStartedAt: 0,
+    injected: 0,
+  });
   // Seed the per-item ID counter so it doesn't collide with IDs already in
   // sessionStore.history (which survives remount). Without this, a remount
   // (resize, overlay toggle, task pane open, etc.) starts the counter at 0
@@ -929,6 +937,9 @@ export function App(props: AppProps) {
     ],
   );
 
+  // Back-reference to the loop, so callbacks defined in its own options object
+  // (which run long after mount) can read loop-owned refs such as runStartRef.
+  const agentLoopRef = useRef<ReturnType<typeof useAgentLoop> | null>(null);
   const agentLoop = useAgentLoop(
     messagesRef,
     {
@@ -1744,6 +1755,26 @@ export function App(props: AppProps) {
       getFollowUpMessages: useCallback(() => {
         const childCompletionFollowUp = buildSubAgentCompletionFollowUp(props.subAgentManager);
         if (childCompletionFollowUp) return childCompletionFollowUp;
+
+        // Background processes started this run and never read block
+        // completion: their progress/exit checkpoints only reach the agent on
+        // the steering path, which a run about to stop never reaches.
+        const runStartedAt = agentLoopRef.current?.runStartRef.current ?? 0;
+        const gate = processGateRef.current;
+        if (gate.runStartedAt !== runStartedAt) {
+          gate.runStartedAt = runStartedAt;
+          gate.injected = 0;
+        }
+        const processFollowUp = buildProcessCompletionFollowUp(
+          props.processManager?.list() ?? [],
+          runStartedAt,
+          gate.injected,
+        );
+        if (processFollowUp) {
+          gate.injected += 1;
+          return processFollowUp;
+        }
+
         const steps = planStepsRef.current;
         if (steps.length === 0 || !approvedPlanPathRef.current) return null;
         const next = steps.find((s) => !s.completed);
@@ -1765,7 +1796,7 @@ export function App(props: AppProps) {
               `or you genuinely need user input.`,
           },
         ];
-      }, [props.subAgentManager]),
+      }, [props.subAgentManager, props.processManager]),
       onRetry: useCallback(() => {
         // Roll back any pending progressive flushes from the aborted attempt.
         // Without this, a stall retry regenerates the preamble and the old
@@ -1794,6 +1825,7 @@ export function App(props: AppProps) {
       ),
     },
   );
+  agentLoopRef.current = agentLoop;
 
   // Sync terminal title with agent loop state
   useEffect(() => {

@@ -10,6 +10,7 @@ import {
   type BackgroundTask,
   type ModelOption,
   type ProjectTask,
+  type QueuedMessage,
   type SlashCommand,
 } from "./agent";
 import { formatTokenCount } from "./ActivityBar";
@@ -137,6 +138,8 @@ export interface AgentEventsDeps {
   setPlanDone: Dispatch<SetStateAction<Set<number>>>;
   setPlanReview: Dispatch<SetStateAction<string | null>>;
   setQueuedCount: Dispatch<SetStateAction<number>>;
+  /** Pending queued messages (id + text) for the cancel affordance. */
+  setQueuedMessages: Dispatch<SetStateAction<QueuedMessage[]>>;
   setAttachments: Dispatch<SetStateAction<PendingAttachment[]>>;
   setCommands: Dispatch<SetStateAction<SlashCommand[]>>;
   setModels: Dispatch<SetStateAction<ModelOption[]>>;
@@ -180,6 +183,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
     setPlanDone,
     setPlanReview,
     setQueuedCount,
+    setQueuedMessages,
     setAttachments,
     setCommands,
     setModels,
@@ -198,6 +202,11 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
   // Transcript id of the active sub-agent group for this run (null until the
   // first subagent spawns). The per-agent map keeps late async lifecycle events
   // attached to their original transcript group after a newer run starts.
+  // Queued-message texts the sidecar has actually acknowledged, with the highest
+  // pending count seen for each. A bubble is marked queued optimistically before
+  // that ack arrives, and clearing the flag is one-way, so this gates the clear
+  // to messages we know really entered the queue.
+  const ackedQueueTextsRef = useRef<Map<string, number>>(new Map());
   const subagentGroupIdRef = useRef<number | null>(null);
   const subagentGroupByAgentRef = useRef<Map<string, number>>(new Map());
   // subagent_state snapshots arrive per tool/turn event PER AGENT — with
@@ -976,9 +985,63 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
         case "tasks_run_done":
           // Run-all sweep finished — nothing to render; the modal reflects it.
           break;
-        case "queued":
+        case "queued": {
           setQueuedCount(Number(d.count ?? 0));
+          // The sidecar sends the full pending list alongside the depth so each
+          // row can offer an individual cancel.
+          const list = Array.isArray(d.messages) ? (d.messages as QueuedMessage[]) : [];
+          setQueuedMessages(list);
+          // This event also fires when the agent CONSUMES queued steering at a
+          // turn boundary (the sidecar re-broadcasts `queue_drained` here), so
+          // drop the pending affordance from bubbles that have left the queue.
+          // Waiting for run_end instead would keep a message marked "queued" for
+          // minutes after the agent already acted on it, which reads as though it
+          // were still waiting and prompts a needless cancel.
+          //
+          // Matching is by COUNT per text, not set membership, because bubbles
+          // carry no queue id: with two identical queued messages and one
+          // consumed, the text is still present and a set test would clear
+          // neither. Comparing counts clears exactly one.
+          const pendingByText = new Map<string, number>();
+          for (const m of list) pendingByText.set(m.text, (pendingByText.get(m.text) ?? 0) + 1);
+
+          // A bubble is marked queued optimistically, before the sidecar acks the
+          // enqueue. Clearing one that has never appeared in a pending list would
+          // be permanent (nothing ever re-sets the flag), so only texts we have
+          // actually seen queued are eligible.
+          for (const [text, count] of pendingByText) {
+            const seen = ackedQueueTextsRef.current.get(text) ?? 0;
+            if (count > seen) ackedQueueTextsRef.current.set(text, count);
+          }
+
+          setItems((prev) => {
+            // How many queued bubbles exist per text, so the number the agent has
+            // taken is (bubbles - still pending).
+            const bubbleCount = new Map<string, number>();
+            for (const it of prev) {
+              if (it.kind !== "user" || !it.queued) continue;
+              if (!ackedQueueTextsRef.current.has(it.text)) continue;
+              bubbleCount.set(it.text, (bubbleCount.get(it.text) ?? 0) + 1);
+            }
+            const toClear = new Map<string, number>();
+            for (const [text, bubbles] of bubbleCount) {
+              const consumed = bubbles - (pendingByText.get(text) ?? 0);
+              if (consumed > 0) toClear.set(text, consumed);
+            }
+            if (toClear.size === 0) return prev;
+
+            // Clear from the FRONT: the queue is FIFO, so the earliest matching
+            // bubble is the one the agent just consumed.
+            return prev.map((it) => {
+              if (it.kind !== "user" || !it.queued) return it;
+              const left = toClear.get(it.text) ?? 0;
+              if (left <= 0) return it;
+              toClear.set(it.text, left - 1);
+              return { ...it, queued: false };
+            });
+          });
           break;
+        }
         case "hook": {
           const kind = String(d.kind ?? "ideal") as HookKind;
           if (kind in HOOK_PRESENTATION) {
@@ -993,6 +1056,9 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           // Buffered sub-agent snapshots are dropped, not flushed: a late
           // flush would recreate a stale group in the fresh transcript.
           dropPendingSubagentSnapshots();
+          // The transcript is going away, so acked queue texts from the old
+          // session must not gate clears in the new one.
+          ackedQueueTextsRef.current.clear();
           stickToBottomRef.current = true;
           setItems([]);
           setLiveToolFeed([]);
@@ -1017,6 +1083,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           }
           setAttachments([]);
           setQueuedCount(0);
+          setQueuedMessages([]);
           endStreamingText();
           subagentGroupIdRef.current = null;
           subagentGroupByAgentRef.current.clear();
@@ -1091,6 +1158,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
       setPlanDone,
       setPlanReview,
       setQueuedCount,
+      setQueuedMessages,
       setAttachments,
       setCommands,
       setModels,

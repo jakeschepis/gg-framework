@@ -147,6 +147,28 @@ export interface CompactionResult {
   newCount: number;
   tokensBeforeEstimate: number;
   tokensAfterEstimate: number;
+  /** How the collapse shifted message positions, so callers can move transcript
+   *  anchors (Ken turns, autopilot verdicts, app markers) onto the rewritten
+   *  message list instead of leaving them pointing at pre-compaction indices.
+   *  Only set when `compacted` is true. */
+  anchorRemap?: CompactionAnchorRemap;
+}
+
+/**
+ * Position bookkeeping for a compaction: the leading `summarizedCount`
+ * non-system messages were replaced by `prefixCount` non-system messages (the
+ * summary, plus the assistant acknowledgement when one is emitted). Everything
+ * after the collapsed region is kept verbatim, so it merely shifts.
+ */
+export interface CompactionAnchorRemap {
+  /** Non-system messages that were folded into the summary. */
+  summarizedCount: number;
+  /** Non-system messages the summary block occupies in the new list. */
+  prefixCount: number;
+  /** Non-system messages in the FINAL compacted list. A hard ceiling for
+   *  remapped anchors: tool-pairing repair and the trailing-assistant pop can
+   *  shorten the retained tail after the collapse is decided. */
+  newNonSystemCount: number;
 }
 
 /**
@@ -941,6 +963,22 @@ export async function compact(
   const tokensAfterEstimate = estimateConversationTokens(newMessages);
   const reduction = Math.round((1 - tokensAfterEstimate / tokensBeforeEstimate) * 100);
 
+  // Everything before the retained tail collapsed into the summary (+ ack).
+  // Callers use this to move transcript anchors onto the new indices; without
+  // it, restored Ken bubbles / autopilot verdicts / error rows keep their
+  // pre-compaction positions and land far below where they happened.
+  //
+  // newNonSystemCount is measured AFTER repairToolPairing and the
+  // trailing-assistant pop above, both of which can drop messages from the
+  // retained tail. Deriving the new length from summarizedCount alone would
+  // overshoot by exactly those messages and push tail anchors past the end —
+  // reintroducing the dropped/bottom-clamped markers this remap exists to fix.
+  const anchorRemap: CompactionAnchorRemap = {
+    summarizedCount: messages.slice(0, recentStart).filter((m) => m.role !== "system").length,
+    prefixCount: skipAck ? 1 : 2,
+    newNonSystemCount: newMessages.filter((m) => m.role !== "system").length,
+  };
+
   log("INFO", "compaction", `Compaction complete`, {
     originalMessages: String(originalCount),
     newMessages: String(newMessages.length),
@@ -962,6 +1000,7 @@ export async function compact(
       newCount: newMessages.length,
       tokensBeforeEstimate,
       tokensAfterEstimate,
+      anchorRemap,
     },
   };
 }

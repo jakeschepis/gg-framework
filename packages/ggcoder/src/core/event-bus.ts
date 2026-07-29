@@ -52,6 +52,12 @@ export interface BusEventMap {
   // Persistent async child lifecycle (bounded metadata/output snapshot).
   subagent_state: SubAgentSnapshot;
 
+  /** Queued user steering was consumed into the run at a turn boundary.
+   *  `count` is the remaining depth. Lets clients clear the "queued" affordance
+   *  the moment the agent picks a message up, instead of holding it until
+   *  run_end — the message is already in the loop long before the run ends. */
+  queue_drained: { count: number };
+
   // Session lifecycle
   session_start: { sessionId: string };
   model_change: { provider: string; model: string; supportsVideo?: boolean };

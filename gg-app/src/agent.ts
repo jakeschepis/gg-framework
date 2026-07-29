@@ -282,6 +282,9 @@ export interface DiscoveredProject {
   sources: string[];
 }
 
+/** Store a session row came from; absent means a native GG Coder session. */
+export type SessionSource = "ggcoder" | "claude-code" | "codex";
+
 export interface RecentSession {
   id: string;
   path: string;
@@ -289,6 +292,11 @@ export interface RecentSession {
   lastActiveDisplay: string;
   messageCount: number;
   chatAgent?: ChatAgentId;
+  /**
+   * Absent (or `ggcoder`) means this resumes directly. A foreign value means
+   * `path` is that tool's own transcript, imported before it opens.
+   */
+  source?: SessionSource;
 }
 
 export interface SwitchModelResult extends ThinkingState {
@@ -855,6 +863,33 @@ export async function setRadioVolume(volume: number): Promise<number> {
   return Number.isFinite(res.volume) ? res.volume : volume;
 }
 
+/** One user message waiting to be injected into the running turn. */
+export interface QueuedMessage {
+  id: string;
+  text: string;
+}
+
+/**
+ * Cancel one pending queued message by id.
+ *
+ * Returns the remaining queue, or null if the call itself failed. A `cancelled:
+ * false` from the sidecar is NOT a failure: it means the agent consumed the
+ * message between the row rendering and the click landing, so the caller should
+ * simply reconcile to the returned list.
+ */
+export async function cancelQueued(id: string): Promise<QueuedMessage[] | null> {
+  try {
+    const res = await invoke<{ cancelled?: boolean; queued?: QueuedMessage[] }>(
+      "agent_cancel_queued",
+      { id },
+    );
+    return res.queued ?? [];
+  } catch (e) {
+    await logError(`agent_cancel_queued failed: ${String(e)}`);
+    return null;
+  }
+}
+
 /** Stop a background task by id. Returns the sidecar's status message, if any. */
 export async function killTask(id: string): Promise<string | null> {
   try {
@@ -863,6 +898,38 @@ export async function killTask(id: string): Promise<string | null> {
   } catch (e) {
     await logError(`agent_kill_task failed: ${String(e)}`);
     return null;
+  }
+}
+
+/** Result of importing a foreign coding-agent transcript. */
+export type ImportTranscriptResult =
+  | {
+      ok: true;
+      sessionId: string;
+      sessionPath: string;
+      cwd: string;
+      format: "claude" | "codex" | "cursor";
+      messageCount: number;
+      /** Human-readable summary of what the lossy import discarded. */
+      dropped: string;
+      preview?: string;
+    }
+  | { ok: false; error: string };
+
+/**
+ * Import a Claude Code / Codex / Cursor transcript as a resumable GG Coder
+ * session. Failures come back as `{ ok: false, error }` rather than throwing,
+ * so the caller can render the reason directly.
+ */
+export async function importTranscript(
+  path: string,
+  cwd?: string,
+): Promise<ImportTranscriptResult> {
+  try {
+    return await invoke<ImportTranscriptResult>("agent_import_transcript", { path, cwd });
+  } catch (e) {
+    await logError(`agent_import_transcript failed: ${String(e)}`);
+    return { ok: false, error: String(e) };
   }
 }
 
@@ -1176,6 +1243,57 @@ export async function gazeFocus(
 export async function onGazeTarget(cb: (e: GazeTargetEvent) => void): Promise<() => void> {
   const un = await appWindow.listen<GazeTargetEvent>("gaze-target", (e) => cb(e.payload));
   return un;
+}
+
+// ── macOS menu-bar tray ────────────────────────────────────────────────────
+
+/** An action picked from the macOS menu-bar menu. */
+export type TrayIntent = "update" | "new-chat" | "new-code" | "remote" | "settings";
+
+/**
+ * Subscribe THIS window to tray actions routed to it. Returns an unlisten fn.
+ * Used when the tray reuses an already-open window.
+ */
+export async function onTrayIntent(cb: (intent: TrayIntent) => void): Promise<() => void> {
+  return await appWindow.listen<TrayIntent>("tray-intent", (e) => cb(e.payload));
+}
+
+/**
+ * Claim (once) the tray action THIS window was opened for, or null when the user
+ * opened it themselves. A window built by the tray isn't listening yet when the
+ * menu is clicked, so Rust parks the intent and the webview claims it on mount.
+ */
+export async function takeTrayIntent(): Promise<TrayIntent | null> {
+  try {
+    return await invoke<TrayIntent | null>("window_tray_intent");
+  } catch (e) {
+    await logError(`window_tray_intent failed: ${String(e)}`);
+    return null;
+  }
+}
+
+/**
+ * Tell the tray whether an app update is pending, so "Update now" appears in the
+ * menu-bar menu (and disappears again when up to date). `null` = up to date.
+ */
+export async function setUpdateAvailable(version: string | null): Promise<void> {
+  try {
+    await invoke("set_update_available", { version });
+  } catch (e) {
+    await logError(`set_update_available failed: ${String(e)}`);
+  }
+}
+
+/**
+ * Tell the tray whether Remote (the Telegram serve loop) is running, so its menu
+ * item reads "Remote" or "Remote · Turn off".
+ */
+export async function setRemoteActive(active: boolean): Promise<void> {
+  try {
+    await invoke("set_remote_active", { active });
+  } catch (e) {
+    await logError(`set_remote_active failed: ${String(e)}`);
+  }
 }
 
 /** Open a single new project window (Cmd/Ctrl+N). Never re-tiles existing ones. */

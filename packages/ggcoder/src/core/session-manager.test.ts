@@ -340,7 +340,9 @@ describe("SessionManager.getAppMarkers", () => {
       // Missing afterMessageCount → 0; missing/null data → {}.
       autopilotEntry("ok", { version: 1, kind: "task", data: null }, APP_MARKER_CUSTOM_KIND),
     ]);
-    expect(markers).toEqual([{ version: 1, kind: "task", afterMessageCount: 0, data: {} }]);
+    expect(markers).toEqual([
+      { version: 1, kind: "task", afterMessageCount: 0, data: {}, recordedAfterMessageCount: 0 },
+    ]);
   });
 
   it("accepts the compaction kind (persisted N → M counts for the resumed notice)", () => {
@@ -362,6 +364,8 @@ describe("SessionManager.getAppMarkers", () => {
         kind: "compaction",
         afterMessageCount: 3,
         data: { originalCount: 40, newCount: 6 },
+        // File-order position: no message entries precede it in this fixture.
+        recordedAfterMessageCount: 0,
       },
     ]);
   });
@@ -385,6 +389,7 @@ describe("SessionManager.getAppMarkers", () => {
         kind: "agent_handoff",
         afterMessageCount: 4,
         data: { chatAgent: "therapist" },
+        recordedAfterMessageCount: 0,
       },
     ]);
   });
@@ -405,7 +410,14 @@ describe("SessionManager.getAppMarkers", () => {
     const msgs = manager2.getMessages(loaded.entries, loaded.header.leafId);
     expect(JSON.stringify(msgs)).not.toContain("kenSent");
     expect(manager2.getAppMarkers(loaded.entries)).toEqual([
-      { version: 1, kind: "user_hint", afterMessageCount: 1, data: { kenSent: true } },
+      {
+        version: 1,
+        kind: "user_hint",
+        afterMessageCount: 1,
+        data: { kenSent: true },
+        // One message entry was written before the marker line.
+        recordedAfterMessageCount: 1,
+      },
     ]);
   });
 });

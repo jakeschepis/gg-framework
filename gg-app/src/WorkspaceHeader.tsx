@@ -1,5 +1,6 @@
 import type { ReactNode } from "react";
 import { openProjectPath, openUrl, type WorkspaceMode } from "./agent";
+import { projectAccent } from "./projectAccent";
 
 interface WorkspaceHeaderProps {
   workspaceMode: WorkspaceMode;
@@ -62,9 +63,16 @@ export function WorkspaceHeader({
 }: WorkspaceHeaderProps): React.ReactElement {
   const fallbackTitle = workspaceMode === "chat" ? "GG Chat" : "GG Coder";
   const directory = cwd?.split(/[\\/]/).filter(Boolean).pop();
+  // Stable per-project colour, so a wall of identical dark windows becomes
+  // identifiable at a glance. Published as a CSS variable (not just inlined on
+  // the one rule that uses it) so descendants can opt in later.
+  const accent = projectAccent(cwd);
 
   return (
-    <div className="chat-head">
+    <div
+      className="chat-head"
+      style={accent ? ({ "--project-accent": accent } as React.CSSProperties) : undefined}
+    >
       <div className="chat-head-strip" data-tauri-drag-region>
         <span
           className="chat-head-title"
@@ -81,6 +89,7 @@ export function WorkspaceHeader({
         >
           {directory ? (
             <>
+              {accent && <span className="chat-head-accent-dot" aria-hidden="true" />}
               <button
                 type="button"
                 className="chat-head-cwd chat-head-link"

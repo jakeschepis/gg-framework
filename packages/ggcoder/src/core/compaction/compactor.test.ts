@@ -12,6 +12,7 @@ import {
   HISTORICAL_TOOL_ARG_MAX_CHARS,
   SUMMARY_ATTEMPT_TIMEOUT_MS,
 } from "./compactor.js";
+import { remapAnchorForCompaction } from "../session-history.js";
 import { estimateConversationTokens } from "./token-estimator.js";
 import { MODELS, getContextWindow } from "@kenkaiiii/gg-core";
 import type { Message, ContentPart, ToolResult } from "@kenkaiiii/gg-ai";
@@ -908,5 +909,123 @@ describe("compact", () => {
     expect(callCount).toBe(3);
     const summaryMsg = result.messages[1];
     expect(summaryMsg.content as string).toContain("Summary on third try");
+  });
+
+  // anchorRemap is what lets callers move transcript markers (Ken turns,
+  // autopilot verdicts, error rows) onto the rewritten message list. If it
+  // disagrees with the actual collapse, restored markers land in the wrong
+  // place — the "everything bunched at the bottom" bug.
+  it("reports an anchorRemap that matches the real collapse (ack skipped)", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockReturnValue(
+      mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "Summary." },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 50 },
+        }),
+      ) as never,
+    );
+
+    const messages = buildConversation(30);
+    const result = await compact(messages, baseOptions);
+    const remap = result.result.anchorRemap;
+    expect(remap).toBeDefined();
+    // This fixture's retained tail starts with an assistant message, so the
+    // ack is skipped and the summary block is a single message.
+    expect(remap!.prefixCount).toBe(1);
+
+    const newNonSystem = result.messages.filter((m) => m.role !== "system").length;
+    const oldNonSystem = messages.filter((m) => m.role !== "system").length;
+
+    // The reported new length must be the real one — everything downstream
+    // clamps against it.
+    expect(remap!.newNonSystemCount).toBe(newNonSystem);
+
+    // The summary block replaces the summarized head; the untouched tail is
+    // exactly what remains after it.
+    const keptTail = oldNonSystem - remap!.summarizedCount;
+    expect(remap!.prefixCount + keptTail).toBe(newNonSystem);
+
+    // That tail really is the ORIGINAL trailing messages, so an anchor in that
+    // region only shifts — it never needs re-interpreting.
+    expect(result.messages.slice(-keptTail)).toEqual(messages.slice(-keptTail));
+
+    // Remapping the last pre-compaction anchor must land exactly at the end of
+    // the new transcript — never past it (past-the-end is what gets dropped or
+    // clamped to the bottom on resume).
+    expect(remapAnchorForCompaction(oldNonSystem, remap!)).toBe(newNonSystem);
+    for (let anchor = 0; anchor <= oldNonSystem; anchor++) {
+      const moved = remapAnchorForCompaction(anchor, remap!);
+      expect(moved).toBeGreaterThanOrEqual(0);
+      expect(moved).toBeLessThanOrEqual(newNonSystem);
+    }
+  });
+
+  it("keeps anchorRemap correct when the ack IS emitted", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockReturnValue(
+      mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "Summary." },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 50 },
+        }),
+      ) as never,
+    );
+
+    // A huge trailing assistant message pushes the cut point past it, so the
+    // retained tail starts with a user message and the ack is emitted — the
+    // summary block is 2 messages, and the remap must account for both.
+    const messages = buildConversation(30);
+    messages.push(makeMessage("assistant", `tail ${"y".repeat(40_000)}`));
+    messages.push(makeMessage("user", "and finally this"));
+
+    const result = await compact(messages, baseOptions);
+    const remap = result.result.anchorRemap;
+    expect(remap).toBeDefined();
+    expect(remap!.prefixCount).toBe(2);
+
+    const newNonSystem = result.messages.filter((m) => m.role !== "system").length;
+    const oldNonSystem = messages.filter((m) => m.role !== "system").length;
+    expect(remap!.newNonSystemCount).toBe(newNonSystem);
+    expect(remap!.prefixCount + (oldNonSystem - remap!.summarizedCount)).toBe(newNonSystem);
+    expect(remapAnchorForCompaction(oldNonSystem, remap!)).toBe(newNonSystem);
+  });
+
+  // repairToolPairing and the trailing-assistant pop can shorten the retained
+  // tail AFTER the collapse is decided. Deriving the new length from
+  // summarizedCount alone then overshoots, pushing tail anchors past the end —
+  // where markers get dropped and Ken turns clamp to the bottom, which is the
+  // exact symptom this remap exists to prevent.
+  it("never maps an anchor past the end when the trailing assistant is popped", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockReturnValue(
+      mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "Summary." },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 50 },
+        }),
+      ) as never,
+    );
+
+    // Ends with an assistant message, so the pop loop fires and trims the tail.
+    const messages = buildConversation(30);
+    messages.push(makeMessage("assistant", "trailing assistant reply"));
+    expect(messages[messages.length - 1].role).toBe("assistant");
+
+    const result = await compact(messages, baseOptions);
+    const remap = result.result.anchorRemap;
+    expect(remap).toBeDefined();
+
+    const newNonSystem = result.messages.filter((m) => m.role !== "system").length;
+    const oldNonSystem = messages.filter((m) => m.role !== "system").length;
+    expect(remap!.newNonSystemCount).toBe(newNonSystem);
+
+    // Every anchor — especially the last one — stays inside the new transcript.
+    for (let anchor = 0; anchor <= oldNonSystem; anchor++) {
+      expect(remapAnchorForCompaction(anchor, remap!)).toBeLessThanOrEqual(newNonSystem);
+    }
   });
 });
