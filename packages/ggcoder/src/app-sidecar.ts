@@ -59,7 +59,7 @@ import {
 } from "./core/autopilot-gate.js";
 import { driveAutopilotCycle, frameAutopilotInjection } from "./core/autopilot-cycle.js";
 import { validateKenModelPref, effectiveKenModel, type KenModelPref } from "./core/ken-model.js";
-import type { KenTurnPayload, AppMarkerPayload } from "./core/session-manager.js";
+import type { KenTurnPayload, AppMarkerPayload, RunOutcome } from "./core/session-manager.js";
 import {
   normalizeAutopilotMarkersForHistory,
   normalizeAppMarkersForHistory,
@@ -157,9 +157,11 @@ import {
   parseMcpAddCommand,
   MCPClientManager,
   McpOAuthStore,
+  createElicitationBridge,
   type MCPScope,
   type MCPServerConfig,
 } from "./core/mcp/index.js";
+import type { ElicitResult } from "@modelcontextprotocol/client";
 import { buildSnapshot, levelForXp, rankForLevel } from "./core/progress/ranks.js";
 import { loadProgress, peekProgress, updateProgress } from "./core/progress/store.js";
 import { awardPrompt, awardCommits } from "./core/progress/engine.js";
@@ -838,6 +840,22 @@ async function main(): Promise<void> {
   // request to its window's session via the `x-gg-session` header (and the
   // `?session=` query for the SSE /events stream).
   const sessions = new Map<string, SessionContext>();
+
+  /**
+   * Fan one frame out to every window.
+   *
+   * For state that is genuinely global rather than per-session — `~/.gg/auth.json`
+   * is shared by all windows, so connecting a provider in one must refresh the
+   * model picker in all of them. Mirrors the memory/jiwa/progress fan-outs.
+   */
+  const broadcastAll = (type: string, data: unknown): void => {
+    for (const ctx of sessions.values()) ctx.broadcast(type, data);
+  };
+
+  // Providers currently mid-OAuth in some window. Daemon-level so two windows
+  // cannot race two browser flows for the same provider into one auth file.
+  const oauthInFlightProviders = new Set<string>();
+
   const memoryStore = new MemoryStore({
     onChange: ({ memories }) => {
       for (const ctx of sessions.values()) {
@@ -1059,7 +1077,15 @@ async function main(): Promise<void> {
           const id = randomUUID();
           try {
             const ctx = await createSession(
-              { auth, paths, progress, memoryStore, jiwaStore },
+              {
+                auth,
+                paths,
+                progress,
+                memoryStore,
+                jiwaStore,
+                broadcastAll,
+                oauthInFlightProviders,
+              },
               { id, mode, chatAgent, cwd: sessionCwd, sessionPath },
             );
             sessions.set(id, ctx);
@@ -1399,6 +1425,13 @@ async function createSession(
     progress: ProgressManager;
     memoryStore: MemoryStore;
     jiwaStore: JiwaStore;
+    /** Fan one frame out to EVERY window, not just this session's. */
+    broadcastAll: (type: string, data: unknown) => void;
+    /**
+     * Providers with an OAuth flow in progress in SOME window. Daemon-wide
+     * because a login writes the shared auth file — see `/auth/oauth/start`.
+     */
+    oauthInFlightProviders: Set<string>;
   },
   opts: {
     id: string;
@@ -1408,7 +1441,7 @@ async function createSession(
     sessionPath?: string;
   },
 ): Promise<SessionContext> {
-  const { auth, progress, memoryStore, jiwaStore } = deps;
+  const { auth, progress, memoryStore, jiwaStore, broadcastAll, oauthInFlightProviders } = deps;
   const paths = deps.paths;
   const mode = opts.mode;
   let chatAgent = opts.chatAgent;
@@ -1570,6 +1603,19 @@ async function createSession(
       .catch(() => {});
   }
 
+  // ── MCP elicitation bridge ─────────────────────────────────
+  // An MCP server can ask for user input in the middle of a tool call. The
+  // bridge parks the promise; we broadcast the prompt over SSE and resolve it
+  // when the webview POSTs /mcp/elicit/:id.
+  const elicitations = createElicitationBridge({
+    broadcast: (prompt) => broadcast("mcp_elicit", prompt),
+    onTimeout: (prompt) =>
+      log("WARN", "app-sidecar", "MCP elicitation timed out", {
+        id: prompt.id,
+        server: prompt.server,
+      }),
+  });
+
   // The session file path to resume (passed by the daemon's POST /session);
   // empty/unset starts a fresh session.
   const resumeSessionPath = opts.sessionPath;
@@ -1584,6 +1630,7 @@ async function createSession(
     signal: abort.signal,
     // Keep MCP startup off the readiness path in both modes.
     backgroundMcpConnect: true,
+    onMcpElicit: elicitations.onElicit,
     // Keep restore-time auto-compaction off the readiness path too: its summary
     // LLM call (30s timeout) used to freeze waitForReady — and with it the whole
     // window (project picker, session list) — whenever a resumed session was
@@ -1996,10 +2043,29 @@ async function createSession(
   // flipping `running` — that stretch awaits, so Node yields inside it. See
   // RunClaim.
   const runClaim = new RunClaim();
-  const runLifecycle = new RunLifecycle((runState) => {
-    running = runState !== "idle";
-    if (runState === "cancelling") broadcast("run_cancelling", { runState });
-  });
+  const runLifecycle = new RunLifecycle(
+    (runState) => {
+      running = runState !== "idle";
+      if (runState === "cancelling") broadcast("run_cancelling", { runState });
+    },
+    // Durable run journal. Fire-and-forget on purpose: an unwritten journal
+    // entry is a missed crash hint, while a journal write that throws inside
+    // begin()/settle() would break run ownership itself.
+    {
+      started: (generation) =>
+        void session.persistRunStarted(generation).catch((err) => {
+          log("WARN", "app-sidecar", "failed to journal run start", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }),
+      finished: (generation, outcome) =>
+        void session.persistRunFinished(generation, outcome).catch((err) => {
+          log("WARN", "app-sidecar", "failed to journal run finish", {
+            error: err instanceof Error ? err.message : String(err),
+          });
+        }),
+    },
+  );
   const cancelledRunEndGenerations = new Set<number>();
   let pendingCancelDrain: { generation: number; text: string } | null = null;
   // Bumped by /cancel — a run whose cancel generation changed mid-flight was
@@ -2230,6 +2296,10 @@ async function createSession(
   function abortOwnedWork(): void {
     cancelGeneration++;
     abort.abort();
+    // An MCP tool call parked on user input is not cancelled by the signal —
+    // the promise lives in the bridge. Release it, or the aborted turn's tool
+    // call never returns.
+    elicitations.cancelAll();
     // Stop a run-all sweep and every async child through AgentSession's signal.
     taskRunAll = false;
     autopilotCancelled = true;
@@ -2243,9 +2313,13 @@ async function createSession(
     kenAutoSession?.setSignal(kenAutoAbort.signal);
   }
 
-  function finishOwnedGeneration(generation: number, emitCancelledFallback: boolean): boolean {
+  function finishOwnedGeneration(
+    generation: number,
+    emitCancelledFallback: boolean,
+    outcome: RunOutcome = "completed",
+  ): boolean {
     const cancelled = runLifecycle.isCancellationRequested(generation);
-    const settlement = runLifecycle.settle(generation);
+    const settlement = runLifecycle.settle(generation, outcome);
     if (!settlement.settled) return cancelled;
     // A replacement signal is safe only after the provider-backed owner settled.
     installFreshRunControllers();
@@ -2322,7 +2396,9 @@ async function createSession(
           });
         }
       }
-      if (ownsGeneration) finishOwnedGeneration(generation, false);
+      if (ownsGeneration) {
+        finishOwnedGeneration(generation, false, runSucceeded ? "completed" : "failed");
+      }
       // A cancelled injected run is still owned by the surrounding autopilot
       // cycle; its outer finalizer emits the one terminal cancelled run_end.
       if (!(cancelled && !ownsGeneration)) {
@@ -3227,6 +3303,22 @@ async function createSession(
                   ...(typeof d.guidance === "string" ? { guidance: d.guidance } : {}),
                 },
               });
+            } else if (marker.kind === "interrupted_run") {
+              // Rendered as an error row: the run's tools already changed the
+              // repo, so the user needs to see it and decide what to do. We
+              // never replay it — that would duplicate those changes.
+              history.push({
+                role: "assistant",
+                text: "",
+                error: {
+                  scope: "interrupted_run",
+                  headline: "A run was interrupted",
+                  message:
+                    "GG Coder stopped mid-run, so this turn is incomplete. Any files its tools already changed are still on disk.",
+                  guidance:
+                    "Review the working tree, then re-send the request if you still want it.",
+                },
+              });
             }
           }
         };
@@ -3314,7 +3406,16 @@ async function createSession(
             // Autopilot injected this turn — live showed only the Ken-tinted
             // marker for it, never a user bubble. Emitting one here would print
             // the injected instruction a second time, unstyled.
-            if (!restored.autopilotInjected && (text.trim() || restored.images.length > 0)) {
+            //
+            // Pushed background-status updates are skipped for the same reason:
+            // the live run rendered no bubble for them, so showing them here
+            // would fill a reopened session with machine-facing status lines
+            // the user never saw while working.
+            if (
+              !restored.autopilotInjected &&
+              !restored.notification &&
+              (text.trim() || restored.images.length > 0)
+            ) {
               history.push({
                 role: "user",
                 text: command ?? text,
@@ -4296,7 +4397,17 @@ async function createSession(
           ...(baseUrl ? { baseUrl } : {}),
         };
         await auth.setCredentials(storageKey, creds);
-        broadcast("auth_done", { provider });
+        // auth.json is shared by every window, so this is a global change:
+        // close their login modals and refresh their provider lists too.
+        broadcastAll("auth_done", { provider });
+        // `auth_done` means "a login succeeded" (modals close on it).
+        // `auth_change` means "auth.json changed" — which a DISCONNECT also is,
+        // so connection state has one signal that covers both directions.
+        broadcastAll("auth_change", { provider });
+        // A newly connected provider unlocks its models. `/models` filters on
+        // who is logged in, so every window's picker is now stale — without
+        // this the new models don't appear until the session is reopened.
+        broadcastAll("models_change", {});
         json(res, 200, { ok: true });
       });
       return;
@@ -4321,7 +4432,18 @@ async function createSession(
           json(res, 409, { error: "a login is already in progress" });
           return;
         }
+        // A login writes the shared ~/.gg/auth.json, so two windows racing the
+        // same provider means two browser tabs and two token exchanges whose
+        // writes clobber each other. The per-session flag above cannot see
+        // that — guard the provider daemon-wide as well.
+        if (oauthInFlightProviders.has(provider)) {
+          json(res, 409, {
+            error: `a ${meta.label} login is already in progress in another window`,
+          });
+          return;
+        }
         oauthInFlight = true;
+        oauthInFlightProviders.add(provider);
         json(res, 202, { accepted: true });
         void (async () => {
           const cb = authCallbacks();
@@ -4338,15 +4460,25 @@ async function createSession(
               throw new Error(`OAuth not implemented for ${provider}`);
             }
             await auth.setCredentials(storageKey, creds);
-            broadcast("auth_done", { provider });
+            // Terminal outcome of a GLOBAL change: every window's login modal
+            // should close and its provider list refresh, not just the one
+            // that started the flow.
+            broadcastAll("auth_done", { provider });
+            broadcastAll("auth_change", { provider });
+            // The OAuth provider's models just became selectable everywhere.
+            broadcastAll("models_change", {});
           } catch (err) {
             captureSidecarError(err, "app-sidecar.auth.oauth", { provider });
+            // Deliberately session-scoped: this is the outcome of ONE window's
+            // attempt. Another window that never pressed Connect has nothing to
+            // show an error about, and its modal correctly still offers login.
             broadcast("auth_error", {
               provider,
               message: err instanceof Error ? err.message : String(err),
             });
           } finally {
             oauthInFlight = false;
+            oauthInFlightProviders.delete(provider);
             pendingCode = null;
           }
         })();
@@ -4370,6 +4502,43 @@ async function createSession(
         }
         pendingCode(code.trim());
         pendingCode = null;
+        json(res, 200, { ok: true });
+      });
+      return;
+    }
+
+    if (method === "POST" && url.startsWith("/mcp/elicit/")) {
+      const id = decodeURIComponent(url.slice("/mcp/elicit/".length));
+      void readBody(req, res).then((raw) => {
+        if (raw === null) return;
+        let result: ElicitResult;
+        try {
+          const parsed = JSON.parse(raw) as {
+            action?: string;
+            content?: Record<string, unknown>;
+          };
+          if (
+            parsed.action !== "accept" &&
+            parsed.action !== "decline" &&
+            parsed.action !== "cancel"
+          ) {
+            json(res, 400, { error: "action must be accept, decline, or cancel" });
+            return;
+          }
+          result =
+            parsed.action === "accept"
+              ? ({ action: "accept", content: parsed.content ?? {} } as ElicitResult)
+              : { action: parsed.action };
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        // Unknown id means it already timed out or was cancelled by an abort —
+        // the tool call has moved on, so the answer has nowhere to go.
+        if (!elicitations.settle(id, result)) {
+          json(res, 409, { error: "no elicitation is awaiting a response" });
+          return;
+        }
         json(res, 200, { ok: true });
       });
       return;
@@ -4766,6 +4935,7 @@ async function createSession(
   }
 
   async function dispose(): Promise<void> {
+    elicitations.cancelAll();
     tasksPollStopped = true;
     if (tasksPoll) clearTimeout(tasksPoll);
     gitPollStopped = true;

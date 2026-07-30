@@ -22,6 +22,10 @@ export interface BusEventMap {
     stopReason: string;
     usage: { inputTokens: number; outputTokens: number; cacheRead?: number; cacheWrite?: number };
   };
+  /** Step boundary: every message for this turn is in the array. Hosts persist here. */
+  checkpoint: {
+    turn: number;
+  };
   agent_done: {
     totalTurns: number;
     totalUsage: {
@@ -153,6 +157,9 @@ export class EventBus {
           stopReason: event.stopReason,
           usage: event.usage,
         });
+        break;
+      case "checkpoint":
+        this.emit("checkpoint", { turn: event.turn });
         break;
       case "agent_done":
         this.emit("agent_done", {

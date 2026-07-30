@@ -1,7 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Cpu } from "lucide-react";
 import { theme } from "./theme";
-import { authStatus, type AuthProvider } from "./agent";
+import { authStatus, subscribe, type AuthProvider, type SidecarEvent } from "./agent";
 import { Badge } from "./Badge";
 import { BackButton } from "./BackButton";
 import { ProviderLoginModal } from "./ProviderLoginModal";
@@ -49,6 +49,18 @@ export function LoginScreen({ onClose }: Props): React.ReactElement {
       cancelled = true;
     };
   }, []);
+
+  // ~/.gg/auth.json is shared by every window, so connecting or disconnecting
+  // anywhere changes what THIS screen should show. `auth_change` covers both
+  // directions (unlike `auth_done`, which only means a login succeeded);
+  // without re-reading here the connection dots and the "N connected" badge
+  // stay stale until the screen is reopened.
+  useEffect(() => {
+    const unsub = subscribe((e: SidecarEvent) => {
+      if (e.type === "auth_change") void refresh();
+    });
+    return () => unsub();
+  }, [refresh]);
 
   const connectedCount = providers.filter((p) => p.connected).length;
 

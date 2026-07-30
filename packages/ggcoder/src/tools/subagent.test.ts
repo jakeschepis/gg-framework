@@ -8,7 +8,11 @@ vi.mock("node:child_process", () => ({ spawn: spawnMock }));
 
 import type { AgentDefinition } from "../core/agents.js";
 import { createSubAgentTool, isModelUnavailableError } from "./subagent.js";
-import { MAX_BLOCKING_SUBAGENT_DEPTH, SUB_AGENT_DEPTH_ENV } from "./subagent-shared.js";
+import {
+  MAX_BLOCKING_SUBAGENT_DEPTH,
+  SUB_AGENT_DEPTH_ENV,
+  SUB_AGENT_TIMEOUT_MS,
+} from "./subagent-shared.js";
 
 class MockChildProcess extends EventEmitter {
   readonly stdout = new PassThrough();
@@ -61,15 +65,32 @@ function mockExit(
   return child;
 }
 
-async function runOwl() {
-  const tool = createSubAgentTool(
+/**
+ * A child killed by a signal reports `code === null` and writes no stderr —
+ * exactly the shape the desktop hang produced once the parent gave up on it.
+ */
+function mockSignalDeath(stdout = ""): MockChildProcess {
+  const child = new MockChildProcess();
+  setImmediate(() => {
+    if (stdout) child.stdout.write(`${JSON.stringify({ type: "text_delta", text: stdout })}\n`);
+    child.stdout.end();
+    child.stderr.end();
+  });
+  return child;
+}
+
+function owlTool() {
+  return createSubAgentTool(
     process.cwd(),
     [owl],
     () => "openai",
     () => "gpt-5.6-sol",
     () => "parent-cache",
   );
-  return tool.execute(
+}
+
+async function runOwl() {
+  return owlTool().execute(
     { agent: "owl", task: "Inspect the registry." },
     { signal: new AbortController().signal, toolCallId: "test-call" },
   );
@@ -120,6 +141,71 @@ describe("createSubAgentTool fast-model fallback", () => {
       content: "Sub-agent failed (exit 1): usage limit reached",
     });
     expect(spawnedModels()).toEqual(["gpt-5.6-luna"]);
+  });
+
+  it("does not mistake partial progress text for a successful final answer", async () => {
+    // Real failure shape: the model narrates before its first tool call, then
+    // the provider rate-limits the next turn and the child exits non-zero. The
+    // old collector returned only "I'll start..." as a successful tool result,
+    // hiding both the failure and the fact that no review/work was completed.
+    spawnMock.mockImplementationOnce(() =>
+      mockExit(
+        "Rate limited by Anthropic. Wait a moment and try again.",
+        1,
+        "I'll read both files now.",
+      ),
+    );
+
+    await expect(runOwl()).resolves.toMatchObject({
+      content:
+        "Sub-agent failed (exit 1): Rate limited by Anthropic. Wait a moment and try again.\n\n" +
+        "Partial output before failure:\nI'll read both files now.",
+    });
+    expect(spawnedModels()).toEqual(["gpt-5.6-luna"]);
+  });
+
+  it("names the timeout instead of reporting a signal death as 'unknown error'", async () => {
+    // Regression: every desktop sub-agent hung until the parent killed it, and
+    // `close(null)` with empty stderr surfaced as "exit null: unknown error",
+    // hiding both the cause and the fact that the child had already answered.
+    const child = mockSignalDeath("CLEAR");
+    spawnMock.mockImplementationOnce(() => child);
+    const pending = runOwl();
+    await new Promise((resolve) => setImmediate(resolve));
+
+    child.emit("close", null, "SIGTERM");
+    const result = (await pending) as { content: string };
+
+    expect(result.content).not.toContain("unknown error");
+    expect(result.content).toContain("SIGTERM");
+    // Whatever the child did finish is still handed back for diagnosis.
+    expect(result.content).toContain("CLEAR");
+  });
+
+  it("names parent cancellation when the caller's signal aborts the child", async () => {
+    const child = mockSignalDeath();
+    spawnMock.mockImplementationOnce(() => child);
+    const controller = new AbortController();
+    const pending = owlTool().execute(
+      { agent: "owl", task: "Inspect the registry." },
+      { signal: controller.signal, toolCallId: "test-call" },
+    );
+    await new Promise((resolve) => setImmediate(resolve));
+
+    controller.abort();
+    expect(child.kill).toHaveBeenCalledWith("SIGTERM");
+    child.emit("close", null, "SIGTERM");
+
+    const result = (await pending) as { content: string };
+    expect(result.content).toContain("cancelled by the parent");
+    expect(result.content).not.toContain("unknown error");
+  });
+
+  it("claims a loop timeout ceiling above its own sub-agent budget", () => {
+    // The loop's default per-tool timeout is SHORTER than SUB_AGENT_TIMEOUT_MS,
+    // so without this override the loop cancelled first and the tool's specific
+    // "exceeded its time limit" message could never be produced.
+    expect(owlTool().timeoutMs).toBeGreaterThan(SUB_AGENT_TIMEOUT_MS);
   });
 
   it("keeps the blocking contract while rejecting recursive process storms", async () => {

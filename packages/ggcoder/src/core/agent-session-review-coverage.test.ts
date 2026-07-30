@@ -1,4 +1,7 @@
-import { describe, expect, it } from "vitest";
+import { afterAll, describe, expect, it } from "vitest";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import os from "node:os";
+import path from "node:path";
 import type { Message } from "@kenkaiiii/gg-ai";
 import { AgentSession } from "./agent-session.js";
 import type { IdealReviewStats, ReviewCoverageTracker } from "./ideal-review.js";
@@ -12,27 +15,51 @@ interface ReviewInternals {
   getHookFollowUpMessages(): Message[] | null;
 }
 
+// Coverage is filesystem-backed: a changed file must still exist to be gated,
+// so these fixtures live in a real temp workspace.
+const workspaces: string[] = [];
+function makeWorkspace(files: readonly string[]): string {
+  const root = mkdtempSync(path.join(os.tmpdir(), "gg-review-coverage-"));
+  workspaces.push(root);
+  for (const file of files) {
+    const target = path.join(root, file);
+    mkdirSync(path.dirname(target), { recursive: true });
+    writeFileSync(target, "export const value = 1;\n");
+  }
+  return root;
+}
+
+afterAll(() => {
+  for (const root of workspaces) rmSync(root, { recursive: true, force: true });
+});
+
+function makeReviewSession(cwd: string, changedFiles: readonly string[]): ReviewInternals {
+  const session = new AgentSession({
+    provider: "anthropic",
+    model: "claude-sonnet-5",
+    cwd,
+    transient: true,
+    systemPrompt: "test",
+  });
+  const internal = session as unknown as ReviewInternals;
+  internal.settingsManager = { get: () => true };
+  internal.hookStats = {
+    changedLines: 130,
+    toolCalls: 9,
+    toolFailures: 0,
+    turns: 3,
+    writeCalls: 1,
+    editCalls: 3,
+    bashCalls: 1,
+  };
+  for (const file of changedFiles) internal.hookFileEditCounts.set(file, 1);
+  return internal;
+}
+
 describe("AgentSession Ideal review coverage gate", () => {
   it("repeats fail-closed follow-ups until every post-injection changed file is read", () => {
-    const session = new AgentSession({
-      provider: "anthropic",
-      model: "claude-sonnet-5",
-      cwd: "/project",
-      transient: true,
-      systemPrompt: "test",
-    });
-    const internal = session as unknown as ReviewInternals;
-    internal.settingsManager = { get: () => true };
-    internal.hookStats = {
-      changedLines: 130,
-      toolCalls: 9,
-      toolFailures: 0,
-      turns: 3,
-      writeCalls: 1,
-      editCalls: 3,
-      bashCalls: 1,
-    };
-    internal.hookFileEditCounts.set("src/a.ts", 1);
+    const cwd = makeWorkspace(["src/a.ts", "src/b.ts"]);
+    const internal = makeReviewSession(cwd, ["src/a.ts"]);
 
     // A pre-review read and a model-authored claim cannot satisfy the gate.
     internal.reviewCoverage.recordRead("src/a.ts");
@@ -48,16 +75,50 @@ describe("AgentSession Ideal review coverage gate", () => {
     const missingB = internal.getHookFollowUpMessages();
     expect(missingB?.[0]?.content).toContain("- src/b.ts");
 
-    internal.reviewCoverage.recordRead("/project/src/b.ts");
+    internal.reviewCoverage.recordRead(path.join(cwd, "src/b.ts"));
+    expect(internal.getHookFollowUpMessages()).toBeNull();
+    expect(internal.getHookFollowUpMessages()).toBeNull();
+  });
+
+  it("stops gating a changed file the run deleted before review", () => {
+    // The observed loop: a scratch script was created, deleted, and then gated
+    // forever because a deleted file can never produce read evidence.
+    const cwd = makeWorkspace(["src/a.ts"]);
+    const internal = makeReviewSession(cwd, ["src/a.ts", "scripts/probe-many.mjs"]);
+
+    const first = internal.getHookFollowUpMessages();
+    expect(first?.[0]?.content).toContain("- src/a.ts");
+    expect(first?.[0]?.content).not.toContain("probe-many.mjs");
+
+    internal.reviewCoverage.recordRead("src/a.ts");
+    expect(internal.getHookFollowUpMessages()).toBeNull();
+  });
+
+  it("escalates to report-what-you-could-not-verify after two coverage follow-ups", () => {
+    const cwd = makeWorkspace(["src/a.ts"]);
+    const internal = makeReviewSession(cwd, ["src/a.ts"]);
+
+    // The agent never reads the file: without a budget this repeats forever.
+    expect(internal.getHookFollowUpMessages()?.[0]?.content).toContain("Ideal?");
+    expect(internal.getHookFollowUpMessages()?.[0]?.content).toContain("coverage is incomplete");
+    expect(internal.getHookFollowUpMessages()?.[0]?.content).toContain("coverage is incomplete");
+
+    const escalation = internal.getHookFollowUpMessages()?.[0]?.content;
+    expect(escalation).toContain("could not verify");
+    expect(escalation).toContain("do not repeat your previous answer");
+    expect(escalation).toContain("- src/a.ts");
+
+    // Terminal: the gate is closed even though the file was never read.
     expect(internal.getHookFollowUpMessages()).toBeNull();
     expect(internal.getHookFollowUpMessages()).toBeNull();
   });
 
   it("suppresses only Ideal review while Ken owns autopilot verification", () => {
+    const cwd = makeWorkspace(["src/a.ts"]);
     const session = new AgentSession({
       provider: "anthropic",
       model: "claude-sonnet-5",
-      cwd: "/project",
+      cwd,
       transient: true,
       systemPrompt: "test",
     });

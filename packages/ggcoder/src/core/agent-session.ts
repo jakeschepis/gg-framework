@@ -40,6 +40,8 @@ import {
   type KenTurnPayload,
   type AutopilotMarkerPayload,
   type AppMarkerPayload,
+  type RunJournalEntry,
+  type RunOutcome,
   type TurnMetricPayload,
 } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
@@ -68,6 +70,7 @@ import { buildSubAgentCompletionFollowUp, type SubAgentManager } from "./subagen
 import { applyAsyncSubagentPolicy } from "./subagent-policy.js";
 import { z } from "zod";
 import { MCPClientManager, getAllMcpServers } from "./mcp/index.js";
+import type { MCPElicitHandler } from "./mcp/index.js";
 import type { MCPServerConfig } from "./mcp/types.js";
 import { DeferredToolCatalog } from "./mcp/deferred-catalog.js";
 import { McpCatalogCache, type CachedTool } from "./mcp/catalog-cache.js";
@@ -88,7 +91,9 @@ import {
   type IdealReviewStats,
   evaluateIdealReview,
   buildIdealReviewMessage,
+  buildReviewCoverageEscalationMessage,
   buildReviewCoverageMessage,
+  MAX_REVIEW_COVERAGE_INJECTIONS,
   withReviewCoverageRequirements,
   detectTestDrift,
   ReviewCoverageTracker,
@@ -180,6 +185,13 @@ export interface AgentSessionOptions {
    * connect-before-ready behavior so MCP tools are present on the first turn.
    */
   backgroundMcpConnect?: boolean;
+  /**
+   * Handler for a server-initiated MCP `elicitation/create` — a request for user
+   * input in the middle of a tool call. Hosts that can render a form (the
+   * gg-app sidecar) supply this; without it the session declares no elicitation
+   * capability and servers fall back to their no-input behavior.
+   */
+  onMcpElicit?: MCPElicitHandler;
   /**
    * If true, an over-context restored session is NOT compacted inline during
    * `loadExistingSession()` — the existing pre-run auto-compaction in
@@ -367,6 +379,8 @@ export class AgentSession {
   /** Runtime-only suppression while Ken owns verification in autopilot mode. */
   private idealReviewSuppressed = false;
   private readonly reviewCoverage: ReviewCoverageTracker;
+  /** Coverage follow-ups spent this run, capped by MAX_REVIEW_COVERAGE_INJECTIONS. */
+  private reviewCoverageInjected = 0;
   /** 0 = none; 1 = first nudge sent; 2 = final stop-and-report injected. */
   private loopBreakInjected: 0 | 1 | 2 = 0;
   private regroundingInjected = false;
@@ -444,6 +458,15 @@ export class AgentSession {
   private readonly transportSessionId = crypto.randomUUID();
   private sessionPath = "";
   private lastPersistedIndex = 0;
+  /**
+   * The array `agentLoop` is currently mutating, while a run is in flight.
+   *
+   * Normally identical to `this.messages`, but a mid-loop compaction rebinds
+   * `this.messages` to the compacted result while the loop keeps appending to
+   * its own array. Step-boundary flushes must follow the loop's array or they
+   * would silently persist nothing for the rest of the run.
+   */
+  private activeLoopMessages: Message[] | null = null;
 
   /**
    * Number of non-system messages guaranteed to be in the session file — the
@@ -608,6 +631,7 @@ export class AgentSession {
     this.mcpManager = new MCPClientManager({
       catalogCache: this.mcpCatalogCache,
       modernProtocol: this.settingsManager.get("mcpModernProtocol"),
+      onElicit: this.opts.onMcpElicit,
     });
     if (this.opts.backgroundMcpConnect) {
       void this.connectMcpServers();
@@ -1145,6 +1169,7 @@ export class AgentSession {
     this.hookFileEditCounts.clear();
     this.hookToolCalls.clear();
     this.reviewCoverage.reset();
+    this.reviewCoverageInjected = 0;
     this.idealReviewPhase = "idle";
     this.loopBreakInjected = 0;
     this.regroundingInjected = false;
@@ -1207,7 +1232,42 @@ export class AgentSession {
           }
         }
         await this.persistTurnMetric(event);
+        // The assistant message for this turn is now in the array.
+        await this.flushPendingMessages();
         break;
+      case "checkpoint":
+        // Tool results for this step are in the array and their side effects
+        // already hit the filesystem. Flushing here is what makes a crash lose
+        // at most the in-flight step instead of the entire turn.
+        await this.flushPendingMessages();
+        break;
+    }
+  }
+
+  /**
+   * Append every message added since the last flush to the session file.
+   *
+   * Safe to call mid-run: `agentLoop` mutates its message array in place, so
+   * the slice from `lastPersistedIndex` is always exactly the new tail.
+   * Transient sessions (subagent spawns) have no session file and
+   * `persistMessage` no-ops for them.
+   *
+   * Persistence failures must never take down a live run — the post-loop flush
+   * retries the same range.
+   */
+  private async flushPendingMessages(): Promise<void> {
+    const messages = this.activeLoopMessages ?? this.messages;
+    if (this.lastPersistedIndex >= messages.length) return;
+    const target = messages.length;
+    try {
+      for (let i = this.lastPersistedIndex; i < target; i++) {
+        await this.persistMessage(messages[i]);
+        this.lastPersistedIndex = i + 1;
+      }
+    } catch (err) {
+      log("WARN", "session", "Failed to flush messages at a step boundary", {
+        error: err instanceof Error ? err.message : String(err),
+      });
     }
   }
 
@@ -1389,9 +1449,20 @@ export class AgentSession {
         lspMissing: lspEvidence.missing,
       });
       if (coverage.missing.length > 0) {
-        return [
-          this.withReviewLspEvidence(buildReviewCoverageMessage(coverage.missing), lspEvidence),
-        ];
+        if (this.reviewCoverageInjected < MAX_REVIEW_COVERAGE_INJECTIONS) {
+          this.reviewCoverageInjected += 1;
+          return [
+            this.withReviewLspEvidence(buildReviewCoverageMessage(coverage.missing), lspEvidence),
+          ];
+        }
+        // Budget spent: close the gate so the run cannot spin on a file that
+        // never becomes readable, and require the gap be reported to the user.
+        this.idealReviewPhase = "complete";
+        log("INFO", "ideal", "Ideal review coverage escalated after retry budget", {
+          injected: String(this.reviewCoverageInjected),
+          missing: coverage.missing,
+        });
+        return [buildReviewCoverageEscalationMessage(coverage.missing)];
       }
       this.idealReviewPhase = "complete";
       return null;
@@ -1686,9 +1757,14 @@ export class AgentSession {
         },
       });
 
-      for await (const event of generator as AsyncIterable<AgentEvent>) {
-        await this.trackHookEvent(event);
-        this.eventBus.forwardAgentEvent(event);
+      this.activeLoopMessages = loopMessages;
+      try {
+        for await (const event of generator as AsyncIterable<AgentEvent>) {
+          await this.trackHookEvent(event);
+          this.eventBus.forwardAgentEvent(event);
+        }
+      } finally {
+        this.activeLoopMessages = null;
       }
     };
 
@@ -1778,7 +1854,9 @@ export class AgentSession {
 
     this.messages = loopMessages;
 
-    // Persist new messages
+    // Backstop. Step-boundary flushes (checkpoint / turn_end) normally leave
+    // nothing here, but this still catches messages appended after the last
+    // checkpoint — an aborted final step, or a flush that failed mid-run.
     for (let i = this.lastPersistedIndex; i < this.messages.length; i++) {
       await this.persistMessage(this.messages[i]);
     }
@@ -2610,6 +2688,33 @@ export class AgentSession {
     await this.sessionManager.appendEntry(this.sessionPath, entry);
   }
 
+  /**
+   * Open the run journal for one `RunLifecycle` generation.
+   *
+   * Never throws and never blocks the run: a session with no file (transient
+   * children) writes nothing, and a write failure just means the run isn't
+   * journalled — which is strictly better than failing the run over it.
+   */
+  async persistRunStarted(generation: number): Promise<void> {
+    if (!this.sessionPath) return;
+    await this.sessionManager.appendRunStarted(this.sessionPath, {
+      version: 1,
+      generation,
+      startedAt: new Date().toISOString(),
+      afterMessageCount: this.persistedTranscriptCount(),
+    });
+  }
+
+  /** Close the run journal. Its absence is what marks a run as crashed. */
+  async persistRunFinished(generation: number, outcome: RunOutcome): Promise<void> {
+    if (!this.sessionPath) return;
+    await this.sessionManager.appendRunFinished(this.sessionPath, {
+      version: 1,
+      generation,
+      outcome,
+    });
+  }
+
   /** Re-append the in-memory app markers to the current session file. Mirrors
    *  `rePersistKenTurns` — called after a continuation/compaction file is
    *  created so display-only rows survive the rewrite. */
@@ -2775,6 +2880,10 @@ export class AgentSession {
     // Restore app transcript markers (plan banner / task header / errors / hints).
     this.appMarkers = this.sessionManager.getAppMarkers(loaded.entries, loaded.header.leafId);
     this.turnMetrics = this.sessionManager.getTurnMetrics(loaded.entries);
+    // A run that opened the journal and never closed it died mid-flight. Read
+    // it here, before anything rewrites the file, and report it once the
+    // transcript is in place.
+    const interruptedRuns = this.sessionManager.getUnfinishedRuns(loaded.entries);
 
     // Track the current leaf for subsequent entries
     this.currentLeafId = loaded.header.leafId;
@@ -2865,6 +2974,7 @@ export class AgentSession {
         originalCount: compacted.result.originalCount,
         newCount: compacted.result.newCount,
       });
+      await this.recordInterruptedRuns(interruptedRuns);
       return;
     }
 
@@ -2876,6 +2986,31 @@ export class AgentSession {
     this.sessionId = loaded.header.id;
     this.setSessionPath(loaded.path);
     this.lastPersistedIndex = this.messages.length;
+    await this.recordInterruptedRuns(interruptedRuns);
+  }
+
+  /**
+   * Surface runs that died mid-flight, without resuming them.
+   *
+   * Deliberately NOT auto-resumed: the dead run's tools already wrote files,
+   * ran commands and made commits. Replaying it would duplicate those effects.
+   * The user gets a transcript row and decides.
+   *
+   * Each detected run is also closed as `aborted`, so reopening the session
+   * reports it once rather than on every load.
+   */
+  private async recordInterruptedRuns(runs: RunJournalEntry[]): Promise<void> {
+    for (const run of runs) {
+      log("WARN", "session", "Restored a session with an unfinished run", {
+        generation: String(run.generation),
+        startedAt: run.startedAt,
+      });
+      await this.persistAppMarker("interrupted_run", {
+        generation: run.generation,
+        startedAt: run.startedAt,
+      });
+      await this.persistRunFinished(run.generation, "aborted");
+    }
   }
 
   private async prepareDynamicContext(_latestUserPrompt?: string): Promise<Message[]> {

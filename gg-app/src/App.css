@@ -1310,6 +1310,19 @@ body {
   font-size: 14px;
   cursor: pointer;
 }
+/* Multi-select elicitation fields stack their checkboxes rather than sitting on
+   one row — an MCP server can ask for a dozen options with long labels. */
+.mcp-elicit-choices {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 10px;
+}
+/* A boolean field has no heading above it (the checkbox is its own label), so
+   it needs the vertical rhythm .modal-label would have provided. */
+.mcp-elicit-boolean {
+  margin-top: 22px;
+}
 .modal-radio input {
   cursor: pointer;
   accent-color: var(--primary);

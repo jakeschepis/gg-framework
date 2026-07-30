@@ -1089,11 +1089,16 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           subagentGroupByAgentRef.current.clear();
           break;
         case "models_change":
-          // Local-model discovery finished (boot scan, manual scan, or an
-          // endpoint added/removed). Without this the models found on the
-          // user's machine wouldn't reach the picker until the next restart.
+          // The set of usable models changed: local-model discovery landed
+          // (boot scan, manual scan, endpoint added/removed) or a provider was
+          // connected/disconnected. Without this, neither the models found on
+          // the user's machine nor the ones a fresh login unlocks reach the
+          // picker until the session is reopened.
+          //
+          // `null` means the refetch failed — keep what we have. `[]` is a real
+          // answer (the last provider was disconnected) and must clear the picker.
           void listModels().then((available) => {
-            if (available.length > 0) setModels(available);
+            if (available) setModels(available);
           });
           break;
         case "extras":

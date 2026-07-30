@@ -11,6 +11,7 @@ import {
   SSEClientTransport,
   UnauthorizedError,
 } from "@modelcontextprotocol/client";
+import type { ElicitRequest, ElicitResult } from "@modelcontextprotocol/client";
 import type { AgentTool } from "@kenkaiiii/gg-agent";
 import { z } from "zod";
 import http from "node:http";
@@ -32,6 +33,9 @@ interface ConnectedServer {
   client: Client;
   transport: StreamableHTTPClientTransport | SSEClientTransport | StdioClientTransport;
   lastCallTime: number;
+  /** The config this connection was built from, kept so an expired HTTP session
+   *  can be rebuilt without going back to the caller for it. */
+  config: MCPServerConfig;
 }
 
 /** Per-server connection outcome for the dashboard / non-interactive list. */
@@ -56,6 +60,22 @@ export interface MCPLoginResult {
 /** Terminal state of one server's connection attempt, awaited by `whenConnected`. */
 type ConnectionOutcome = { ok: true } | { ok: false; error: string };
 
+/**
+ * A server-initiated request for user input, mid tool call. The host resolves
+ * it by showing the user a form built from `requestedSchema` and returning
+ * their answer — or `decline` / `cancel`.
+ */
+export interface MCPElicitation {
+  /** Which configured server is asking. */
+  server: string;
+  /** Human-readable prompt from the server. */
+  message: string;
+  /** JSON Schema object describing the fields to collect. */
+  requestedSchema: Record<string, unknown>;
+}
+
+export type MCPElicitHandler = (request: MCPElicitation) => Promise<ElicitResult>;
+
 export class MCPClientManager {
   private servers: ConnectedServer[] = [];
   /**
@@ -67,6 +87,14 @@ export class MCPClientManager {
     { promise: Promise<ConnectionOutcome>; settle: (outcome: ConnectionOutcome) => void }
   >();
 
+  /**
+   * In-flight session rebuilds, keyed by server name. N tool calls to the same
+   * server all 404 at once when its session expires; without coalescing each
+   * would spawn its own reconnect and they would race to replace each other in
+   * `this.servers`. Sharing one promise means exactly one reconnect per outage.
+   */
+  private reconnecting = new Map<string, Promise<void>>();
+
   private readonly catalogCache: McpCatalogCache;
   /**
    * Opt into the 2026-07-28 revision. Off by default: `mode: "auto"` probes with
@@ -75,9 +103,55 @@ export class MCPClientManager {
    */
   private readonly modernProtocol: boolean;
 
-  constructor(opts: { catalogCache?: McpCatalogCache; modernProtocol?: boolean } = {}) {
+  /**
+   * Host callback for server-initiated `elicitation/create`. Absent means we
+   * declare no elicitation capability at all — which is protocol-legal and is
+   * how the CLI runs, since it has nowhere to render the form.
+   */
+  private readonly onElicit?: MCPElicitHandler;
+
+  constructor(
+    opts: {
+      catalogCache?: McpCatalogCache;
+      modernProtocol?: boolean;
+      onElicit?: MCPElicitHandler;
+    } = {},
+  ) {
     this.catalogCache = opts.catalogCache ?? new McpCatalogCache();
     this.modernProtocol = opts.modernProtocol ?? false;
+    this.onElicit = opts.onElicit;
+  }
+
+  /**
+   * Build a `Client` for one server, declaring elicitation support and wiring
+   * the handler when the host can actually prompt the user.
+   *
+   * Form mode only. URL mode would have us open a browser tab in the middle of
+   * a tool call with no user gesture behind it — the SDK rejects URL-mode
+   * requests for us when the `url` capability is undeclared.
+   */
+  private createClient(serverName: string, negotiate: NegotiationOptions): Client {
+    const handler = this.onElicit;
+    if (!handler) return new Client({ name: "ggcoder", version: "1.0.0" }, negotiate);
+
+    const client = new Client(
+      { name: "ggcoder", version: "1.0.0" },
+      { ...negotiate, capabilities: { elicitation: { form: {} } } },
+    );
+    client.setRequestHandler("elicitation/create", async (request: ElicitRequest) => {
+      const params = request.params;
+      if (params.mode === "url") {
+        // Unreachable while `url` stays undeclared, but a server that ignores
+        // capabilities must get a clean decline rather than a thrown handler.
+        return { action: "decline" } satisfies ElicitResult;
+      }
+      return handler({
+        server: serverName,
+        message: params.message,
+        requestedSchema: params.requestedSchema as Record<string, unknown>,
+      });
+    });
+    return client;
   }
 
   /**
@@ -407,7 +481,7 @@ export class MCPClientManager {
       transport.stderr?.on("data", (chunk: Buffer | string) => {
         stderrChunks.push(typeof chunk === "string" ? chunk : chunk.toString("utf8"));
       });
-      client = new Client({ name: "ggcoder", version: "1.0.0" }, negotiate);
+      client = this.createClient(config.name, negotiate);
       try {
         await client.connect(transport, connectOptions);
       } catch (err) {
@@ -445,7 +519,7 @@ export class MCPClientManager {
       }
     }
 
-    this.servers.push({ name: config.name, client, transport, lastCallTime: 0 });
+    this.servers.push({ name: config.name, client, transport, lastCallTime: 0, config });
 
     const { tools } = await client.listTools(undefined, { timeout });
 
@@ -475,7 +549,7 @@ export class MCPClientManager {
         description: tool.description ?? "",
         parameters: z.record(z.string(), z.unknown()),
         rawInputSchema: tool.inputSchema as Record<string, unknown>,
-        execute: async (args) => {
+        execute: async (args, context) => {
           const server = this.servers.find((s) => s.name === config.name);
           if (server) {
             const elapsed = Date.now() - server.lastCallTime;
@@ -486,8 +560,18 @@ export class MCPClientManager {
             server.lastCallTime = Date.now();
           }
 
-          try {
-            const result = await client.callTool(
+          // Resolve the client from `this.servers` on every attempt rather than
+          // closing over the one from connect time: a session rebuild swaps the
+          // entry, and a stale capture would keep calling the dead client.
+          const liveClient = (): Client =>
+            this.servers.find((s) => s.name === config.name)?.client ?? client;
+
+          // The client the attempt actually ran against, so a failure can be
+          // attributed to "my client was replaced" vs "the server hung up".
+          let attemptClient = liveClient();
+          const callOnce = async (): Promise<string> => {
+            attemptClient = liveClient();
+            const result = await attemptClient.callTool(
               { name: tool.name, arguments: args as Record<string, unknown> },
               { timeout: config.timeout ?? 60_000 },
             );
@@ -506,7 +590,21 @@ export class MCPClientManager {
               }
             }
             return texts.join("\n") || "(empty response)";
+          };
+
+          try {
+            return await callOnce();
           } catch (err) {
+            // An expired HTTP session is recoverable exactly once: rebuild the
+            // connection and replay the call. A second failure is a real error.
+            if (this.canRecoverSession(config, err, attemptClient, context?.signal)) {
+              try {
+                await this.reconnectServer(config);
+                if (!context?.signal?.aborted) return await callOnce();
+              } catch (retryErr) {
+                return `MCP tool error: ${formatConnectError(retryErr)}`;
+              }
+            }
             const msg = err instanceof Error ? err.message : String(err);
             if (msg.includes("Too Many R") || msg.includes("429")) {
               return "Rate limited — too many requests. Wait a moment before searching again.";
@@ -516,6 +614,70 @@ export class MCPClientManager {
         },
       };
     });
+  }
+
+  /**
+   * Is this failure a recoverable expired HTTP session?
+   *
+   * Stdio servers are excluded: they have no HTTP session to expire, so a 404
+   * from one means something else entirely and respawning the child process
+   * mid-call would be a surprise. An already-aborted call is excluded too —
+   * reconnecting to replay work the user cancelled resurrects it.
+   */
+  private canRecoverSession(
+    config: MCPServerConfig,
+    err: unknown,
+    attemptClient: Client,
+    signal: AbortSignal | undefined,
+  ): boolean {
+    if (config.command) return false;
+    if (signal?.aborted) return false;
+    if (isSessionExpired(err)) return true;
+    // A sibling call that hit the same expired session may already have torn
+    // the transport down underneath us, which surfaces as a generic "connection
+    // closed" rather than the 404. Recover only when the client we called has
+    // genuinely been retired — otherwise this is a real disconnect and a retry
+    // would just fail again.
+    const current = this.servers.find((s) => s.name === config.name)?.client;
+    return current !== attemptClient && this.isConnectionClosed(err);
+  }
+
+  /** A local "the transport went away mid-request" failure, as the SDK reports it. */
+  private isConnectionClosed(reason: unknown): boolean {
+    return SdkError.isInstance(reason) && reason.code === SdkErrorCode.ConnectionClosed;
+  }
+
+  /**
+   * Rebuild one server's connection from its stored config, replacing the dead
+   * entry in `this.servers`. Concurrent callers share a single rebuild.
+   *
+   * Rejects if the reconnect itself fails, so the caller reports a real error
+   * rather than retrying against a client that was never replaced.
+   */
+  private async reconnectServer(config: MCPServerConfig): Promise<void> {
+    const inFlight = this.reconnecting.get(config.name);
+    if (inFlight) return inFlight;
+
+    const attempt = (async () => {
+      log("INFO", "mcp", `MCP session expired for "${config.name}", reconnecting`);
+      const dead = this.servers.find((s) => s.name === config.name);
+      if (dead) {
+        this.servers = this.servers.filter((s) => s !== dead);
+        try {
+          await dead.client.close();
+        } catch {
+          // The session is already gone server-side; a failed close is expected.
+        }
+      }
+      await this.connectServer(config);
+    })();
+
+    this.reconnecting.set(config.name, attempt);
+    try {
+      await attempt;
+    } finally {
+      this.reconnecting.delete(config.name);
+    }
   }
 
   /**
@@ -549,7 +711,7 @@ export class MCPClientManager {
 
     if (config.transport === "sse") {
       const transport = sseTransport();
-      const client = new Client({ name: "ggcoder", version: "1.0.0" }, negotiate);
+      const client = this.createClient(config.name, negotiate);
       await client.connect(transport, connectOptions);
       return { client, transport };
     }
@@ -559,7 +721,7 @@ export class MCPClientManager {
         requestInit: reqInit,
         authProvider,
       });
-      const client = new Client({ name: "ggcoder", version: "1.0.0" }, negotiate);
+      const client = this.createClient(config.name, negotiate);
       await client.connect(transport, connectOptions);
       return { client, transport };
     } catch (streamableErr) {
@@ -572,7 +734,7 @@ export class MCPClientManager {
         error: String(streamableErr),
       });
       const transport = sseTransport();
-      const client = new Client({ name: "ggcoder", version: "1.0.0" }, negotiate);
+      const client = this.createClient(config.name, negotiate);
       await client.connect(transport, connectOptions);
       return { client, transport };
     }
@@ -598,6 +760,7 @@ export class MCPClientManager {
 
   async dispose(): Promise<void> {
     this.connections.clear();
+    this.reconnecting.clear();
     for (const server of this.servers) {
       try {
         await server.client.close();
@@ -665,6 +828,19 @@ const REAUTH_OAUTH_CODES: readonly (OAuthErrorCode | string)[] = [
   OAuthErrorCode.InvalidClient,
   OAuthErrorCode.AccessDenied,
 ];
+
+/**
+ * Whether an error means the remote server has dropped our HTTP session.
+ *
+ * `StreamableHTTPClientTransport.send` handles 401/403 (it re-runs auth) but
+ * returns a bare `SdkHttpError{status:404}` when the `Mcp-Session-Id` we are
+ * carrying is no longer known to the server — which is exactly what happens
+ * after a server restart or an idle-session sweep on a long desktop session.
+ * The SDK has no recovery for it, so we rebuild the connection ourselves.
+ */
+function isSessionExpired(reason: unknown): boolean {
+  return SdkHttpError.isInstance(reason) && reason.status === 404;
+}
 
 /**
  * Whether a connect error means the server needs OAuth login. The SDK throws

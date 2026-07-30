@@ -215,10 +215,53 @@ export interface AppMarkerPayload extends RecordedPosition {
     /** Transcript imported from another agent; `data` carries
      *  { source, sourcePath, messageCount, dropped }. Import is lossy, so this
      *  marker is the record of what the imported thread is missing. */
-    | "import";
+    | "import"
+    /** A run that opened the journal and never closed it — the process died
+     *  mid-run. `data` carries { generation, startedAt }. Surfaced so the user
+     *  can review what the run's tools already changed; never auto-resumed. */
+    | "interrupted_run";
   afterMessageCount: number;
   /** Kind-specific display fields (reason/title/headline/kenSent/counts/…). */
   data: Record<string, unknown>;
+}
+
+/**
+ * Run journal — a matched pair of custom entries bracketing every provider run.
+ *
+ * Same not-on-the-DAG treatment as Ken turns (`parentId: null`): the model never
+ * sees them, and they can't race the message branch's leaf pointer. A
+ * `run_started` with no matching `run_finished` is the on-disk signature of a
+ * run that died mid-flight — the host surfaces it on load instead of silently
+ * resuming work whose tools already half-mutated the repo.
+ *
+ * `generation` is the `RunLifecycle` generation, so the pairing inherits that
+ * class's generation-safety: a stale run cannot close a newer one's journal.
+ */
+export const RUN_STARTED_CUSTOM_KIND = "run_started";
+export const RUN_FINISHED_CUSTOM_KIND = "run_finished";
+
+export type RunOutcome = "completed" | "failed" | "aborted";
+
+export interface RunStartedPayload {
+  version: 1;
+  generation: number;
+  startedAt: string;
+  /** Non-system message count when the run began, for locating it in the transcript. */
+  afterMessageCount: number;
+}
+
+export interface RunFinishedPayload {
+  version: 1;
+  generation: number;
+  outcome: RunOutcome;
+}
+
+/** One run as reconstructed from the journal. `outcome` is undefined if unfinished. */
+export interface RunJournalEntry {
+  generation: number;
+  startedAt: string;
+  afterMessageCount: number;
+  outcome?: RunOutcome;
 }
 
 export type SessionEntry =
@@ -727,6 +770,83 @@ export class SessionManager {
     await this.appendEntry(sessionPath, entry);
   }
 
+  /** Open the run journal for one `RunLifecycle` generation. */
+  async appendRunStarted(sessionPath: string, payload: RunStartedPayload): Promise<void> {
+    await this.appendEntry(sessionPath, {
+      type: "custom",
+      kind: RUN_STARTED_CUSTOM_KIND,
+      id: crypto.randomUUID(),
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      data: payload,
+    });
+  }
+
+  /** Close the run journal for one generation. Its absence marks a crashed run. */
+  async appendRunFinished(sessionPath: string, payload: RunFinishedPayload): Promise<void> {
+    await this.appendEntry(sessionPath, {
+      type: "custom",
+      kind: RUN_FINISHED_CUSTOM_KIND,
+      id: crypto.randomUUID(),
+      parentId: null,
+      timestamp: new Date().toISOString(),
+      data: payload,
+    });
+  }
+
+  /**
+   * Reconstruct the run journal in file order, pairing each `run_started` with
+   * the `run_finished` carrying the same generation.
+   *
+   * Generations are NOT unique across a session file. `RunLifecycle` counts
+   * from zero per instance, and a resumed session builds a fresh one — so the
+   * first run after every app restart is generation 1 again. Pairing therefore
+   * tracks only the runs still OPEN: a `run_finished` closes its generation and
+   * releases the number, and a later `run_started` reusing it opens a new run.
+   *
+   * Without that release, a crash in a resumed session was invisible: the
+   * reused `run_started` looked like a duplicate and was dropped, which is
+   * exactly the case this journal exists to catch.
+   *
+   * A repeat `run_started` for a generation that is still open IS ignored, so a
+   * truncated or replayed log reports one unfinished run — never a phantom pile.
+   */
+  getRunJournal(entries: SessionEntry[]): RunJournalEntry[] {
+    const runs: RunJournalEntry[] = [];
+    const openByGeneration = new Map<number, RunJournalEntry>();
+    for (const entry of entries) {
+      if (entry.type !== "custom") continue;
+      if (entry.kind === RUN_STARTED_CUSTOM_KIND) {
+        const p = entry.data as Partial<RunStartedPayload> | undefined;
+        if (p?.version !== 1 || typeof p.generation !== "number") continue;
+        if (openByGeneration.has(p.generation)) continue;
+        const run: RunJournalEntry = {
+          generation: p.generation,
+          startedAt: typeof p.startedAt === "string" ? p.startedAt : entry.timestamp,
+          afterMessageCount: typeof p.afterMessageCount === "number" ? p.afterMessageCount : 0,
+        };
+        openByGeneration.set(p.generation, run);
+        runs.push(run);
+        continue;
+      }
+      if (entry.kind === RUN_FINISHED_CUSTOM_KIND) {
+        const p = entry.data as Partial<RunFinishedPayload> | undefined;
+        if (p?.version !== 1 || typeof p.generation !== "number") continue;
+        const run = openByGeneration.get(p.generation);
+        if (!run || !p.outcome) continue;
+        run.outcome = p.outcome;
+        // Closed — the number is free for the next app run to reuse.
+        openByGeneration.delete(p.generation);
+      }
+    }
+    return runs;
+  }
+
+  /** Runs that opened the journal but never closed it — i.e. crashed mid-flight. */
+  getUnfinishedRuns(entries: SessionEntry[]): RunJournalEntry[] {
+    return this.getRunJournal(entries).filter((run) => run.outcome === undefined);
+  }
+
   async updateLeaf(sessionPath: string, leafId: string): Promise<void> {
     try {
       const writablePath = await thawSessionArchive(sessionPath);
@@ -870,7 +990,8 @@ export class SessionManager {
             kind === "compaction" ||
             kind === "agent_handoff" ||
             kind === "model_switch" ||
-            kind === "import")
+            kind === "import" ||
+            kind === "interrupted_run")
         ) {
           return [
             {

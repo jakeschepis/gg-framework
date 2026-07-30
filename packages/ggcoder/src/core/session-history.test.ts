@@ -4,7 +4,7 @@ import type {
   AppMarkerPayload,
   KenTurnPayload,
 } from "./session-manager.js";
-import { STEERING_PREFIX } from "./steering.js";
+import { STEERING_PREFIX, buildNotificationSteeringText } from "./steering.js";
 import { frameAutopilotInjection } from "./autopilot-cycle.js";
 import {
   normalizeAutopilotMarkersForHistory,
@@ -87,6 +87,37 @@ describe("restoreUserRow", () => {
 
     // The same body typed by a human keeps its user bubble.
     expect(restoreUserRow("Fix the failing test.").autopilotInjected).toBe(false);
+  });
+
+  it("flags pushed background-status updates so resume skips them", () => {
+    // The live run renders no bubble for these (the loop yields
+    // `steering_message`, which no host forwards). They are persisted only
+    // because the model genuinely saw them — so a reopened session must not
+    // suddenly show build logs as if the user had typed them.
+    const row = restoreUserRow(
+      buildNotificationSteeringText([
+        'Background process c1c45a8d (pnpm dev) exited with code 0 after 40s. Read it with task_output id="c1c45a8d".',
+      ]),
+    );
+    expect(row.notification).toBe(true);
+
+    // A human writing about a background process still gets their bubble.
+    expect(restoreUserRow("why did pnpm dev exit?").notification).toBe(false);
+  });
+
+  it("flags a status update delivered as block content", () => {
+    const row = restoreUserRow([
+      { type: "text", text: buildNotificationSteeringText(["Background process p1 exited 1."]) },
+    ]);
+    expect(row.notification).toBe(true);
+  });
+
+  it("keeps steering and notification framing distinct", () => {
+    // Both are machine framing, but only steering wraps something a human
+    // actually typed — that one keeps its bubble, stripped.
+    const steered = restoreUserRow(`${STEERING_PREFIX}also add dark mode`);
+    expect(steered.notification).toBe(false);
+    expect(steered.text).toBe("also add dark mode");
   });
 
   it("detects the autopilot preamble under a steering wrapper and in block content", () => {

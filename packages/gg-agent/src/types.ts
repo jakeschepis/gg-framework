@@ -39,6 +39,13 @@ export interface AgentTool<T extends z.ZodType = z.ZodType> extends Tool {
    * batch runs in source order so stateful mutations cannot race each other.
    */
   executionMode?: ToolExecutionMode;
+  /**
+   * Overrides the loop's default per-tool timeout. A tool that owns a longer
+   * internal budget than the default must declare it here, or the loop cancels
+   * it first and the tool's own timeout — with its specific, actionable error
+   * message — becomes unreachable.
+   */
+  timeoutMs?: number;
   execute: (
     args: z.infer<T>,
     context: ToolContext,
@@ -100,6 +107,22 @@ export interface AgentTurnEndEvent {
   stopReason: StopReason;
   usage: Usage;
   timing: AgentTurnTiming;
+}
+
+/**
+ * A safe point between steps: the assistant message and every tool result for
+ * this turn are now in the message array, and no provider call is in flight.
+ *
+ * Hosts that persist a transcript flush here. Without it a crash mid-run loses
+ * the WHOLE turn — including tool results whose side effects already landed on
+ * disk — because the only flush happens after the loop returns.
+ *
+ * Yielded immediately after tool results are appended, so it pairs with
+ * `turn_end` (which covers the assistant half) to cover every message.
+ */
+export interface AgentCheckpointEvent {
+  type: "checkpoint";
+  turn: number;
 }
 
 export interface AgentDoneEvent {
@@ -227,6 +250,7 @@ export type AgentEvent =
   | AgentFollowUpMessageEvent
   | AgentRetryEvent
   | AgentTurnEndEvent
+  | AgentCheckpointEvent
   | AgentDoneEvent
   | AgentMaxTurnsEvent
   | AgentTurnBudgetExtendedEvent

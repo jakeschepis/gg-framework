@@ -5,7 +5,7 @@ import type {
   AppMarkerPayload,
   KenTurnPayload,
 } from "./session-manager.js";
-import { STEERING_PREFIX } from "./steering.js";
+import { STEERING_PREFIX, NOTIFICATION_PREFIX } from "./steering.js";
 import { AUTOPILOT_INJECTION_PREAMBLE } from "./autopilot-cycle.js";
 
 /**
@@ -221,10 +221,26 @@ export interface RestoredUserRow {
    *  marker. Resume must skip the row, or the injected body renders twice:
    *  once styled as Ken's marker, once raw as a user message. */
   autopilotInjected: boolean;
+  /** True when this "user" message is a pushed background-work status update
+   *  (a spawned child finished, a background process logged or exited) rather
+   *  than anything a human sent.
+   *
+   *  The live transcript shows NO bubble for these — the loop yields
+   *  `steering_message`, which no host renders. They are persisted only because
+   *  they are real context the model saw. Resume must skip them too, or a
+   *  reopened session is full of machine-facing status lines the user never saw
+   *  while working. */
+  notification: boolean;
 }
 
 function stripSteering(text: string): string {
   return text.startsWith(STEERING_PREFIX) ? text.slice(STEERING_PREFIX.length) : text;
+}
+
+/** Whether a persisted user message is a pushed background-status update.
+ *  `buildNotificationSteeringText` adds this prefix and nothing else does. */
+function isNotification(text: string): boolean {
+  return text.startsWith(NOTIFICATION_PREFIX);
 }
 
 /** Strip the autopilot situational-awareness preamble that the sidecar prepends
@@ -260,18 +276,21 @@ export function restoreUserRow(content: Message["content"]): RestoredUserRow {
       images: [],
       videoWarning: false,
       autopilotInjected: hasAutopilotPreamble(unsteered),
+      notification: isNotification(content),
     };
   }
   const images: string[] = [];
   const textParts: string[] = [];
   let videoWarning = false;
   let autopilotInjected = false;
+  let notification = false;
   for (const c of content) {
     if (c.type === "image") {
       images.push(`data:${c.mediaType};base64,${c.data}`);
       continue;
     }
     if (c.type !== "text" || typeof c.text !== "string") continue;
+    if (isNotification(c.text)) notification = true;
     const unsteered = stripSteering(c.text);
     if (hasAutopilotPreamble(unsteered)) autopilotInjected = true;
     const stripped = stripAutopilotPreamble(unsteered);
@@ -280,7 +299,13 @@ export function restoreUserRow(content: Message["content"]): RestoredUserRow {
     const cleaned = stripAttachedFilesBlock(stripped);
     if (cleaned.trim()) textParts.push(cleaned);
   }
-  return { text: textParts.join("\n\n").trim(), images, videoWarning, autopilotInjected };
+  return {
+    text: textParts.join("\n\n").trim(),
+    images,
+    videoWarning,
+    autopilotInjected,
+    notification,
+  };
 }
 
 // ── Slash-command reconstruction ──────────────────────────────

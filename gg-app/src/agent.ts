@@ -802,6 +802,26 @@ export async function authOAuthCode(code: string): Promise<void> {
   await invoke("agent_auth_oauth_code", { code });
 }
 
+/** How the user answered an MCP server's request for input. */
+export type McpElicitAction = "accept" | "decline" | "cancel";
+
+/**
+ * Answer an MCP server's mid-tool-call request for user input (the `mcp_elicit`
+ * SSE event). `content` is the filled form and applies only to `accept`.
+ *
+ * The MCP tool call — and therefore the whole turn — is blocked until this
+ * lands, so every dismissal path must call it. The sidecar only auto-cancels
+ * after a multi-minute timeout.
+ */
+export async function mcpElicit(
+  id: string,
+  action: McpElicitAction,
+  content?: Record<string, unknown>,
+): Promise<void> {
+  await waitForReady();
+  await invoke("agent_mcp_elicit", { id, action, content: content ?? null });
+}
+
 /**
  * Disconnect a provider (clear stored credentials). Handled NATIVELY in Rust
  * (removes the provider from ~/.gg/auth.json; moonshot also clears its OAuth
@@ -954,14 +974,23 @@ export async function listCommands(): Promise<SlashCommand[]> {
   }
 }
 
-/** List models available to the logged-in providers. */
-export async function listModels(): Promise<ModelOption[]> {
+/**
+ * List models available to the logged-in providers, or `null` when the fetch
+ * itself failed.
+ *
+ * The distinction matters: an empty array is a real answer (every provider was
+ * disconnected) and must clear the picker, whereas a failed IPC call must leave
+ * the previous list alone. Collapsing both to `[]` meant callers had to guard
+ * with `length > 0`, which made disconnecting your last provider leave a picker
+ * full of models you can no longer authenticate against.
+ */
+export async function listModels(): Promise<ModelOption[] | null> {
   try {
     const res = await invoke<{ models: ModelOption[] }>("agent_models");
     return res.models ?? [];
   } catch (e) {
     await logError(`agent_models failed: ${String(e)}`);
-    return [];
+    return null;
   }
 }
 

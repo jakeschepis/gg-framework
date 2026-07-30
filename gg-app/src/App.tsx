@@ -95,6 +95,7 @@ import { PlanModeLogo } from "./PlanModeLogo";
 import { KenPowerBanner } from "./KenPowerBanner";
 import { ExportChatButton } from "./ExportChatButton";
 import { PlanReviewModal } from "./PlanReviewModal";
+import { McpElicitModal } from "./McpElicitModal";
 import { WindowLayoutButton } from "./WindowLayoutButton";
 // Experimental gaze focus — disabled for now (see main.tsx).
 // import { GazeButton } from "./GazeButton";
@@ -1183,7 +1184,8 @@ function App(): React.ReactElement {
         setStatus(st.runState === "cancelling" ? "cancelling..." : "ready");
       }
       const available = await listModels();
-      if (available.length > 0) setModels(available);
+      // null = the fetch failed; keep whatever the picker already had.
+      if (available) setModels(available);
       const cmds = await listCommands();
       if (cmds.length > 0) setCommands(cmds);
       // Project task list for the Tasks modal + nav button.
@@ -2806,6 +2808,10 @@ function App(): React.ReactElement {
           onClose={() => setConfirmNewSession(false)}
         />
       )}
+
+      {/* Always mounted: an MCP server can ask for input at any moment, in any
+          workspace mode, and its tool call stays blocked until we answer. */}
+      <McpElicitModal />
 
       {workspaceMode === "code" && planReview !== null && (
         <PlanReviewModal

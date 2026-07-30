@@ -773,10 +773,58 @@ describe("models_change", () => {
     expect(getModels()).toEqual(discovered);
   });
 
-  it("keeps the existing list when a refresh comes back empty", async () => {
-    vi.mocked(listModels).mockResolvedValue([] as never);
+  it("refreshes the picker when a provider is connected", async () => {
+    // Connecting a provider unlocks its models; the sidecar fans models_change
+    // out to every window because ~/.gg/auth.json is shared, not per-session.
+    const unlocked = [
+      { id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" },
+      { id: "gpt-6", name: "GPT-6", provider: "openai" },
+    ];
+    vi.mocked(listModels).mockResolvedValue(unlocked as never);
     const { hook, getModels } = setup();
 
+    await act(async () => {
+      hook.result.current.handleEvent(ev("models_change"));
+      await Promise.resolve();
+    });
+
+    expect(getModels()).toEqual(unlocked);
+  });
+
+  it("keeps the existing list when the refresh itself fails", async () => {
+    const seeded = [{ id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" }];
+    vi.mocked(listModels).mockResolvedValue(seeded as never);
+    const { hook, getModels } = setup();
+    await act(async () => {
+      hook.result.current.handleEvent(ev("models_change"));
+      await Promise.resolve();
+    });
+    expect(getModels()).toEqual(seeded);
+
+    // null = the IPC call failed. Wiping the picker on a transient failure
+    // would strand the user with no way to switch models.
+    vi.mocked(listModels).mockResolvedValue(null as never);
+    await act(async () => {
+      hook.result.current.handleEvent(ev("models_change"));
+      await Promise.resolve();
+    });
+
+    expect(getModels()).toEqual(seeded);
+  });
+
+  it("clears the picker when the last provider is disconnected", async () => {
+    const seeded = [{ id: "claude-opus-5", name: "Claude Opus 5", provider: "anthropic" }];
+    vi.mocked(listModels).mockResolvedValue(seeded as never);
+    const { hook, getModels } = setup();
+    await act(async () => {
+      hook.result.current.handleEvent(ev("models_change"));
+      await Promise.resolve();
+    });
+    expect(getModels()).toEqual(seeded);
+
+    // [] is a real answer, not a failure: every provider is now disconnected.
+    // Leaving the old list up would offer models that can no longer authenticate.
+    vi.mocked(listModels).mockResolvedValue([] as never);
     await act(async () => {
       hook.result.current.handleEvent(ev("models_change"));
       await Promise.resolve();

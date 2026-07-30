@@ -73,6 +73,11 @@ export function createSubAgentTool(
     // turn. NOTE: the loop serializes the WHOLE batch if any call is
     // sequential, so this only fans out when every call in the turn is parallel.
     executionMode: "parallel",
+    // This tool enforces its own SUB_AGENT_TIMEOUT_MS budget and reports a
+    // specific message when it fires. Give the loop a slightly larger ceiling
+    // so the child is stopped and explained here, instead of being cancelled
+    // generically by the loop's shorter default before that can happen.
+    timeoutMs: SUB_AGENT_TIMEOUT_MS + 30_000,
     async execute(args, context) {
       if (isPlanModeActive(planModeRef)) {
         return planModeRestriction("subagent");
@@ -147,17 +152,20 @@ export function createSubAgentTool(
       let maxTurnsLimit = 0;
       let activeChild: ReturnType<typeof spawn> | undefined;
       let activeChildExited = true;
+      /** Set when WE killed the child, so `exit null` can name its real cause. */
+      let killReason: "timeout" | "aborted" | undefined;
 
-      const killActiveChild = () => {
+      const killActiveChild = (reason: "timeout" | "aborted") => {
         const child = activeChild;
         if (!child || activeChildExited) return;
+        killReason ??= reason;
         child.kill("SIGTERM");
         setTimeout(() => {
           if (activeChild === child && !activeChildExited) child.kill("SIGKILL");
         }, 3000);
       };
 
-      const abortHandler = () => killActiveChild();
+      const abortHandler = () => killActiveChild("aborted");
       context.signal.addEventListener("abort", abortHandler, { once: true });
 
       return new Promise((resolve) => {
@@ -192,7 +200,7 @@ export function createSubAgentTool(
           // Both attempts share the original hard timeout; a retry never doubles
           // the maximum runtime of one sub-agent call.
           const remainingMs = Math.max(1, SUB_AGENT_TIMEOUT_MS - (Date.now() - startTime));
-          const timeout = setTimeout(killActiveChild, remainingMs);
+          const timeout = setTimeout(() => killActiveChild("timeout"), remainingMs);
           const rl = createInterface({ input: child.stdout! });
           rl.on("line", (line) => {
             try {
@@ -266,7 +274,7 @@ export function createSubAgentTool(
             stderr = (stderr + chunk.toString()).slice(0, SUB_AGENT_MAX_STDERR_CHARS);
           });
 
-          child.on("close", (code) => {
+          child.on("close", (code, signal) => {
             if (activeChild === child) activeChildExited = true;
             clearTimeout(timeout);
             rl.close();
@@ -304,18 +312,46 @@ export function createSubAgentTool(
               cacheRead: String(tokenUsage.cacheRead ?? 0),
               cacheWrite: String(tokenUsage.cacheWrite ?? 0),
               exitCode: String(code),
+              ...(signal && { signal }),
+              ...(killReason && { killReason }),
               model,
             });
 
-            if (code !== 0 && !textOutput) {
+            const body = boundSubAgentOutput(textOutput);
+            if (code !== 0) {
+              // A provider/process failure can happen AFTER the model has emitted
+              // a progress sentence (for example: "I'll read both files now.").
+              // Treating any partial text as a successful final answer hid the
+              // non-zero exit and handed that sentence to the parent as if the
+              // review/task had completed. Preserve the partial output for
+              // diagnosis, but make the failure impossible to mistake for a
+              // result.
+              // `code` is null when the child died from a signal, which is
+              // almost always us killing it. Reporting that as "exit null:
+              // unknown error" hid the actual cause (a timeout) behind a
+              // mystery, so name it explicitly.
+              const error =
+                stderr.trim() ||
+                (killReason === "timeout"
+                  ? `sub-agent exceeded its ${Math.round(SUB_AGENT_TIMEOUT_MS / 60000)}-minute time limit and was stopped`
+                  : killReason === "aborted"
+                    ? "sub-agent was cancelled by the parent (turn aborted or per-tool timeout)"
+                    : signal
+                      ? `sub-agent terminated by ${signal}`
+                      : "unknown error");
               finish({
-                content: `Sub-agent failed (exit ${code}): ${stderr.trim() || "unknown error"}`,
+                // `boundSubAgentOutput("")` intentionally returns
+                // "(no output)" for successful empty children. Test the raw
+                // stream here so that placeholder is not mislabeled as partial
+                // model output on failures.
+                content: textOutput
+                  ? `Sub-agent failed (exit ${code}): ${error}\n\nPartial output before failure:\n${body}`
+                  : `Sub-agent failed (exit ${code}): ${error}`,
                 details,
               });
               return;
             }
 
-            const body = boundSubAgentOutput(textOutput);
             const content = hitMaxTurns
               ? `[Sub-agent reached its ${maxTurnsLimit}-turn limit — it stopped mid-task and this output may be incomplete.]\n\n${body}`
               : body;
@@ -329,7 +365,7 @@ export function createSubAgentTool(
             finish({ content: `Failed to spawn sub-agent: ${err.message}` });
           });
 
-          if (context.signal.aborted) killActiveChild();
+          if (context.signal.aborted) killActiveChild("aborted");
         };
 
         startAttempt(useModel);

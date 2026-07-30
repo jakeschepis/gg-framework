@@ -34,7 +34,16 @@ export class ReviewCoverageTracker {
   private readonly covered = new Set<string>();
   private active = false;
 
-  constructor(private readonly cwd: string) {}
+  /**
+   * `fileExists` is injectable for tests and defaults to the real filesystem.
+   * A file the run created and then deleted can never be re-read, so without
+   * this check it stayed in `missing` forever and the coverage gate re-injected
+   * the same follow-up on every turn.
+   */
+  constructor(
+    private readonly cwd: string,
+    private readonly fileExists: (p: string) => boolean = existsSync,
+  ) {}
 
   reset(): void {
     this.expected.clear();
@@ -62,7 +71,9 @@ export class ReviewCoverageTracker {
   }
 
   evidence(): ReviewCoverageEvidence {
-    const expected = [...this.expected].sort();
+    // Deleted files are dropped, not reported unread: review evidence can only
+    // come from reading a file that is still on disk.
+    const expected = [...this.expected].filter((filePath) => this.fileExists(filePath)).sort();
     const covered = expected.filter((filePath) => this.covered.has(filePath));
     const missing = expected.filter((filePath) => !this.covered.has(filePath));
     return {
@@ -95,6 +106,30 @@ export function buildReviewCoverageMessage(missingFiles: readonly string[]): Mes
       "Ideal review coverage is incomplete. Open every changed file below with the read tool " +
       "before finalizing; model-authored claims do not count as evidence:\n" +
       missingFiles.map((filePath) => `- ${filePath}`).join("\n"),
+  };
+}
+
+/**
+ * Coverage follow-ups spent before the gate gives up. The gate is fail-closed,
+ * but a file the agent genuinely cannot read (permissions, a path outside the
+ * workspace, a race with an external delete) must not cost an unbounded number
+ * of identical turns — it escalates once and lets the run finish.
+ */
+export const MAX_REVIEW_COVERAGE_INJECTIONS = 2;
+
+/**
+ * Terminal coverage message: stop demanding reads, require an honest statement
+ * of what went unverified in the final answer.
+ */
+export function buildReviewCoverageEscalationMessage(missingFiles: readonly string[]): Message {
+  return {
+    role: "user",
+    content:
+      `Ideal review coverage is still incomplete after ${MAX_REVIEW_COVERAGE_INJECTIONS} attempts. ` +
+      "Stop trying to read these files and do not repeat your previous answer:\n" +
+      missingFiles.map((filePath) => `- ${filePath}`).join("\n") +
+      "\n\nGive your final response now, and state plainly in it that you could not verify the " +
+      "files above (say why if you know) so the user can check them.",
   };
 }
 

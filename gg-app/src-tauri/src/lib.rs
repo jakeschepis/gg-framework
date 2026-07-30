@@ -1163,6 +1163,36 @@ async fn agent_auth_oauth_code(
         .map_err(|e| e.to_string())
 }
 
+/// Proxy: answer an MCP server's mid-tool-call request for user input.
+///
+/// `action` is `accept` | `decline` | `cancel`; `content` carries the filled
+/// form and is only meaningful for `accept`.
+#[tauri::command]
+async fn agent_mcp_elicit(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    id: String,
+    action: String,
+    content: Option<serde_json::Value>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!(
+            "{}/mcp/elicit/{}",
+            sidecar_base(port),
+            urlencoding(&id)
+        ))
+        .header("x-gg-session", &gg_sid)
+        .json(&serde_json::json!({ "action": action, "content": content }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 /// Proxy: disconnect a provider (clear its stored credentials).
 #[tauri::command]
 async fn agent_auth_logout(
@@ -2360,7 +2390,7 @@ fn app_auth_apikey(
 /// single "disconnect" fully removes all of a provider's credentials. Never
 /// touches the sidecar. Returns `{ ok: true }`.
 #[tauri::command]
-fn app_auth_logout(provider: String) -> Result<serde_json::Value, String> {
+fn app_auth_logout(app: tauri::AppHandle, provider: String) -> Result<serde_json::Value, String> {
     let existing = std::fs::read_to_string(auth_file_path()).ok();
     // Nothing to remove and no file → succeed silently (idempotent).
     if existing.is_none() {
@@ -2368,7 +2398,26 @@ fn app_auth_logout(provider: String) -> Result<serde_json::Value, String> {
     }
     let next = apply_logout(existing.as_deref(), &provider)?;
     write_auth_file(&next)?;
+    // Disconnecting removes that provider's models from `/models` and clears
+    // its connection dot. Logout is deliberately native (it must work even with
+    // no daemon), so the sidecar never learns about it — tell every window
+    // directly, or their pickers keep offering models the user can no longer
+    // authenticate against and the login screen still shows them connected.
+    broadcast_agent_event(&app, "models_change", serde_json::json!({}));
+    broadcast_agent_event(&app, "auth_change", serde_json::json!({ "provider": provider }));
     Ok(serde_json::json!({ "ok": true }))
+}
+
+/// Emit one `agent-event` frame to EVERY window, matching the shape the SSE
+/// bridge produces. For global state changed natively, outside any session.
+fn broadcast_agent_event(app: &tauri::AppHandle, event_type: &str, data: serde_json::Value) {
+    for label in app.webview_windows().keys() {
+        let _ = app.emit_to(
+            EventTarget::webview_window(label.clone()),
+            "agent-event",
+            serde_json::json!({ "type": event_type, "data": data }),
+        );
+    }
 }
 
 /// Current unix time in milliseconds (wall clock; fine for an expiry stamp).
@@ -4522,6 +4571,7 @@ pub fn run() {
             agent_auth_apikey,
             agent_auth_oauth_start,
             agent_auth_oauth_code,
+            agent_mcp_elicit,
             agent_auth_logout,
             agent_kill_task,
             agent_import_transcript,

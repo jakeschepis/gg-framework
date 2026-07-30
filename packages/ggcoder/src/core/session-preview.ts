@@ -1,4 +1,5 @@
 import type { Message } from "@kenkaiiii/gg-ai";
+import { NOTIFICATION_PREFIX } from "./steering.js";
 
 const COMPACTION_SUMMARY_PREFIX = "[Previous conversation summary]";
 const AUTOPILOT_PROMPT_PREFIX =
@@ -21,13 +22,19 @@ export function extractSessionText(content: Message["content"] | unknown): strin
 
 /**
  * Return user-authored prompt text suitable for a stable session title.
- * Compaction summaries and Ken's autopilot injections are model-owned context,
- * not new conversations, so they must never replace the user's title.
+ * Compaction summaries, Ken's autopilot injections and pushed background-status
+ * updates are model-owned context, not new conversations, so they must never
+ * replace the user's title — a session called "Background process c1c45a8d
+ * (pnpm dev) exited with code 0" is unfindable.
  */
 export function getUserSessionPrompt(content: Message["content"] | unknown): string | null {
   let text = extractSessionText(content).trim();
   if (!text) return null;
-  if (text.startsWith(COMPACTION_SUMMARY_PREFIX) || text.startsWith(AUTOPILOT_PROMPT_PREFIX)) {
+  if (
+    text.startsWith(COMPACTION_SUMMARY_PREFIX) ||
+    text.startsWith(AUTOPILOT_PROMPT_PREFIX) ||
+    text.startsWith(NOTIFICATION_PREFIX)
+  ) {
     return null;
   }
 

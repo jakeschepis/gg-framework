@@ -1,4 +1,19 @@
+import type { RunOutcome } from "./session-manager.js";
+
 export type RunState = "idle" | "running" | "cancelling";
+
+/**
+ * Durable record of run boundaries. `RunLifecycle` already owns generation
+ * identity, so hanging the journal off it makes the on-disk pair inherit that
+ * generation-safety for free — a stale run cannot close a newer one's entry.
+ *
+ * Both hooks are fire-and-forget: journalling must never delay a run or fail
+ * one. Implementations swallow their own write errors.
+ */
+export interface RunJournalWriter {
+  started(generation: number): void;
+  finished(generation: number, outcome: RunOutcome): void;
+}
 
 export type CancelResult =
   | { status: "cancelled"; generation: number }
@@ -31,7 +46,10 @@ export class RunLifecycle {
   private nextGeneration = 0;
   private active?: ActiveRun;
 
-  constructor(private readonly onStateChange?: (state: RunState) => void) {}
+  constructor(
+    private readonly onStateChange?: (state: RunState) => void,
+    private readonly journal?: RunJournalWriter,
+  ) {}
 
   get state(): RunState {
     return this.currentState;
@@ -60,6 +78,7 @@ export class RunLifecycle {
       resolveSettlement,
     };
     this.setState("running");
+    this.journal?.started(generation);
     return { generation };
   }
 
@@ -67,8 +86,16 @@ export class RunLifecycle {
     return this.active?.generation === generation && this.active.cancelRequested;
   }
 
-  /** Settle only the matching owner; stale generations cannot release a new run. */
-  settle(generation: number): { settled: boolean; cancelled: boolean } {
+  /**
+   * Settle only the matching owner; stale generations cannot release a new run.
+   *
+   * `outcome` defaults to `completed`; a cancelled run always records `aborted`
+   * regardless, since cancellation is the authoritative signal here.
+   */
+  settle(
+    generation: number,
+    outcome: RunOutcome = "completed",
+  ): { settled: boolean; cancelled: boolean } {
     const active = this.active;
     if (!active || active.generation !== generation) {
       return { settled: false, cancelled: false };
@@ -77,6 +104,7 @@ export class RunLifecycle {
     this.active = undefined;
     this.setState("idle");
     active.resolveSettlement();
+    this.journal?.finished(generation, cancelled ? "aborted" : outcome);
     return { settled: true, cancelled };
   }
 

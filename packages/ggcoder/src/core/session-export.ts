@@ -319,6 +319,10 @@ export function sessionToMarkdown(
       const isHook = HOOK_PREFIXES.some((p) => text.startsWith(p));
       const isCompaction = text.startsWith("[Previous conversation summary]");
       flushPending();
+      // Pushed background-status updates were never shown as a bubble live, so
+      // an export that included them would not match the conversation the user
+      // had — and would read as if they had typed build logs at the agent.
+      if (restored.notification) continue;
       if (isHook) {
         out.push("");
         out.push(`> _(agent self-correction check)_`);

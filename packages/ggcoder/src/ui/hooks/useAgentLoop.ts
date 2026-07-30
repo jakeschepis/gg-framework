@@ -16,7 +16,9 @@ import type {
   VideoContent,
 } from "@kenkaiiii/gg-ai";
 import {
+  buildReviewCoverageEscalationMessage,
   buildReviewCoverageMessage,
+  MAX_REVIEW_COVERAGE_INJECTIONS,
   withReviewCoverageRequirements,
   type IdealReviewStats,
   type ReviewCoverageTracker,
@@ -349,6 +351,8 @@ export function useAgentLoop(
     bashCalls: 0,
   });
   const idealReviewPhaseRef = useRef<"idle" | "reviewing" | "complete">("idle");
+  /** Coverage follow-ups spent this run, capped by MAX_REVIEW_COVERAGE_INJECTIONS. */
+  const reviewCoverageInjectedRef = useRef(0);
   // ── Loop-breaker tracking ──
   const loopProgressTrackerRef = useRef(new ToolCallProgressTracker());
   const cycleDetectorRef = useRef(new CycleDetector());
@@ -548,6 +552,7 @@ export function useAgentLoop(
           bashCalls: 0,
         };
         idealReviewPhaseRef.current = "idle";
+        reviewCoverageInjectedRef.current = 0;
         options.reviewCoverageTracker?.reset();
         loopProgressTrackerRef.current.reset();
         cycleDetectorRef.current.reset();
@@ -771,13 +776,24 @@ export function useAgentLoop(
                   missing: coverage.missing,
                 });
                 if (coverage.missing.length > 0) {
-                  return [
-                    withLspReviewEvidence(
-                      buildReviewCoverageMessage(coverage.missing),
-                      coverage.expected,
-                      options.lspManager,
-                    ),
-                  ];
+                  if (reviewCoverageInjectedRef.current < MAX_REVIEW_COVERAGE_INJECTIONS) {
+                    reviewCoverageInjectedRef.current += 1;
+                    return [
+                      withLspReviewEvidence(
+                        buildReviewCoverageMessage(coverage.missing),
+                        coverage.expected,
+                        options.lspManager,
+                      ),
+                    ];
+                  }
+                  // Budget spent: close the gate rather than re-injecting the
+                  // same unreadable-file checklist for the rest of the run.
+                  idealReviewPhaseRef.current = "complete";
+                  log("INFO", "ideal", "Ideal review coverage escalated after retry budget", {
+                    injected: String(reviewCoverageInjectedRef.current),
+                    missing: coverage.missing,
+                  });
+                  return [buildReviewCoverageEscalationMessage(coverage.missing)];
                 }
                 idealReviewPhaseRef.current = "complete";
                 return null;
