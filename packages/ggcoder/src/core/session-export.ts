@@ -1,5 +1,9 @@
 import type { Message, ToolResultContent } from "@kenkaiiii/gg-ai";
-import { restoreUserRow, restoreAssistantTexts } from "./session-history.js";
+import {
+  getHistoryMessageVisibility,
+  restoreUserRow,
+  restoreAssistantTexts,
+} from "./session-history.js";
 
 /**
  * Markdown transcript export.
@@ -312,23 +316,26 @@ export function sessionToMarkdown(
 
   for (const msg of messages) {
     if (msg.role === "system" || msg.role === "tool") continue;
+    const visibility = getHistoryMessageVisibility(msg);
+    if (visibility === "hidden") continue;
 
     if (msg.role === "user") {
-      const restored = restoreUserRow(msg.content);
+      const restored = restoreUserRow(msg.content, msg.provenance);
       const text = restored.text.trim();
-      const isHook = HOOK_PREFIXES.some((p) => text.startsWith(p));
-      const isCompaction = text.startsWith("[Previous conversation summary]");
+      const isHook = !msg.provenance && HOOK_PREFIXES.some((p) => text.startsWith(p));
+      const isCompaction =
+        visibility === "summary" ||
+        (!msg.provenance && text.startsWith("[Previous conversation summary]"));
       flushPending();
-      // Pushed background-status updates were never shown as a bubble live, so
-      // an export that included them would not match the conversation the user
-      // had — and would read as if they had typed build logs at the agent.
-      if (restored.notification) continue;
+      // Legacy generated rows rely on framing; tagged rows trust provenance.
+      if (!msg.provenance && (restored.notification || restored.autopilotInjected)) continue;
       if (isHook) {
         out.push("");
         out.push(`> _(agent self-correction check)_`);
         continue;
       }
       if (isCompaction) {
+        rows++;
         out.push("");
         out.push(`> _(conversation compacted here)_`);
         continue;

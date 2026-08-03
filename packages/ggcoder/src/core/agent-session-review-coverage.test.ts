@@ -157,7 +157,11 @@ describe("AgentSession Ideal review coverage gate", () => {
     };
 
     expect(internal.getHookFollowUpMessages()).toEqual([
-      { role: "user", content: "Collect child agent recovered-child before finishing." },
+      {
+        role: "user",
+        content: "Collect child agent recovered-child before finishing.",
+        provenance: { source: "runtime", kind: "completion_gate", visibility: "hidden" },
+      },
     ]);
   });
 });

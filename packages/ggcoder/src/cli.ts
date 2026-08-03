@@ -55,6 +55,7 @@ import { runJsonMode } from "./modes/json-mode.js";
 import { runSubagentWorkerMode } from "./modes/subagent-worker-mode.js";
 import { runRpcMode } from "./modes/rpc-mode.js";
 import { runServeMode } from "./modes/serve-mode.js";
+import { runAcpModeCli } from "./modes/acp-mode.js";
 import {
   loadTelegramConfig,
   saveTelegramConfig,
@@ -85,8 +86,10 @@ import {
   createCompactedSessionCheckpoint,
   formatRestoreInfoText,
   getRestoredMessagesForDisplay,
+  sourceFingerprint,
 } from "./core/session-compaction.js";
 import { setEstimatorModel } from "./core/compaction/token-estimator.js";
+import { resolveCompactionPolicy } from "./core/compaction/policy.js";
 import { findUserSessionPrompt } from "./core/session-preview.js";
 import {
   getAuthStorageKeys,
@@ -157,6 +160,7 @@ function printHelp(): void {
     ["sessions", "Browse and resume previous sessions"],
     ["continue", "Resume the most recent session"],
     ["serve", "Start the HTTP/WebSocket API server"],
+    ["acp", "Serve as an Agent Client Protocol agent on stdio"],
     ["telegram", "Configure Telegram bot integration"],
     ["agent-home-login", "Configure Agent Home relay connection"],
     ["agent-home", "Connect to Agent Home as a remote agent"],
@@ -241,6 +245,7 @@ function createCliSubcommandHandlers(): Record<CliSubcommandName, () => void> {
     sessions: () => runWithStandardErrorHandling(runSessions),
     telegram: () => runWithStandardErrorHandling(runTelegramSetup),
     serve: () => runWithStandardErrorHandling(runServe),
+    acp: () => runWithStandardErrorHandling(runAcp),
     doctor: () => {
       runDoctor().catch((err) => {
         process.stderr.write(formatUserError(err) + "\n");
@@ -453,6 +458,7 @@ async function runInkTUI(opts: {
   // actually logged in with — we must never default to a provider they
   // haven't authenticated against.
   const paths = await ensureAppDirs();
+  const savedSettings = loadSavedSettings(paths.settingsFile);
 
   // Wire stream stall diagnostics into the debug log
   setStreamDiagnostic((phase, data) => {
@@ -694,19 +700,18 @@ async function runInkTUI(opts: {
   let initialHistory: CompletedItem[] | undefined;
   let turnMetrics: TurnMetricPayload[] = [];
 
-  // Determine which session to resume (explicit path or most recent)
+  // IDs and physical paths both resolve to the newest checkpoint in their
+  // logical conversation before any restored messages are read.
   const explicitResumePath = opts.resumeSessionPath
-    ? opts.resumeSessionPath.includes("/")
-      ? opts.resumeSessionPath
-      : await sessionManager.findById(cwd, opts.resumeSessionPath)
+    ? await sessionManager.resolveCanonicalSession(opts.resumeSessionPath, cwd)
     : null;
   const resumePath =
     explicitResumePath ?? (opts.continueRecent ? await sessionManager.getMostRecent(cwd) : null);
 
   if (resumePath) {
     try {
-      const loaded = await sessionManager.load(resumePath);
-      const loadedMessages = sessionManager.getMessages(loaded.entries);
+      let loaded = await sessionManager.load(resumePath);
+      let loadedMessages = sessionManager.getMessages(loaded.entries);
       turnMetrics = sessionManager.getTurnMetrics(loaded.entries);
 
       if (loadedMessages.length > 0) {
@@ -718,54 +723,142 @@ async function runInkTUI(opts: {
           messageCount: String(loadedMessages.length),
         });
 
-        // Auto-compact on load if the restored session exceeds the context window.
-        // Without this, huge sessions (1M+ tokens) get loaded into memory and OOM.
+        // Auto-compact on load using the same configurable trigger as AgentSession.
         const contextWindow = getContextWindow(model, { provider, accountId: creds.accountId });
-        if (shouldCompact(messages, contextWindow, 0.8)) {
+        const policy = resolveCompactionPolicy({
+          provider,
+          model,
+          contextWindow,
+          threshold: savedSettings.compactThreshold,
+          accountId: creds.accountId,
+        });
+        const activeTokens = undefined;
+        log("INFO", "compaction", "CLI restore compaction decision", {
+          provider,
+          model,
+          transport: provider === "openai" && creds.accountId ? "codex_oauth" : "public_api",
+          contextWindow: String(contextWindow),
+          activeTokens: activeTokens === undefined ? "estimated" : String(activeTokens),
+          triggerLimit: String(policy.targetTokens),
+        });
+
+        if (
+          savedSettings.autoCompact &&
+          shouldCompact(messages, contextWindow, policy.threshold, activeTokens)
+        ) {
           await subAgentManager?.hydrate(loaded.header.id);
           log("INFO", "session", `Restored session exceeds context — auto-compacting`);
           const compactionAbort = new AbortController();
           const onSigint = () => compactionAbort.abort();
           process.once("SIGINT", onSigint);
           try {
-            const compacted = await compact(messages, {
-              provider,
-              model,
-              apiKey: creds.accessToken,
-              accountId: creds.accountId,
-              projectId: creds.projectId,
-              baseUrl: cached.baseUrl,
-              contextWindow,
-              signal: compactionAbort.signal,
-            });
-            // Persist compacted continuation to a fresh session so future
-            // `ggcoder continue` starts from the compacted checkpoint instead
-            // of repeatedly restoring the oversized source session.
-            const compactedSession = await createCompactedSessionCheckpoint(sessionManager, {
-              cwd,
-              provider,
-              model,
-              messages: compacted.messages,
-              conversationId: loaded.header.conversationId ?? loaded.header.id,
-              preview: loaded.header.preview ?? findUserSessionPrompt(messages),
-              title: [...loaded.entries]
-                .reverse()
-                .find((entry) => entry.type === "label")
-                ?.label.trim(),
-            });
-            sessionPath = compactedSession.path;
-            sessionId = compactedSession.id;
-            for (const metric of turnMetrics) {
-              await sessionManager.appendTurnMetric(sessionPath, metric);
-            }
-            await subAgentManager?.rebindParentSession(sessionId);
-            messages.length = 0;
-            messages.push(...compacted.messages);
-            log("INFO", "session", `Auto-compaction complete`, {
-              before: String(compacted.result.originalCount),
-              after: String(compacted.result.newCount),
-              path: sessionPath,
-            });
+            const conversationId = loaded.header.conversationId ?? loaded.header.id;
+            await sessionManager.withCompactionLease(
+              conversationId,
+              compactionAbort.signal,
+              async () => {
+                // A different process may have completed the checkpoint while
+                // this CLI was waiting. Adopt it and re-check before summarizing.
+                const canonicalPath = await sessionManager.resolveCanonicalSession(
+                  conversationId,
+                  cwd,
+                );
+                if (canonicalPath && canonicalPath !== loaded.path) {
+                  loaded = await sessionManager.load(canonicalPath);
+                  loadedMessages = sessionManager.getMessages(loaded.entries);
+                  turnMetrics = sessionManager.getTurnMetrics(loaded.entries);
+                  messages.length = 1;
+                  messages.push(...loadedMessages);
+                  sessionPath = loaded.path;
+                  sessionId = loaded.header.id;
+                }
+                if (!shouldCompact(messages, contextWindow, policy.threshold)) return;
+
+                const fingerprint = sourceFingerprint(messages);
+                const attempt = await sessionManager.readCompactionAttemptState(conversationId);
+                const attemptActive =
+                  !attempt?.expiresAt || Date.parse(attempt.expiresAt) > Date.now();
+                if (
+                  attempt?.fingerprint === fingerprint &&
+                  attempt.policyKey === policy.policyKey &&
+                  attemptActive &&
+                  (attempt.outcome === "failed" || attempt.outcome === "noop")
+                ) {
+                  return;
+                }
+
+                try {
+                  const compacted = await compact(messages, {
+                    provider,
+                    model,
+                    apiKey: creds.accessToken,
+                    accountId: creds.accountId,
+                    projectId: creds.projectId,
+                    baseUrl: cached.baseUrl,
+                    contextWindow,
+                    targetTokens: policy.targetTokens,
+                    signal: compactionAbort.signal,
+                  });
+                  if (!compacted.result.compacted) {
+                    await sessionManager.writeCompactionAttemptState(conversationId, {
+                      fingerprint,
+                      policyKey: policy.policyKey,
+                      outcome: "noop",
+                      updatedAt: new Date().toISOString(),
+                      expiresAt: new Date(Date.now() + 30_000).toISOString(),
+                    });
+                    return;
+                  }
+
+                  const compactedSession = await createCompactedSessionCheckpoint(sessionManager, {
+                    cwd,
+                    provider,
+                    model,
+                    messages: compacted.messages,
+                    conversationId,
+                    generation: (loaded.header.generation ?? 0) + 1,
+                    parentSessionId: loaded.header.id,
+                    sourceFingerprint: fingerprint,
+                    preview: loaded.header.preview ?? findUserSessionPrompt(messages),
+                    title: [...loaded.entries]
+                      .reverse()
+                      .find((entry) => entry.type === "label")
+                      ?.label.trim(),
+                  });
+                  sessionPath = compactedSession.path;
+                  sessionId = compactedSession.id;
+                  for (const metric of turnMetrics) {
+                    await sessionManager.appendTurnMetric(sessionPath, metric);
+                  }
+                  await subAgentManager?.rebindParentSession(sessionId);
+                  messages.length = 0;
+                  messages.push(...compacted.messages);
+                  await sessionManager.writeCompactionAttemptState(conversationId, {
+                    fingerprint,
+                    policyKey: policy.policyKey,
+                    outcome: "success",
+                    checkpointId: compactedSession.id,
+                    updatedAt: new Date().toISOString(),
+                  });
+                  log("INFO", "session", `Auto-compaction complete`, {
+                    before: String(compacted.result.originalCount),
+                    after: String(compacted.result.newCount),
+                    path: sessionPath,
+                  });
+                } catch (error) {
+                  await sessionManager
+                    .writeCompactionAttemptState(conversationId, {
+                      fingerprint,
+                      policyKey: policy.policyKey,
+                      outcome: "failed",
+                      updatedAt: new Date().toISOString(),
+                      expiresAt: new Date(Date.now() + 30_000).toISOString(),
+                    })
+                    .catch(() => {});
+                  throw error;
+                }
+              },
+            );
           } finally {
             process.off("SIGINT", onSigint);
           }
@@ -1128,6 +1221,60 @@ async function runServe(): Promise<void> {
     version: CLI_VERSION,
     thinkingLevel,
     telegram: { botToken, userId },
+  });
+}
+
+// ── ACP (Agent Client Protocol over stdio) ───────────────
+
+/**
+ * Serve ggcoder as an ACP agent on stdio, for editors and remote clients that
+ * speak the protocol (Zed, pew2, anything from the ACP registry).
+ *
+ * The client spawns this process and owns its lifetime, so there is no banner,
+ * no prompt and no exit of our own choosing. stdout is the protocol stream:
+ * NOTHING else may write to it, which is why every diagnostic here goes to the
+ * log file or stderr.
+ */
+async function runAcp(): Promise<void> {
+  const { values: acpValues } = parseArgs({
+    options: {
+      provider: { type: "string" },
+      model: { type: "string" },
+      cwd: { type: "string" },
+    },
+    strict: true,
+  });
+
+  const savedAcp = loadSavedSettings();
+  const paths = await ensureAppDirs();
+  const authStorage = new AuthStorage(paths.authFile);
+  await authStorage.load();
+
+  const preferredProvider: Provider =
+    (acpValues.provider as Provider | undefined) ?? savedAcp.provider ?? "anthropic";
+  const { provider, model } = await resolveActiveProvider(
+    authStorage,
+    preferredProvider,
+    acpValues.model ?? savedAcp.model,
+  );
+
+  const thinkingLevel: ThinkingLevel | undefined = savedAcp.thinkingEnabled
+    ? (savedAcp.thinkingLevel ??
+      getDefaultThinkingLevel(model, { baseUrl: authStorage.getStoredBaseUrl(provider) }))
+    : undefined;
+
+  initLogger(paths.logFile, { version: CLI_VERSION, provider, model });
+  setEstimatorModel(model);
+
+  await runAcpModeCli({
+    provider,
+    model,
+    // ACP clients pass the project directory per session; until `session/new`
+    // honours it, the process's own cwd is the project, which is exactly how a
+    // client that spawns one agent per workspace already behaves.
+    cwd: acpValues.cwd ?? process.cwd(),
+    version: CLI_VERSION,
+    thinkingLevel,
   });
 }
 

@@ -9,6 +9,38 @@ import {
 } from "../tools/subagent-shared.js";
 import { captureSidecarError, flushSidecarErrors } from "../core/sidecar-error-reporter.js";
 
+const TIMEOUT_RECOVERY_GRACE_MS = 60_000;
+const TIMEOUT_RECOVERY_PROMPT = `Your execution time limit was reached and the active operation was stopped.
+You have one final 60-second recovery turn. Do not call any tools. Immediately return the best concise answer you can from the evidence already in this conversation. Clearly state what remains incomplete or unverified.`;
+
+/** One bounded, tool-free chance to turn the durable transcript into a useful result. */
+export async function recoverTimedOutTurn(
+  activeSession: Pick<AgentSession, "prompt" | "setSignal">,
+  currentOutput: () => string,
+  setController: (controller: AbortController) => void,
+): Promise<boolean> {
+  const recoveryOutputStart = currentOutput().length;
+  const recoveryController = new AbortController();
+  setController(recoveryController);
+  activeSession.setSignal(recoveryController.signal);
+  const recoveryTimer = setTimeout(() => recoveryController.abort(), TIMEOUT_RECOVERY_GRACE_MS);
+  try {
+    await activeSession.prompt(
+      TIMEOUT_RECOVERY_PROMPT,
+      { source: "runtime", kind: "completion_gate", visibility: "hidden" },
+      { disableTools: true },
+    );
+    return (
+      !recoveryController.signal.aborted &&
+      currentOutput().slice(recoveryOutputStart).trim().length > 0
+    );
+  } catch {
+    return false;
+  } finally {
+    clearTimeout(recoveryTimer);
+  }
+}
+
 export interface SubagentWorkerInitialize {
   provider: Provider;
   model: string;
@@ -50,7 +82,10 @@ export async function runSubagentWorkerMode(): Promise<void> {
   let controller = new AbortController();
   let activeTurn: Promise<void> | undefined;
   let turnTimer: ReturnType<typeof setTimeout> | undefined;
+  let abortReason: "timeout" | "interrupt" | "shutdown" | "stdin_closed" | undefined;
   let output = "";
+  let recoveryOutput = "";
+  let recoveringAfterTimeout = false;
   let producedToolCall = false;
 
   const setState = (next: WorkerState, extra: Record<string, unknown> = {}) => {
@@ -72,7 +107,11 @@ export async function runSubagentWorkerMode(): Promise<void> {
       "server_tool_result",
     ] as const;
     activeSession.eventBus.on("text_delta", (payload) => {
-      if (output.length < 200_000) output += payload.text;
+      if (recoveringAfterTimeout) {
+        if (recoveryOutput.length < 200_000) recoveryOutput += payload.text;
+      } else if (output.length < 200_000) {
+        output += payload.text;
+      }
       emit({ type: "event", event: "text_delta", payload });
     });
     for (const event of forwarded) {
@@ -104,18 +143,27 @@ export async function runSubagentWorkerMode(): Promise<void> {
     if (!session) throw new Error("Worker is not initialized");
     if (state === "running") throw new Error("Worker already has an active turn");
     output = "";
+    recoveryOutput = "";
+    recoveringAfterTimeout = false;
     producedToolCall = false;
+    abortReason = undefined;
     controller = new AbortController();
     session.setSignal(controller.signal);
     setState("running");
-    turnTimer = setTimeout(() => controller.abort(), SUB_AGENT_TIMEOUT_MS);
+    turnTimer = setTimeout(() => {
+      abortReason = "timeout";
+      controller.abort();
+    }, SUB_AGENT_TIMEOUT_MS);
     activeTurn = (async () => {
       try {
         await session!.prompt(task);
       } catch (error) {
         const message = errorMessage(error);
         const fallbackModel = initializeOptions?.fallbackModel;
-        if (
+        if (abortReason === "timeout") {
+          // The timed-out turn remains in the durable child transcript. Continue
+          // below with one bounded summary turn using that same context.
+        } else if (
           fallbackModel &&
           !controller.signal.aborted &&
           !output &&
@@ -135,31 +183,72 @@ export async function runSubagentWorkerMode(): Promise<void> {
         }
       }
       clearTimeout(turnTimer);
-      const interrupted = controller.signal.aborted;
-      setState(interrupted ? "interrupted" : "idle");
+
+      let recoveredAfterTimeout = false;
+      if (abortReason === "timeout") {
+        recoveringAfterTimeout = true;
+        try {
+          recoveredAfterTimeout = await recoverTimedOutTurn(
+            session!,
+            () => recoveryOutput,
+            (recoveryController) => {
+              controller = recoveryController;
+            },
+          );
+        } finally {
+          recoveringAfterTimeout = false;
+        }
+        if (recoveryOutput.trim()) {
+          output += `\n\n[Timeout recovery summary]\n${recoveryOutput}`;
+        }
+      }
+
+      const interrupted =
+        controller.signal.aborted || (abortReason !== undefined && abortReason !== "timeout");
+      const timedOut = abortReason === "timeout" && !recoveredAfterTimeout;
+      setState(interrupted && !timedOut ? "interrupted" : "idle");
       emit({
         type: "turn_complete",
-        status: interrupted ? "interrupted" : "completed",
+        status: recoveredAfterTimeout
+          ? "completed"
+          : timedOut
+            ? "failed"
+            : interrupted
+              ? "interrupted"
+              : "completed",
         output: boundSubAgentOutput(output),
-        ...(interrupted ? { error: "Interrupted" } : {}),
+        ...(recoveredAfterTimeout
+          ? { recovered_after_timeout: true }
+          : timedOut
+            ? {
+                error: `Timed out after ${Math.round(SUB_AGENT_TIMEOUT_MS / 60_000)} minutes; recovery summary failed`,
+              }
+            : interrupted
+              ? { error: "Interrupted" }
+              : {}),
         model: initializeOptions?.model,
       });
     })()
       .catch((error: unknown) => {
         clearTimeout(turnTimer);
         const interrupted = controller.signal.aborted;
+        const timedOut = abortReason === "timeout";
         if (!interrupted) {
           captureSidecarError(error, "subagent-worker.turn", {
             provider: initializeOptions?.provider ?? "unknown",
             model: initializeOptions?.model ?? "unknown",
           });
         }
-        setState(interrupted ? "interrupted" : "idle");
+        setState(interrupted && !timedOut ? "interrupted" : "idle");
         emit({
           type: "turn_complete",
-          status: interrupted ? "interrupted" : "failed",
+          status: timedOut ? "failed" : interrupted ? "interrupted" : "failed",
           output: boundSubAgentOutput(output),
-          error: interrupted ? "Interrupted" : errorMessage(error),
+          error: timedOut
+            ? `Timed out after ${Math.round(SUB_AGENT_TIMEOUT_MS / 60_000)} minutes; recovery summary failed`
+            : interrupted
+              ? "Interrupted"
+              : errorMessage(error),
           model: initializeOptions?.model,
         });
       })
@@ -205,10 +294,12 @@ export async function runSubagentWorkerMode(): Promise<void> {
         }
         case "interrupt":
           if (!session || state !== "running") throw new Error("Worker is not running");
+          abortReason = "interrupt";
           controller.abort();
           acknowledge(command.request_id);
           return;
         case "shutdown":
+          abortReason = "shutdown";
           controller.abort();
           await activeTurn?.catch(() => undefined);
           await session?.dispose();
@@ -237,6 +328,7 @@ export async function runSubagentWorkerMode(): Promise<void> {
     void handle(command);
   });
   await new Promise<void>((resolve) => lines.once("close", resolve));
+  abortReason = "stdin_closed";
   controller.abort();
   await activeTurn?.catch(() => undefined);
   await session?.dispose();

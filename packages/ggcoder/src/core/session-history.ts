@@ -1,4 +1,4 @@
-import type { Message } from "@kenkaiiii/gg-ai";
+import type { Message, MessageProvenance } from "@kenkaiiii/gg-ai";
 import type { CompactionAnchorRemap } from "./compaction/compactor.js";
 import type {
   AutopilotMarkerPayload,
@@ -8,6 +8,127 @@ import type {
 import { STEERING_PREFIX, NOTIFICATION_PREFIX } from "./steering.js";
 import { AUTOPILOT_INJECTION_PREAMBLE } from "./autopilot-cycle.js";
 
+export type HistoryMessageVisibility = "transcript" | "hidden" | "summary";
+
+const LEGACY_COMPACTION_SUMMARY_PREFIX = "[Previous conversation summary]";
+const LEGACY_COMPACTION_ACK =
+  "I have the full context from the summary above, including where work left off and the next step.";
+
+function messageText(message: Message): string {
+  if (typeof message.content === "string") return message.content;
+  return message.content
+    .flatMap((part) => ("text" in part && typeof part.text === "string" ? [part.text] : []))
+    .join("\n");
+}
+
+/** Metadata-first transcript visibility with prefix fallback for legacy JSONL. */
+export function getHistoryMessageVisibility(message: Message): HistoryMessageVisibility {
+  if (message.provenance) return message.provenance.visibility;
+  if (message.role === "system") return "hidden";
+
+  const text = messageText(message);
+  if (message.role === "user") {
+    if (text.startsWith(LEGACY_COMPACTION_SUMMARY_PREFIX)) return "summary";
+    if (isNotification(text) || hasAutopilotPreamble(stripSteering(text))) return "hidden";
+  }
+  if (message.role === "assistant" && text.startsWith(LEGACY_COMPACTION_ACK)) return "hidden";
+  return "transcript";
+}
+
+export interface HistoryCheckpoint {
+  header: { id: string; parentSessionId?: string; retainedMessageCount?: number };
+  messages: readonly Message[];
+}
+
+function canonicalHistoryValue(value: unknown): unknown {
+  if (typeof value === "string") return value.replace(/\r\n?/g, "\n").trimEnd();
+  if (Array.isArray(value)) return value.map(canonicalHistoryValue);
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value as Record<string, unknown>)
+        .filter(([, entry]) => entry !== undefined)
+        .sort(([left], [right]) => left.localeCompare(right))
+        .map(([key, entry]) => [key, canonicalHistoryValue(entry)]),
+    );
+  }
+  return value;
+}
+
+/**
+ * Rebuild a display transcript from a contiguous checkpoint chain.
+ *
+ * Compaction writes the retained tail into the child with fresh session-entry
+ * ids. The largest ordered suffix/prefix overlap therefore compares normalized
+ * message role, content, and provenance rather than persistence ids. A child's
+ * summary is omitted only when its direct parent is readable; the oldest loaded
+ * checkpoint keeps its summary as the fallback for a broken chain.
+ */
+export function reconstructCheckpointHistory(checkpoints: readonly HistoryCheckpoint[]): Message[] {
+  const transcript: Message[] = [];
+  const transcriptKeys: string[] = [];
+
+  for (let index = 0; index < checkpoints.length; index += 1) {
+    const checkpoint = checkpoints[index]!;
+    const parent = checkpoints[index - 1];
+    const parentAvailable =
+      parent !== undefined && checkpoint.header.parentSessionId === parent.header.id;
+    const messages = checkpoint.messages.filter((message) => {
+      const visibility = getHistoryMessageVisibility(message);
+      return visibility !== "hidden" && !(visibility === "summary" && parentAvailable);
+    });
+    const keys = messages.map((message) =>
+      JSON.stringify(
+        canonicalHistoryValue({
+          role: message.role,
+          content: message.content,
+          provenance: message.provenance ?? null,
+        }),
+      ),
+    );
+
+    const maximumOverlap = Math.min(
+      transcriptKeys.length,
+      keys.length,
+      checkpoint.header.retainedMessageCount ?? keys.length,
+    );
+    let overlap = maximumOverlap;
+    while (overlap > 0) {
+      const transcriptStart = transcriptKeys.length - overlap;
+      let matches = true;
+      for (let offset = 0; offset < overlap; offset += 1) {
+        if (transcriptKeys[transcriptStart + offset] !== keys[offset]) {
+          matches = false;
+          break;
+        }
+      }
+      if (matches) break;
+      overlap -= 1;
+    }
+
+    transcript.push(...messages.slice(overlap));
+    transcriptKeys.push(...keys.slice(overlap));
+  }
+
+  return transcript;
+}
+
+/** Replay every non-system message and flush anchor work after each one. */
+export async function replayMessagesInOrder(
+  messages: readonly Message[],
+  visitMessage: (message: Message, count: number) => void | Promise<void>,
+  afterMessage: (count: number) => void | Promise<void>,
+): Promise<void> {
+  let count = 0;
+  for (const message of messages) {
+    if (message.role === "system") continue;
+    count += 1;
+    try {
+      await visitMessage(message, count);
+    } finally {
+      await afterMessage(count);
+    }
+  }
+}
 /**
  * Move a transcript anchor (`afterMessageCount`) from the pre-compaction
  * message list onto the compacted one.
@@ -268,32 +389,38 @@ function stripAttachedFilesBlock(text: string): string {
 }
 
 /** Rebuild the live user bubble from a persisted user message's content. */
-export function restoreUserRow(content: Message["content"]): RestoredUserRow {
+export function restoreUserRow(
+  content: Message["content"],
+  provenance?: MessageProvenance,
+): RestoredUserRow {
   if (typeof content === "string") {
     const unsteered = stripSteering(content);
+    const legacy = !provenance;
     return {
-      text: stripAttachedFilesBlock(stripAutopilotPreamble(unsteered)).trim(),
+      text: stripAttachedFilesBlock(legacy ? stripAutopilotPreamble(unsteered) : unsteered).trim(),
       images: [],
       videoWarning: false,
-      autopilotInjected: hasAutopilotPreamble(unsteered),
-      notification: isNotification(content),
+      autopilotInjected:
+        provenance?.kind === "automation" || (legacy && hasAutopilotPreamble(unsteered)),
+      notification: provenance?.kind === "notification" || (legacy && isNotification(content)),
     };
   }
   const images: string[] = [];
   const textParts: string[] = [];
   let videoWarning = false;
-  let autopilotInjected = false;
-  let notification = false;
+  let autopilotInjected = provenance?.kind === "automation";
+  let notification = provenance?.kind === "notification";
+  const legacy = !provenance;
   for (const c of content) {
     if (c.type === "image") {
       images.push(`data:${c.mediaType};base64,${c.data}`);
       continue;
     }
     if (c.type !== "text" || typeof c.text !== "string") continue;
-    if (isNotification(c.text)) notification = true;
+    if (legacy && isNotification(c.text)) notification = true;
     const unsteered = stripSteering(c.text);
-    if (hasAutopilotPreamble(unsteered)) autopilotInjected = true;
-    const stripped = stripAutopilotPreamble(unsteered);
+    if (legacy && hasAutopilotPreamble(unsteered)) autopilotInjected = true;
+    const stripped = legacy ? stripAutopilotPreamble(unsteered) : unsteered;
     if (stripped.startsWith("[User attached a video file")) videoWarning = true;
     if (ATTACHMENT_NOTE_PATTERNS.some((re) => re.test(stripped))) continue;
     const cleaned = stripAttachedFilesBlock(stripped);

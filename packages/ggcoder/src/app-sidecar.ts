@@ -27,7 +27,7 @@ import {
 import type { AddressInfo } from "node:net";
 import { runJsonMode } from "./modes/json-mode.js";
 import { runSubagentWorkerMode } from "./modes/subagent-worker-mode.js";
-import type { Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
+import type { MessageProvenance, Provider, ThinkingLevel } from "@kenkaiiii/gg-ai";
 import { setStreamDiagnostic } from "@kenkaiiii/gg-agent";
 import { AgentSession } from "./core/agent-session.js";
 import { RunLifecycle } from "./core/run-lifecycle.js";
@@ -64,6 +64,8 @@ import {
   normalizeAutopilotMarkersForHistory,
   normalizeAppMarkersForHistory,
   normalizeKenTurnsForHistory,
+  getHistoryMessageVisibility,
+  replayMessagesInOrder,
   restoreUserRow,
   restoreAssistantTexts,
   resolveRestoredCommand,
@@ -175,6 +177,12 @@ import {
   shouldCaptureUsagePollingError,
   wrapSidecarHandler,
 } from "./core/sidecar-error-reporter.js";
+
+const AUTOMATION_PROVENANCE: MessageProvenance = {
+  source: "runtime",
+  kind: "automation",
+  visibility: "hidden",
+};
 
 const ALL_PROVIDERS: Provider[] = [
   // US
@@ -2567,7 +2575,9 @@ async function createSession(
           // label stays the clean prompt.
           const framed = frameAutopilotInjection(IMPLEMENT_PLAN_PROMPT);
           injectedAutopilotPrompts.push(framed);
-          return runAgent(IMPLEMENT_PLAN_PROMPT, () => session.prompt(framed));
+          return runAgent(IMPLEMENT_PLAN_PROMPT, () =>
+            session.prompt(framed, AUTOMATION_PROVENANCE),
+          );
         },
         // Lean context per user turn: wipe prior review history so each new
         // turn starts cheap, while within this cycle the few review messages
@@ -2596,7 +2606,10 @@ async function createSession(
         },
         // Autopilot-injected run: GG Coder receives the framed prompt (no human
         // is watching this turn) while run_start keeps the clean label.
-        runPrompt: (body) => runAgent(body, () => session.prompt(frameAutopilotInjection(body))),
+        runPrompt: (body) =>
+          runAgent(body, () =>
+            session.prompt(frameAutopilotInjection(body), AUTOMATION_PROVENANCE),
+          ),
         emit: (event) => {
           // Persist the terminal verdict marker so a resumed session renders the
           // same Ken bubble the live run showed instead of dropping it or
@@ -2728,7 +2741,9 @@ async function createSession(
     const completionHint =
       `\n\n---\nWhen you have fully completed this task, call the tasks tool to mark it done:\n` +
       `tasks({ action: "done", id: "${shortId}" })`;
-    await runAgent(task.title, () => session.prompt(task.prompt + completionHint));
+    await runAgent(task.title, () =>
+      session.prompt(task.prompt + completionHint, AUTOMATION_PROVENANCE),
+    );
     // The agent typically marks the task done via the tasks tool during the run;
     // prune completed tasks and push the refreshed list so the modal drops them.
     broadcast("tasks_list", { tasks: pruneDoneTasksSync(cwd) });
@@ -3329,172 +3344,178 @@ async function createSession(
         flushAutopilot(0);
         flushAppMarkers(0);
 
-        for (const msg of messages) {
-          if (msg.role === "system") continue;
-          nonSystemCount++;
+        await replayMessagesInOrder(
+          messages,
+          async (msg, count) => {
+            nonSystemCount = count;
+            const visibility = getHistoryMessageVisibility(msg);
+            if (visibility === "hidden") return;
 
-          if (msg.role === "tool") {
-            // Tool result messages: check for ImageContent blocks (screenshots,
-            // generated images) and emit a toolImages entry.
-            for (const tr of msg.content) {
-              if (typeof tr.content === "string") continue;
-              const imageBlocks = tr.content.filter((c) => c.type === "image");
-              if (imageBlocks.length === 0) continue;
-              // Extract the path from the text block (e.g. "Generated image → /path").
-              const textBlock = tr.content.find(
-                (c) => c.type === "text" && "text" in c && typeof c.text === "string",
-              );
-              const textContent = textBlock && textBlock.type === "text" ? textBlock.text : "";
-              const pathMatch = textContent.match(/→\s*(\S+)/);
-              const imgPath = pathMatch?.[1];
+            if (msg.role === "tool") {
+              // Tool result messages: check for ImageContent blocks (screenshots,
+              // generated images) and emit a toolImages entry.
+              for (const tr of msg.content) {
+                if (typeof tr.content === "string") continue;
+                const imageBlocks = tr.content.filter((c) => c.type === "image");
+                if (imageBlocks.length === 0) continue;
+                // Extract the path from the text block (e.g. "Generated image → /path").
+                const textBlock = tr.content.find(
+                  (c) => c.type === "text" && "text" in c && typeof c.text === "string",
+                );
+                const textContent = textBlock && textBlock.type === "text" ? textBlock.text : "";
+                const pathMatch = textContent.match(/→\s*(\S+)/);
+                const imgPath = pathMatch?.[1];
 
-              // Downscale each image for the webview preview.
-              const toolImages: Array<{ src: string; path?: string }> = [];
-              for (const block of imageBlocks) {
-                if (block.type !== "image") continue;
-                try {
-                  const rawBuf = Buffer.from(block.data, "base64");
-                  const previewBuf = await downscaleForPreview(rawBuf);
-                  toolImages.push({
-                    src: `data:${block.mediaType};base64,${previewBuf.toString("base64")}`,
-                    path: imgPath,
-                  });
-                } catch {
-                  // Downscale failed — use the raw data.
-                  toolImages.push({
-                    src: `data:${block.mediaType};base64,${block.data}`,
-                    path: imgPath,
+                // Downscale each image for the webview preview.
+                const toolImages: Array<{ src: string; path?: string }> = [];
+                for (const block of imageBlocks) {
+                  if (block.type !== "image") continue;
+                  try {
+                    const rawBuf = Buffer.from(block.data, "base64");
+                    const previewBuf = await downscaleForPreview(rawBuf);
+                    toolImages.push({
+                      src: `data:${block.mediaType};base64,${previewBuf.toString("base64")}`,
+                      path: imgPath,
+                    });
+                  } catch {
+                    // Downscale failed — use the raw data.
+                    toolImages.push({
+                      src: `data:${block.mediaType};base64,${block.data}`,
+                      path: imgPath,
+                    });
+                  }
+                }
+                if (toolImages.length > 0) {
+                  history.push({
+                    role: "assistant",
+                    text: "",
+                    toolImages,
                   });
                 }
               }
-              if (toolImages.length > 0) {
+              return;
+            }
+
+            // User or assistant message — text/hook/command/compacted extraction,
+            // plus sub-agent group detection for assistant tool_calls.
+            if (msg.role === "user") {
+              // Rebuild the live bubble: strip the steering wrapper, drop
+              // attachment/file notes the model saw but the bubble never showed.
+              const restored = restoreUserRow(msg.content, msg.provenance);
+              const text = restored.text;
+              const hook = msg.provenance ? null : detectHookKind(text);
+              const compacted =
+                visibility === "summary" ||
+                (!msg.provenance && !hook && text.startsWith("[Previous conversation summary]"));
+              const hint = userHintByCount.get(nonSystemCount);
+              // The typed invocation persisted alongside the prompt is
+              // authoritative. Reversing the expanded body only works while the
+              // template is byte-identical, and templates drift (edited
+              // `.gg/commands/*.md`, reworded built-ins, app-vs-CLI phrasing) —
+              // after which the resumed session dumped the raw multi-KB body
+              // instead of the `/name` chip. Older sessions have no hint, so the
+              // body match stays as the fallback.
+              const command =
+                !hook && !compacted
+                  ? resolveRestoredCommand(
+                      typeof hint?.command === "string" ? hint.command : null,
+                      text,
+                      commandCandidates,
+                    )
+                  : null;
+              // Autopilot injected this turn — live showed only the Ken-tinted
+              // marker for it, never a user bubble. Emitting one here would print
+              // the injected instruction a second time, unstyled.
+              //
+              // Pushed background-status updates are skipped for the same reason:
+              // the live run rendered no bubble for them, so showing them here
+              // would fill a reopened session with machine-facing status lines
+              // the user never saw while working.
+              if (
+                (!msg.provenance || (!restored.autopilotInjected && !restored.notification)) &&
+                (text.trim() || restored.images.length > 0)
+              ) {
+                history.push({
+                  role: "user",
+                  text: command ?? text,
+                  images: restored.images,
+                  hook,
+                  command: command !== null,
+                  compacted,
+                  // Markers accumulate across continuation files (each rewrite
+                  // re-persists prior ones) but only the LATEST summary row
+                  // survives compaction — so consume from the newest end.
+                  ...(compacted && compactionCounts.length > 0
+                    ? { compactionCounts: compactionCounts.pop() }
+                    : {}),
+                  ...(hint?.kenSent === true ? { kenSent: true } : {}),
+                  ...(Array.isArray(hint?.enhancements) ? { enhancements: hint.enhancements } : {}),
+                });
+                // Live showed the video-capability warning right after the bubble.
+                if (restored.videoWarning) {
+                  history.push({ role: "assistant", text: "", infoKind: "video_warning" });
+                }
+              }
+            } else if (!hiddenIdealDrafts.has(msg)) {
+              // Assistant: one wire row per persisted text block — live streaming
+              // splits bubbles at server_tool_call boundaries, and the persisted
+              // content keeps those blocks separate. Ideal-review candidate drafts
+              // are intentionally omitted to match the live pre-final hook flow.
+              for (const blockText of restoreAssistantTexts(msg.content)) {
                 history.push({
                   role: "assistant",
-                  text: "",
-                  toolImages,
+                  text: blockText,
+                  images: [],
+                  hook: null,
+                  command: false,
+                  compacted: false,
                 });
               }
             }
-            continue;
-          }
 
-          // User or assistant message — text/hook/command/compacted extraction,
-          // plus sub-agent group detection for assistant tool_calls.
-          if (msg.role === "user") {
-            // Rebuild the live bubble: strip the steering wrapper, drop
-            // attachment/file notes the model saw but the bubble never showed.
-            const restored = restoreUserRow(msg.content);
-            const text = restored.text;
-            const hook = detectHookKind(text);
-            const compacted = !hook && text.startsWith("[Previous conversation summary]");
-            const hint = userHintByCount.get(nonSystemCount);
-            // The typed invocation persisted alongside the prompt is
-            // authoritative. Reversing the expanded body only works while the
-            // template is byte-identical, and templates drift (edited
-            // `.gg/commands/*.md`, reworded built-ins, app-vs-CLI phrasing) —
-            // after which the resumed session dumped the raw multi-KB body
-            // instead of the `/name` chip. Older sessions have no hint, so the
-            // body match stays as the fallback.
-            const command =
-              !hook && !compacted
-                ? resolveRestoredCommand(
-                    typeof hint?.command === "string" ? hint.command : null,
-                    text,
-                    commandCandidates,
-                  )
-                : null;
-            // Autopilot injected this turn — live showed only the Ken-tinted
-            // marker for it, never a user bubble. Emitting one here would print
-            // the injected instruction a second time, unstyled.
-            //
-            // Pushed background-status updates are skipped for the same reason:
-            // the live run rendered no bubble for them, so showing them here
-            // would fill a reopened session with machine-facing status lines
-            // the user never saw while working.
-            if (
-              !restored.autopilotInjected &&
-              !restored.notification &&
-              (text.trim() || restored.images.length > 0)
-            ) {
-              history.push({
-                role: "user",
-                text: command ?? text,
-                images: restored.images,
-                hook,
-                command: command !== null,
-                compacted,
-                // Markers accumulate across continuation files (each rewrite
-                // re-persists prior ones) but only the LATEST summary row
-                // survives compaction — so consume from the newest end.
-                ...(compacted && compactionCounts.length > 0
-                  ? { compactionCounts: compactionCounts.pop() }
-                  : {}),
-                ...(hint?.kenSent === true ? { kenSent: true } : {}),
-                ...(Array.isArray(hint?.enhancements) ? { enhancements: hint.enhancements } : {}),
-              });
-              // Live showed the video-capability warning right after the bubble.
-              if (restored.videoWarning) {
-                history.push({ role: "assistant", text: "", infoKind: "video_warning" });
+            // Assistant tool_call blocks: detect sub-agent delegations.
+            if (msg.role === "assistant" && typeof msg.content !== "string") {
+              const subagentCalls = msg.content.filter(
+                (
+                  c,
+                ): c is typeof c & {
+                  type: "tool_call";
+                  id: string;
+                  name: string;
+                  args: Record<string, unknown>;
+                } => c.type === "tool_call" && (c.name === "subagent" || c.name === "spawn_agent"),
+              );
+              if (subagentCalls.length > 0) {
+                const agents = subagentCalls.map((c) => {
+                  const result = toolResultMap.get(c.id);
+                  return {
+                    agentName:
+                      c.name === "spawn_agent" && typeof c.args?.task_name === "string"
+                        ? c.args.task_name
+                        : typeof c.args?.agent === "string"
+                          ? c.args.agent
+                          : undefined,
+                    // Async workers are intentionally non-resumable; restored rows are historical.
+                    status: result?.isError ? ("error" as const) : ("done" as const),
+                    toolUseCount: 0,
+                  };
+                });
+                history.push({
+                  role: "assistant",
+                  text: "",
+                  subagentGroup: agents,
+                });
               }
             }
-          } else if (!hiddenIdealDrafts.has(msg)) {
-            // Assistant: one wire row per persisted text block — live streaming
-            // splits bubbles at server_tool_call boundaries, and the persisted
-            // content keeps those blocks separate. Ideal-review candidate drafts
-            // are intentionally omitted to match the live pre-final hook flow.
-            for (const blockText of restoreAssistantTexts(msg.content)) {
-              history.push({
-                role: "assistant",
-                text: blockText,
-                images: [],
-                hook: null,
-                command: false,
-                compacted: false,
-              });
-            }
-          }
-
-          // Assistant tool_call blocks: detect sub-agent delegations.
-          if (msg.role === "assistant" && typeof msg.content !== "string") {
-            const subagentCalls = msg.content.filter(
-              (
-                c,
-              ): c is typeof c & {
-                type: "tool_call";
-                id: string;
-                name: string;
-                args: Record<string, unknown>;
-              } => c.type === "tool_call" && (c.name === "subagent" || c.name === "spawn_agent"),
-            );
-            if (subagentCalls.length > 0) {
-              const agents = subagentCalls.map((c) => {
-                const result = toolResultMap.get(c.id);
-                return {
-                  agentName:
-                    c.name === "spawn_agent" && typeof c.args?.task_name === "string"
-                      ? c.args.task_name
-                      : typeof c.args?.agent === "string"
-                        ? c.args.agent
-                        : undefined,
-                  // Async workers are intentionally non-resumable; restored rows are historical.
-                  status: result?.isError ? ("error" as const) : ("done" as const),
-                  toolUseCount: 0,
-                };
-              });
-              history.push({
-                role: "assistant",
-                text: "",
-                subagentGroup: agents,
-              });
-            }
-          }
-
-          // Interleave any Ken turns / autopilot / app markers recorded right
-          // after this message.
-          flushKen(nonSystemCount);
-          flushAutopilot(nonSystemCount);
-          flushAppMarkers(nonSystemCount);
-        }
+          },
+          (count) => {
+            // Markers flush after every physical message, including tools and
+            // provenance-hidden runtime context.
+            flushKen(count);
+            flushAutopilot(count);
+            flushAppMarkers(count);
+          },
+        );
 
         // Flush remaining Ken turns whose anchor is at/after the message count so
         // none are dropped. Autopilot/app markers beyond the restored message

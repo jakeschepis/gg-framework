@@ -1,5 +1,56 @@
 # @kenkaiiii/ggcoder
 
+## 5.31.0
+
+### Minor Changes
+
+- Advertise built-in and project slash commands to ACP clients when sessions open or load.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.31.0
+- @kenkaiiii/gg-agent@5.31.0
+- @kenkaiiii/gg-core@5.31.0
+
+## 5.30.3
+
+### Patch Changes
+
+- Restore complete compacted-session history in ACP clients without duplicate retained messages or internal replay noise.
+  - @kenkaiiii/gg-ai@5.30.3
+  - @kenkaiiii/gg-agent@5.30.3
+  - @kenkaiiii/gg-core@5.30.3
+
+## 5.30.2
+
+### Patch Changes
+
+- Recover useful subagent findings after timeouts and prevent nested delegation from exhausting child turn budgets.
+  - @kenkaiiii/gg-ai@5.30.2
+  - @kenkaiiii/gg-agent@5.30.2
+  - @kenkaiiii/gg-core@5.30.2
+
+## 5.30.1
+
+### Patch Changes
+
+- Keep long autonomous tool runs lean by pruning stale outputs and oversized completed tool arguments.
+  - @kenkaiiii/gg-ai@5.30.1
+  - @kenkaiiii/gg-agent@5.30.1
+  - @kenkaiiii/gg-core@5.30.1
+
+## 5.30.0
+
+### Minor Changes
+
+- Add ACP session controls and make conversation compaction durable across resumes and concurrent processes.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.30.0
+- @kenkaiiii/gg-agent@5.30.0
+- @kenkaiiii/gg-core@5.30.0
+
 ## 5.29.1
 
 ### Patch Changes

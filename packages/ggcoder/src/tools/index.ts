@@ -75,8 +75,8 @@ export interface CreateToolsOptions {
   /** Optional per-model subagent concurrency cap (subagentMaxPerModel). */
   getMaxPerModel?: () => number | undefined;
   onSubAgentState?: (snapshot: SubAgentSnapshot) => void;
-  /** Persistent child workers omit async orchestration to enforce one-level fan-out. */
-  disableAsyncSubagents?: boolean;
+  /** Persistent child workers omit every subagent tool to enforce one-level fan-out. */
+  disableSubagents?: boolean;
   /**
    * Append LSP diagnostics to edit/write results (default true). Servers are
    * resolved from the project/PATH only and spawn lazily on the first edit of
@@ -197,7 +197,13 @@ export async function createTools(
   }
 
   let subAgentManager: SubAgentManager | undefined;
-  if (opts?.agents && opts.agents.length > 0 && opts.provider && opts.model) {
+  if (
+    !opts?.disableSubagents &&
+    opts?.agents &&
+    opts.agents.length > 0 &&
+    opts.provider &&
+    opts.model
+  ) {
     tools.push(
       createSubAgentTool(
         cwd,
@@ -208,21 +214,19 @@ export async function createTools(
         planModeRef,
       ),
     );
-    if (!opts.disableAsyncSubagents) {
-      subAgentManager = new SubAgentManager({
-        cwd,
-        agents: opts.agents,
-        getProvider: () => opts.getProvider?.() ?? opts.provider!,
-        getModel: () => opts.getModel?.() ?? opts.model!,
-        getThinkingLevel: () => opts.getThinkingLevel?.(),
-        getCacheKey: opts.getCacheKey,
-        getBaseUrl: opts.getBaseUrl,
-        getMaxPerModel: () => opts.getMaxPerModel?.(),
-        onState: opts.onSubAgentState,
-        notifications: opts.notifications,
-      });
-      tools.push(...createSubAgentControlTools(subAgentManager, planModeRef));
-    }
+    subAgentManager = new SubAgentManager({
+      cwd,
+      agents: opts.agents,
+      getProvider: () => opts.getProvider?.() ?? opts.provider!,
+      getModel: () => opts.getModel?.() ?? opts.model!,
+      getThinkingLevel: () => opts.getThinkingLevel?.(),
+      getCacheKey: opts.getCacheKey,
+      getBaseUrl: opts.getBaseUrl,
+      getMaxPerModel: () => opts.getMaxPerModel?.(),
+      onState: opts.onSubAgentState,
+      notifications: opts.notifications,
+    });
+    tools.push(...createSubAgentControlTools(subAgentManager, planModeRef));
   }
 
   if (opts?.skills && opts.skills.length > 0) {

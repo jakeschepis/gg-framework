@@ -5,6 +5,8 @@ import {
   findRecentCutPoint,
   prepareMessagesForSummary,
   selectMessagesInBudget,
+  classifyMessagesForSummary,
+  findLatestPreviousSummary,
   buildFallbackSummary,
   extractSummaryText,
   compact,
@@ -434,15 +436,54 @@ describe("selectMessagesInBudget", () => {
     expect(selected.length).toBeLessThan(msgs.length);
   });
 
-  it("walks forward from start", () => {
+  it("pins the earliest request and fills the remaining budget from newest messages", () => {
     const msgs = [
-      makeMessage("user", "first"),
-      makeMessage("assistant", "second"),
-      makeMessage("user", "third"),
+      makeMessage("user", `first ${"a".repeat(2_000)}`),
+      makeMessage("assistant", `old ${"b".repeat(2_000)}`),
+      makeMessage("user", `latest ${"c".repeat(2_000)}`),
     ];
-    const selected = selectMessagesInBudget(msgs, 100_000);
-    expect(selected[0].content as string).toBe("first");
-    expect(selected[2].content as string).toBe("third");
+    const budget = estimateConversationTokens([msgs[0], msgs[2]]);
+    const selected = selectMessagesInBudget(msgs, budget);
+    expect(selected).toEqual([msgs[0], msgs[2]]);
+  });
+});
+
+describe("summary provenance classification", () => {
+  it("anchors the latest previous summary and excludes low-value runtime controls", () => {
+    const previous = {
+      role: "user" as const,
+      content: "[Previous conversation summary]\n\nold memory",
+      provenance: {
+        source: "runtime" as const,
+        kind: "compaction_summary" as const,
+        visibility: "summary" as const,
+      },
+    };
+    const messages: Message[] = [
+      previous,
+      {
+        role: "user",
+        content: "keep this correction",
+        provenance: { source: "human", kind: "steering", visibility: "transcript" },
+      },
+      {
+        role: "user",
+        content: "continue",
+        provenance: { source: "runtime", kind: "continuation", visibility: "hidden" },
+      },
+      {
+        role: "user",
+        content: "model changed",
+        provenance: { source: "runtime", kind: "model_switch", visibility: "hidden" },
+      },
+    ];
+
+    expect(findLatestPreviousSummary(messages)).toEqual({ index: 0, text: "old memory" });
+    const classified = classifyMessagesForSummary(messages);
+    expect(classified.map((message) => message.content)).toEqual([
+      "[Human steering]\nkeep this correction",
+      "[Runtime fact: model_switch]\nmodel changed",
+    ]);
   });
 });
 
@@ -687,6 +728,66 @@ describe("compact", () => {
     expect(summaryMsg.role).toBe("user");
     expect(summaryMsg.content as string).toContain("[Previous conversation summary]");
     expect(summaryMsg.content as string).toContain("great summary");
+    expect(result.result.reductionStatus).toBe("material");
+    expect(result.result.summarizedCount).toBeGreaterThan(0);
+    expect(result.result.retainedCount).toBeGreaterThanOrEqual(0);
+    expect(result.result.tokensAfterEstimate).toBeLessThan(result.result.targetTokens);
+  });
+
+  it("updates an anchored prior summary and preserves the approved plan reference", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockImplementation((request) => {
+      const requestMessages = request.messages as Message[];
+      expect(requestMessages[0].content).toContain("/tmp/approved-plan.md");
+      expect(requestMessages[0].content).toContain("Update the anchored <previous-summary>");
+      expect(requestMessages[1].content).toContain("<previous-summary>\nold durable memory");
+      expect(requestMessages[1].content).toContain("</previous-summary>");
+      expect(
+        requestMessages.filter(
+          (message) =>
+            typeof message.content === "string" && message.content.includes("old durable memory"),
+        ),
+      ).toHaveLength(1);
+      return mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "Updated summary." },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 50 },
+        }),
+      ) as never;
+    });
+
+    const messages = buildConversation(30);
+    messages.splice(1, 0, {
+      role: "user",
+      content: "[Previous conversation summary]\n\nold durable memory",
+      provenance: { source: "runtime", kind: "compaction_summary", visibility: "summary" },
+    });
+    const result = await compact(messages, {
+      ...baseOptions,
+      approvedPlanPath: "/tmp/approved-plan.md",
+    });
+    expect(result.result.compacted).toBe(true);
+  });
+
+  it("rejects a rewrite that cannot land below the configured target", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockReturnValue(
+      mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "Summary." },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 50 },
+        }),
+      ) as never,
+    );
+
+    const messages = buildConversation(30);
+    const result = await compact(messages, { ...baseOptions, targetTokens: 1 });
+    expect(result.result.compacted).toBe(false);
+    expect(result.result.reason).toBe("above_target");
+    expect(result.result.reductionStatus).toBe("above_target");
+    expect(result.messages).toEqual(messages);
   });
 
   it("caps the preserved recent tail at ~8K tokens", async () => {
@@ -733,6 +834,33 @@ describe("compact", () => {
     expect(summaryMsg.content as string).toContain("[Previous conversation summary]");
     expect(summaryMsg.content as string).toContain("## Goal");
     expect(summaryMsg.content as string).toContain("## Progress");
+  });
+
+  it("preserves previous compacted memory in the fallback summary", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockReturnValue(
+      mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "" },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 0 },
+        }),
+      ) as never,
+    );
+
+    const messages = buildConversation(30);
+    messages[1] = {
+      role: "user",
+      content:
+        "[Previous conversation summary]\n\nCritical earlier decision: retain durable lineage.",
+      provenance: { source: "runtime", kind: "compaction_summary", visibility: "summary" },
+    };
+    const result = await compact(messages, baseOptions);
+
+    expect(result.messages[1]?.content as string).toContain(
+      "Critical earlier decision: retain durable lineage.",
+    );
+    expect(result.messages[1]?.content as string).toContain("## Update since the previous summary");
   });
 
   it("uses fallback summary when LLM throws error", async () => {

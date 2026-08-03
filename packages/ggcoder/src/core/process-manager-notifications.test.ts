@@ -54,7 +54,11 @@ async function waitForNotification(
 afterEach(async () => {
   for (const instance of managers.splice(0)) instance.shutdownAll();
   await Promise.all(
-    tempDirs.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })),
+    tempDirs
+      .splice(0)
+      .map((directory) =>
+        fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }),
+      ),
   );
 });
 
@@ -198,7 +202,7 @@ describe("ProcessManager progress notifications", () => {
     );
 
     const spawnedAt = Date.now();
-    const started = await instance.start(`sh ${script}`, cwd);
+    const started = await instance.start("sh server.sh", cwd);
 
     // Consume the boot checkpoint (this one legitimately backs off to 10s).
     const boot = await waitForNotification(queue, (entry) => !entry.terminal);

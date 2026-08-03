@@ -29,6 +29,8 @@ export async function ensureAppDirs(): Promise<AppPaths> {
 export interface SavedSettings {
   provider?: Provider;
   model?: string;
+  autoCompact: boolean;
+  compactThreshold: number;
   thinkingEnabled: boolean;
   thinkingLevel?: ThinkingLevel;
   theme: "auto" | ThemeName;
@@ -70,6 +72,8 @@ function isValidProvider(value: unknown): value is Provider {
 export function loadSavedSettings(settingsFilePath?: string): SavedSettings {
   const filePath = settingsFilePath ?? getAppPaths().settingsFile;
   const result: SavedSettings = {
+    autoCompact: true,
+    compactThreshold: 0.85,
     thinkingEnabled: false,
     theme: "auto",
     idealReviewEnabled: true,
@@ -87,6 +91,15 @@ export function loadSavedSettings(settingsFilePath?: string): SavedSettings {
       // Only honor the saved model when the provider was also accepted —
       // otherwise a model from the removed provider would leak through.
       if (typeof raw.defaultModel === "string") result.model = raw.defaultModel;
+    }
+    if (raw.autoCompact === false) result.autoCompact = false;
+    if (
+      typeof raw.compactThreshold === "number" &&
+      Number.isFinite(raw.compactThreshold) &&
+      raw.compactThreshold >= 0.1 &&
+      raw.compactThreshold <= 1
+    ) {
+      result.compactThreshold = raw.compactThreshold;
     }
     if (raw.thinkingEnabled === true) result.thinkingEnabled = true;
     if (isValidThinkingLevel(raw.thinkingLevel)) result.thinkingLevel = raw.thinkingLevel;

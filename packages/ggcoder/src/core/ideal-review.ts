@@ -102,6 +102,7 @@ export class ReviewCoverageTracker {
 export function buildReviewCoverageMessage(missingFiles: readonly string[]): Message {
   return {
     role: "user",
+    provenance: { source: "runtime", kind: "review_follow_up", visibility: "hidden" },
     content:
       "Ideal review coverage is incomplete. Open every changed file below with the read tool " +
       "before finalizing; model-authored claims do not count as evidence:\n" +
@@ -124,6 +125,7 @@ export const MAX_REVIEW_COVERAGE_INJECTIONS = 2;
 export function buildReviewCoverageEscalationMessage(missingFiles: readonly string[]): Message {
   return {
     role: "user",
+    provenance: { source: "runtime", kind: "review_follow_up", visibility: "hidden" },
     content:
       `Ideal review coverage is still incomplete after ${MAX_REVIEW_COVERAGE_INJECTIONS} attempts. ` +
       "Stop trying to read these files and do not repeat your previous answer:\n" +
@@ -146,6 +148,7 @@ export function withReviewCoverageRequirements(
   const requirement = buildReviewCoverageMessage(missingFiles);
   return {
     role: "user",
+    provenance: message.provenance,
     content: `${String(message.content)}\n\n${String(requirement.content)}`,
   };
 }
@@ -216,6 +219,7 @@ export function buildIdealReviewMessage(
       : "";
   return {
     role: "user",
+    provenance: { source: "runtime", kind: "review_follow_up", visibility: "hidden" },
     content: `${IDEAL_REVIEW_PROMPT}${reasonText}${driftText}`,
   };
 }

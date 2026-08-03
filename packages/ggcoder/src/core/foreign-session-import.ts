@@ -179,7 +179,11 @@ class TranscriptBuilder {
     }
     this.flush();
     if (!this.preview) this.preview = trimmed;
-    this.messages.push({ role: "user", content: trimmed });
+    this.messages.push({
+      role: "user",
+      content: trimmed,
+      provenance: { source: "human", kind: "prompt", visibility: "transcript" },
+    });
   }
 
   pushAssistant(parts: ContentPart[]): void {

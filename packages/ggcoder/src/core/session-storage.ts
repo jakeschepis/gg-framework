@@ -199,12 +199,47 @@ async function syncFile(filePath: string): Promise<void> {
   }
 }
 
+const WINDOWS_REPLACE_RETRY_CODES = new Set(["EACCES", "EBUSY", "EPERM"]);
+
+async function retryWindowsReplace(operation: () => Promise<void>): Promise<void> {
+  const maxAttempts = process.platform === "win32" ? 10 : 1;
+  for (let attempt = 1; attempt <= maxAttempts; attempt++) {
+    try {
+      await operation();
+      return;
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code;
+      if (!code || !WINDOWS_REPLACE_RETRY_CODES.has(code) || attempt === maxAttempts) throw error;
+      await new Promise((resolve) => setTimeout(resolve, attempt * 25));
+    }
+  }
+}
+
+async function replaceFile(tempPath: string, filePath: string): Promise<void> {
+  try {
+    await retryWindowsReplace(() => fs.rename(tempPath, filePath));
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code;
+    if (process.platform !== "win32" || !code || !WINDOWS_REPLACE_RETRY_CODES.has(code)) {
+      throw error;
+    }
+    // Windows cannot atomically replace some existing/open files. Once the
+    // destination lock clears, remove the old copy and install the durable temp.
+    await retryWindowsReplace(async () => {
+      await fs.unlink(filePath).catch((unlinkError: NodeJS.ErrnoException) => {
+        if (unlinkError.code !== "ENOENT") throw unlinkError;
+      });
+    });
+    await retryWindowsReplace(() => fs.rename(tempPath, filePath));
+  }
+}
+
 async function atomicWrite(filePath: string, content: string): Promise<void> {
   const tempPath = temporarySiblingPath(filePath);
   try {
     await fs.writeFile(tempPath, content, { encoding: "utf8", flag: "wx" });
     await syncFile(tempPath);
-    await fs.rename(tempPath, filePath);
+    await replaceFile(tempPath, filePath);
   } finally {
     await fs.unlink(tempPath).catch(() => {});
   }
@@ -287,7 +322,7 @@ export async function thawSessionArchive(filePath: string): Promise<string> {
     if (after.size !== before.size || after.mtimeMs !== before.mtimeMs) {
       throw new Error(`Session archive changed while thawing: ${archivePath}`);
     }
-    await fs.rename(tempPath, plainPath);
+    await replaceFile(tempPath, plainPath);
     await fs.utimes(plainPath, before.atime, before.mtime);
     await writeRedirect(archivePath, plainPath);
     return plainPath;
@@ -623,7 +658,7 @@ export async function archiveColdSession(sessionPath: string): Promise<ArchiveSe
       throw new Error(`Session changed while archiving: ${plainPath}`);
     }
 
-    await fs.rename(gzipTemp, archivePath);
+    await replaceFile(gzipTemp, archivePath);
     await fs.utimes(archivePath, before.atime, before.mtime);
     await writeRedirect(plainPath, archivePath);
     const archiveStat = await fs.stat(archivePath);

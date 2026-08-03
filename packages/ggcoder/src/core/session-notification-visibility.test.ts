@@ -90,3 +90,48 @@ describe("session export", () => {
     expect(markdown).not.toContain("still running after");
   });
 });
+
+describe("provenance-first visibility", () => {
+  const human = { source: "human", kind: "prompt", visibility: "transcript" } as const;
+  const hiddenRuntime = {
+    source: "runtime",
+    kind: "notification",
+    visibility: "hidden",
+  } as const;
+
+  it("trusts metadata over misleading message text for titles and exports", () => {
+    const messages: Message[] = [
+      { role: "user", content: "ordinary-looking generated context", provenance: hiddenRuntime },
+      { role: "user", content: DEV_SERVER_NOTIFICATION, provenance: human },
+    ];
+
+    expect(findUserSessionPrompt(messages)).toBe(DEV_SERVER_NOTIFICATION);
+    const markdown = sessionToMarkdown(
+      { mode: "code", cwd: "/tmp/project", provider: "anthropic", model: "claude-test" },
+      messages,
+    );
+    expect(markdown).not.toContain("ordinary-looking generated context");
+    expect(markdown).toContain(DEV_SERVER_NOTIFICATION);
+  });
+
+  it("renders tagged summaries as compaction markers without exporting their payload", () => {
+    const markdown = sessionToMarkdown(
+      { mode: "code", cwd: "/tmp/project", provider: "anthropic", model: "claude-test" },
+      [
+        {
+          role: "user",
+          content: "summary payload without a legacy prefix",
+          provenance: {
+            source: "runtime",
+            kind: "compaction_summary",
+            visibility: "summary",
+          },
+        },
+      ],
+    );
+
+    expect(markdown).toContain("conversation compacted here");
+    expect(markdown).not.toContain("summary payload without a legacy prefix");
+    expect(markdown).not.toContain("no messages yet");
+  });
+});

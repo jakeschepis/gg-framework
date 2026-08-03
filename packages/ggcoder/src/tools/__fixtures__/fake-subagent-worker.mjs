@@ -1,3 +1,4 @@
+import path from "node:path";
 import { createInterface } from "node:readline";
 
 let running = false;
@@ -27,7 +28,13 @@ createInterface({ input: process.stdin }).on("line", (line) => {
     else if (frame.options?.systemPrompt === "hang") return;
     else {
       emit({ type: "state", state: "idle" });
-      ack(frame);
+      const childSessionPath =
+        frame.options?.childSessionPath ??
+        path.join(frame.options?.sessionRootDir ?? process.cwd(), `fake-${process.pid}.jsonl`);
+      ack(frame, {
+        child_session_id: path.basename(childSessionPath, ".jsonl"),
+        child_session_path: childSessionPath,
+      });
     }
     return;
   }

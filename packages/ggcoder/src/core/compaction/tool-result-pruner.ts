@@ -1,26 +1,33 @@
-import type { Message, ToolResult } from "@kenkaiiii/gg-ai";
+import type { ContentPart, Message, ToolResult } from "@kenkaiiii/gg-ai";
+import { compactHistoricalToolCallArgs } from "./compactor.js";
 import { estimateTokens } from "./token-estimator.js";
 
 /**
- * Cheap context pruning for stale tool outputs (opencode-style, no LLM call).
+ * Cheap context pruning for stale tool payloads (opencode-style, no LLM call).
  *
- * Two signals, one pass:
+ * Three signals, one pass:
  * 1. Superseded reads — an old `read` of a file that was re-read later carries
  *    zero information; the newest read wins.
  * 2. Old tool-output overflow — walking backwards, the most recent
- *    `protectTokens` worth of tool output (plus everything in the last
- *    `protectTurns` user turns) is kept verbatim; anything older is stubbed.
+ *    `protectTokens` worth of tool output plus the last `protectToolBatches`
+ *    provider tool batches are kept verbatim; anything older is stubbed.
+ * 3. Large completed tool arguments — old write/edit payloads are capped once
+ *    their result has returned; the files and tool result are the durable truth.
+ *
+ * Tool batches—not human turns—are the protection boundary. Autonomous research
+ * can execute dozens of provider/tool cycles for one user prompt; protecting the
+ * whole human turn lets reproducible reads refill the context immediately after
+ * compaction.
  *
  * Cache stability: pruning mutates history, which invalidates the provider's
- * prompt-cache prefix once. To avoid churning the cache every turn, nothing is
- * pruned unless at least `minimumTokens` would be freed in one batch — so
- * prunes are rare, large, and the stubbed prefix is stable afterwards.
- * Stubs are idempotent (marked with a prefix) and never re-pruned.
+ * prompt-cache prefix. To limit churn, nothing is pruned unless at least
+ * `minimumTokens` would be freed in one batch. Stubs and compacted arguments are
+ * idempotent, so later passes leave the rewritten prefix stable.
  */
 
 export const PRUNE_PROTECT_TOKENS = 40_000;
 export const PRUNE_MINIMUM_TOKENS = 20_000;
-export const PRUNE_PROTECT_TURNS = 2;
+export const PRUNE_PROTECT_TOOL_BATCHES = 2;
 
 const PRUNE_MARKER = "[Pruned:";
 
@@ -29,20 +36,28 @@ export interface PruneOptions {
   protectTokens?: number;
   /** Minimum freed tokens required to apply a prune batch. Default 20k. */
   minimumTokens?: number;
-  /** Number of most-recent user turns whose tool outputs are never pruned. Default 2. */
-  protectTurns?: number;
+  /** Number of most-recent provider tool batches never pruned. Default 2. */
+  protectToolBatches?: number;
 }
 
 export interface PruneResult {
   pruned: boolean;
   prunedResults: number;
+  compactedToolCalls: number;
   freedTokens: number;
 }
 
-interface Candidate {
+interface ResultCandidate {
   result: ToolResult;
   freedTokens: number;
   stub: string;
+}
+
+interface ToolArgCandidate {
+  message: Message;
+  content: Message["content"];
+  compactedToolCalls: number;
+  freedTokens: number;
 }
 
 /** Mutates `messages` in place; message/array identity is preserved so usage
@@ -50,7 +65,7 @@ interface Candidate {
 export function pruneStaleToolResults(messages: Message[], opts: PruneOptions = {}): PruneResult {
   const protectTokens = opts.protectTokens ?? PRUNE_PROTECT_TOKENS;
   const minimumTokens = opts.minimumTokens ?? PRUNE_MINIMUM_TOKENS;
-  const protectTurns = opts.protectTurns ?? PRUNE_PROTECT_TURNS;
+  const protectToolBatches = opts.protectToolBatches ?? PRUNE_PROTECT_TOOL_BATCHES;
 
   // toolCallId → tool name + args (for read-dedup path identification).
   const callInfo = new Map<string, { name: string; args: Record<string, unknown> }>();
@@ -64,18 +79,21 @@ export function pruneStaleToolResults(messages: Message[], opts: PruneOptions = 
   }
 
   const seenReadPaths = new Set<string>();
-  const candidates: Candidate[] = [];
-  let userTurns = 0;
+  const resultCandidates: ResultCandidate[] = [];
+  const toolBatchByCallId = new Map<string, number>();
+  let recentToolBatches = 0;
   let recentToolTokens = 0;
 
   for (let msgIndex = messages.length - 1; msgIndex >= 0; msgIndex--) {
     const msg = messages[msgIndex];
-    if (msg.role === "user") userTurns++;
     if (msg.role !== "tool" || !Array.isArray(msg.content)) continue;
-
+    recentToolBatches++;
+    const protectedBatch = recentToolBatches <= protectToolBatches;
     for (let partIndex = msg.content.length - 1; partIndex >= 0; partIndex--) {
       const result = msg.content[partIndex];
-      if (result.type !== "tool_result" || typeof result.content !== "string") continue;
+      if (result.type !== "tool_result") continue;
+      toolBatchByCallId.set(result.toolCallId, recentToolBatches);
+      if (typeof result.content !== "string") continue;
       if (result.content.startsWith(PRUNE_MARKER)) continue;
 
       const info = callInfo.get(result.toolCallId);
@@ -90,14 +108,13 @@ export function pruneStaleToolResults(messages: Message[], opts: PruneOptions = 
         readPath !== undefined
           ? `${readPath}#${String(info?.args.offset ?? "")}:${String(info?.args.limit ?? "")}`
           : undefined;
-      const protectedTurn = userTurns < protectTurns;
 
       // Newest read of each path+range wins — remember it even inside the
       // protect zone so an older duplicate outside the zone still counts as
       // superseded.
       if (readKey !== undefined) {
-        if (seenReadPaths.has(readKey) && !protectedTurn) {
-          candidates.push({
+        if (seenReadPaths.has(readKey) && !protectedBatch) {
+          resultCandidates.push({
             result,
             freedTokens: estimateTokens(result.content),
             stub: `${PRUNE_MARKER} this read of ${readPath} was superseded by a newer read later in the conversation.]`,
@@ -107,13 +124,13 @@ export function pruneStaleToolResults(messages: Message[], opts: PruneOptions = 
         seenReadPaths.add(readKey);
       }
 
-      if (protectedTurn) continue;
+      if (protectedBatch) continue;
 
       const resultTokens = estimateTokens(result.content);
       recentToolTokens += resultTokens;
       if (recentToolTokens <= protectTokens) continue;
 
-      candidates.push({
+      resultCandidates.push({
         result,
         freedTokens: resultTokens,
         stub:
@@ -123,13 +140,59 @@ export function pruneStaleToolResults(messages: Message[], opts: PruneOptions = 
     }
   }
 
-  const freedTokens = candidates.reduce((sum, candidate) => sum + candidate.freedTokens, 0);
-  if (freedTokens < minimumTokens) {
-    return { pruned: false, prunedResults: 0, freedTokens: 0 };
+  // Completed write/edit-style calls can carry entire files in their arguments.
+  // Once outside the protected batches, cap those payloads before they alone can
+  // trigger an LLM compaction. Unresolved calls are deliberately left untouched.
+  const toolArgCandidates: ToolArgCandidate[] = [];
+  for (const message of messages) {
+    if (message.role !== "assistant" || !Array.isArray(message.content)) continue;
+    const compactedMessage = compactHistoricalToolCallArgs([message], (toolCallId) => {
+      const batch = toolBatchByCallId.get(toolCallId);
+      return batch !== undefined && batch > protectToolBatches;
+    })[0];
+    if (compactedMessage === message) continue;
+
+    const originalContent = message.content as ContentPart[];
+    const compactedContent = compactedMessage.content as ContentPart[];
+    const originalTokens = estimateTokens(JSON.stringify(originalContent));
+    const compactedTokens = estimateTokens(JSON.stringify(compactedContent));
+    const compactedToolCalls = compactedContent.filter(
+      (part, index) => part !== originalContent[index],
+    ).length;
+    toolArgCandidates.push({
+      message,
+      content: compactedMessage.content,
+      compactedToolCalls,
+      freedTokens: Math.max(0, originalTokens - compactedTokens),
+    });
   }
 
-  for (const candidate of candidates) {
+  const freedTokens = [...resultCandidates, ...toolArgCandidates].reduce(
+    (sum, candidate) => sum + candidate.freedTokens,
+    0,
+  );
+  if (freedTokens < minimumTokens) {
+    return {
+      pruned: false,
+      prunedResults: 0,
+      compactedToolCalls: 0,
+      freedTokens: 0,
+    };
+  }
+
+  for (const candidate of resultCandidates) {
     candidate.result.content = candidate.stub;
   }
-  return { pruned: true, prunedResults: candidates.length, freedTokens };
+  for (const candidate of toolArgCandidates) {
+    candidate.message.content = candidate.content;
+  }
+  return {
+    pruned: true,
+    prunedResults: resultCandidates.length,
+    compactedToolCalls: toolArgCandidates.reduce(
+      (sum, candidate) => sum + candidate.compactedToolCalls,
+      0,
+    ),
+    freedTokens,
+  };
 }

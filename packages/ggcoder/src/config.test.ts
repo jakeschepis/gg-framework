@@ -24,10 +24,12 @@ afterEach(() => {
 });
 
 describe("loadSavedSettings", () => {
-  it("defaults ideal review to enabled", () => {
+  it("defaults ideal review and shared compaction policy", () => {
     const settings = loadSavedSettings(tempSettingsPath());
 
     expect(settings.idealReviewEnabled).toBe(true);
+    expect(settings.autoCompact).toBe(true);
+    expect(settings.compactThreshold).toBe(0.85);
   });
 
   it("honors an explicit ideal review disable", () => {
@@ -37,6 +39,19 @@ describe("loadSavedSettings", () => {
     const settings = loadSavedSettings(settingsPath);
 
     expect(settings.idealReviewEnabled).toBe(false);
+  });
+
+  it("loads the configured compaction policy used by CLI resume", () => {
+    const settingsPath = tempSettingsPath();
+    fs.writeFileSync(
+      settingsPath,
+      JSON.stringify({ autoCompact: false, compactThreshold: 0.72 }),
+      "utf-8",
+    );
+
+    const settings = loadSavedSettings(settingsPath);
+    expect(settings.autoCompact).toBe(false);
+    expect(settings.compactThreshold).toBe(0.72);
   });
 
   it("accepts xai as a saved provider", () => {

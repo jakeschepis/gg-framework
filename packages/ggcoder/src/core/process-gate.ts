@@ -89,5 +89,13 @@ export function buildProcessCompletionFollowUp(
 ): Message[] | null {
   if (injected >= MAX_PROCESS_GATE_INJECTIONS) return null;
   const message = buildProcessCompletionGateMessage(procs, runStartedAt);
-  return message ? [{ role: "user", content: message }] : null;
+  return message
+    ? [
+        {
+          role: "user",
+          content: message,
+          provenance: { source: "runtime", kind: "completion_gate", visibility: "hidden" },
+        },
+      ]
+    : null;
 }

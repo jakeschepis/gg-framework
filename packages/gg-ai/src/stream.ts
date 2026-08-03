@@ -194,12 +194,26 @@ export function stream(options: StreamOptions): StreamResult {
   if (options.supportsVideo !== true && messagesContainVideo(options.messages)) {
     throw new VideoUnsupportedError();
   }
+  const wireMessages = stripMessageProvenance(options.messages);
   const messages = clampProviderContextImages(
-    options.messages,
+    wireMessages,
     options.provider,
     options.supportsImages,
   );
   return entry.stream(messages === options.messages ? options : { ...options, messages });
+}
+
+/** Clone provenance-bearing messages and remove internal metadata at the provider boundary. */
+function stripMessageProvenance(messages: Message[]): Message[] {
+  let stripped: Message[] | undefined;
+  for (let index = 0; index < messages.length; index++) {
+    const message = messages[index]!;
+    if (!message.provenance) continue;
+    stripped ??= messages.slice();
+    const { provenance: _provenance, ...wireMessage } = message;
+    stripped[index] = wireMessage as Message;
+  }
+  return stripped ?? messages;
 }
 
 /** True if any message carries a video block, in user content or a tool result. */

@@ -124,7 +124,15 @@ export function buildSubAgentCompletionFollowUp(
   manager: Pick<SubAgentManager, "completionGateMessage"> | undefined,
 ): Message[] | null {
   const message = manager?.completionGateMessage();
-  return message ? [{ role: "user", content: message }] : null;
+  return message
+    ? [
+        {
+          role: "user",
+          content: message,
+          provenance: { source: "runtime", kind: "completion_gate", visibility: "hidden" },
+        },
+      ]
+    : null;
 }
 
 export class SubAgentManager {

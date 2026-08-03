@@ -160,10 +160,21 @@ beforeEach(async () => {
 
 afterEach(async () => {
   for (const stream of openStreams.splice(0)) stream.destroy();
-  daemon?.kill("SIGKILL");
+  const runningDaemon = daemon;
   daemon = undefined;
-  await fs.rm(tmpHome, { recursive: true, force: true });
-  await fs.rm(tmpProject, { recursive: true, force: true });
+  if (runningDaemon && runningDaemon.exitCode === null && runningDaemon.signalCode === null) {
+    await new Promise<void>((resolve) => {
+      const timer = setTimeout(resolve, 10_000);
+      runningDaemon.once("close", () => {
+        clearTimeout(timer);
+        resolve();
+      });
+      runningDaemon.kill("SIGKILL");
+    });
+  }
+  const removeOptions = { recursive: true, force: true, maxRetries: 10, retryDelay: 100 };
+  await fs.rm(tmpHome, removeOptions);
+  await fs.rm(tmpProject, removeOptions);
 });
 
 describe("connecting a provider", () => {

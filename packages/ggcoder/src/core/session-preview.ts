@@ -1,4 +1,4 @@
-import type { Message } from "@kenkaiiii/gg-ai";
+import type { Message, MessageProvenance } from "@kenkaiiii/gg-ai";
 import { NOTIFICATION_PREFIX } from "./steering.js";
 
 const COMPACTION_SUMMARY_PREFIX = "[Previous conversation summary]";
@@ -27,13 +27,18 @@ export function extractSessionText(content: Message["content"] | unknown): strin
  * replace the user's title — a session called "Background process c1c45a8d
  * (pnpm dev) exited with code 0" is unfindable.
  */
-export function getUserSessionPrompt(content: Message["content"] | unknown): string | null {
+export function getUserSessionPrompt(
+  content: Message["content"] | unknown,
+  provenance?: MessageProvenance,
+): string | null {
+  if (provenance && provenance.source !== "human") return null;
   let text = extractSessionText(content).trim();
   if (!text) return null;
   if (
-    text.startsWith(COMPACTION_SUMMARY_PREFIX) ||
-    text.startsWith(AUTOPILOT_PROMPT_PREFIX) ||
-    text.startsWith(NOTIFICATION_PREFIX)
+    !provenance &&
+    (text.startsWith(COMPACTION_SUMMARY_PREFIX) ||
+      text.startsWith(AUTOPILOT_PROMPT_PREFIX) ||
+      text.startsWith(NOTIFICATION_PREFIX))
   ) {
     return null;
   }
@@ -49,7 +54,7 @@ export function getUserSessionPrompt(content: Message["content"] | unknown): str
 export function findUserSessionPrompt(messages: readonly Message[]): string {
   for (const message of messages) {
     if (message.role !== "user") continue;
-    const text = getUserSessionPrompt(message.content);
+    const text = getUserSessionPrompt(message.content, message.provenance);
     if (text) return text;
   }
   return "";

@@ -138,15 +138,27 @@ const COMPACTION_USER_PROMPT =
   "Summarize the conversation above following the section structure in your instructions. " +
   "Output only the summary, nothing else.";
 
+export type CompactionReductionStatus =
+  | "material"
+  | "insufficient_reduction"
+  | "above_target"
+  | "not_attempted";
+
 export interface CompactionResult {
-  /** Whether messages were actually reduced. */
+  /** Whether messages were actually reduced below the configured trigger target. */
   compacted: boolean;
   /** Why compaction was skipped (only set when compacted is false). */
   reason?: string;
   originalCount: number;
   newCount: number;
+  /** Number of non-system source messages folded into the summary. */
+  summarizedCount: number;
+  /** Number of original messages retained verbatim after the summary block. */
+  retainedCount: number;
   tokensBeforeEstimate: number;
   tokensAfterEstimate: number;
+  targetTokens: number;
+  reductionStatus: CompactionReductionStatus;
   /** How the collapse shifted message positions, so callers can move transcript
    *  anchors (Ken turns, autopilot verdicts, app markers) onto the rewritten
    *  message list instead of leaving them pointing at pre-compaction indices.
@@ -296,6 +308,11 @@ export const HISTORICAL_TOOL_ARG_MAX_CHARS = 8_000;
 
 function compactHistoricalToolArg(value: unknown): { value: unknown; changed: boolean } {
   if (typeof value === "string") {
+    // Already-compacted arguments can survive several later compactions. Do not
+    // shave another chunk off the retained prefix on every pass.
+    if (/\n\n\[\.\.\. \d+ more characters truncated\]$/.test(value)) {
+      return { value, changed: false };
+    }
     const compacted = truncateString(value, HISTORICAL_TOOL_ARG_MAX_CHARS);
     return { value: compacted, changed: compacted !== value };
   }
@@ -323,16 +340,20 @@ function compactHistoricalToolArg(value: unknown): { value: unknown; changed: bo
 }
 
 /**
- * Clone recent assistant tool-call messages and cap large historical arguments.
+ * Clone assistant tool-call messages and cap large completed arguments.
  * IDs, tool names, and short arguments remain byte-for-byte unchanged.
+ * `shouldCompact` lets the live pruner preserve the newest provider batches.
  */
-export function compactHistoricalToolCallArgs(messages: Message[]): Message[] {
+export function compactHistoricalToolCallArgs(
+  messages: Message[],
+  shouldCompact: (toolCallId: string) => boolean = () => true,
+): Message[] {
   return messages.map((message) => {
     if (message.role !== "assistant" || !Array.isArray(message.content)) return message;
 
     let messageChanged = false;
     const content = (message.content as ContentPart[]).map((part): ContentPart => {
-      if (part.type !== "tool_call") return part;
+      if (part.type !== "tool_call" || !shouldCompact(part.id)) return part;
 
       const toolCall = part as ContentPart & {
         type: "tool_call";
@@ -500,14 +521,6 @@ function messageToString(msg: Message): string {
 }
 
 /**
- * Check whether a message is an assistant message that contains tool_call blocks.
- */
-function hasToolCalls(msg: Message): boolean {
-  if (msg.role !== "assistant" || !Array.isArray(msg.content)) return false;
-  return (msg.content as ContentPart[]).some((p) => p.type === "tool_call");
-}
-
-/**
  * Collect all tool_call IDs from an assistant message.
  */
 function getToolCallIds(msg: Message): Set<string> {
@@ -592,31 +605,111 @@ function repairToolPairing(msgs: Message[]): void {
   }
 }
 
+/** A previous compaction summary, separated from fresh conversation evidence. */
+interface PreviousSummary {
+  index: number;
+  text: string;
+}
+
+const LEGACY_SUMMARY_PREFIX = "[Previous conversation summary]";
+const OMITTED_RUNTIME_KINDS = new Set([
+  "completion_gate",
+  "review_follow_up",
+  "continuation",
+  "compaction_ack",
+]);
+
+function summaryTextFromMessage(message: Message): string | undefined {
+  if (message.role !== "user" || typeof message.content !== "string") return undefined;
+  if (message.provenance?.kind === "compaction_summary") {
+    return message.content.replace(/^\[Previous conversation summary\]\s*/u, "");
+  }
+  if (!message.provenance && message.content.startsWith(LEGACY_SUMMARY_PREFIX)) {
+    return message.content.slice(LEGACY_SUMMARY_PREFIX.length).trimStart();
+  }
+  return undefined;
+}
+
+export function findLatestPreviousSummary(messages: Message[]): PreviousSummary | undefined {
+  for (let index = messages.length - 1; index >= 0; index--) {
+    const text = summaryTextFromMessage(messages[index]);
+    if (text !== undefined) return { index, text };
+  }
+  return undefined;
+}
+
 /**
- * Select messages that fit within a token budget for the summary LLM call.
- * Walks forward from the start, accumulating messages until the budget is
- * exceeded. Ensures tool_use / tool_result pairs are never split: if the last
- * selected message is an assistant with tool_call blocks, it is removed so the
- * API never sees an orphaned tool_use without a matching tool_result.
+ * Convert provenance into explicit summarizer attribution and remove low-value
+ * runtime control traffic. Legacy messages remain available for old sessions.
+ */
+export function classifyMessagesForSummary(messages: Message[]): Message[] {
+  const classified: Message[] = [];
+  for (const message of messages) {
+    const provenance = message.provenance;
+    if (provenance?.source === "runtime" && OMITTED_RUNTIME_KINDS.has(provenance.kind)) continue;
+    if (summaryTextFromMessage(message) !== undefined) continue;
+
+    const prepared = prepareMessagesForSummary([message]);
+    for (const converted of prepared) {
+      if (converted.role === "system") continue;
+      const content = messageToString(converted);
+      if (!content) continue;
+
+      if (provenance?.source === "human") {
+        const attribution = provenance.kind === "steering" ? "Human steering" : "Human prompt";
+        classified.push({ role: "user", content: `[${attribution}]\n${content}` });
+      } else if (provenance?.source === "runtime") {
+        classified.push({
+          role: "user",
+          content: `[Runtime fact: ${provenance.kind}]\n${content}`,
+        });
+      } else {
+        classified.push({
+          role: converted.role === "assistant" ? "assistant" : "user",
+          content,
+        });
+      }
+    }
+  }
+  return classified;
+}
+
+function isHumanRequest(message: Message): boolean {
+  if (message.role !== "user") return false;
+  if (message.provenance) return message.provenance.source === "human";
+  if (typeof message.content === "string" && message.content.startsWith("[Runtime fact:"))
+    return false;
+  return summaryTextFromMessage(message) === undefined;
+}
+
+/**
+ * Select whole summarizer units by pinning prior memory (or the earliest human
+ * request), then spending the remaining budget from newest to oldest.
  */
 export function selectMessagesInBudget(msgs: Message[], tokenBudget: number): Message[] {
+  if (msgs.length === 0 || tokenBudget <= 0) return [];
+  const previousSummary = findLatestPreviousSummary(msgs);
+  const pinIndex = previousSummary?.index ?? msgs.findIndex(isHumanRequest);
+  const selected = new Set<number>();
   let accumulated = 0;
-  const selected: Message[] = [];
 
-  for (const msg of msgs) {
-    const tokens = estimateMessageTokens(msg);
-    if (accumulated + tokens > tokenBudget) break;
+  if (pinIndex >= 0) {
+    const pinTokens = estimateMessageTokens(msgs[pinIndex]);
+    if (pinTokens <= tokenBudget) {
+      selected.add(pinIndex);
+      accumulated += pinTokens;
+    }
+  }
+
+  for (let index = msgs.length - 1; index >= 0; index--) {
+    if (selected.has(index)) continue;
+    const tokens = estimateMessageTokens(msgs[index]);
+    if (accumulated + tokens > tokenBudget) continue;
+    selected.add(index);
     accumulated += tokens;
-    selected.push(msg);
   }
 
-  // Drop trailing assistant messages that have tool_call blocks without
-  // their corresponding tool_result (which was cut by the budget).
-  while (selected.length > 0 && hasToolCalls(selected[selected.length - 1])) {
-    selected.pop();
-  }
-
-  return selected;
+  return msgs.filter((_message, index) => selected.has(index));
 }
 
 /**
@@ -671,13 +764,16 @@ export function extractSummaryText(content: string | ContentPart[]): string {
     .join("");
 }
 
-/**
- * Budget of recent tokens to keep un-summarized (~8K tokens).
- * Aligned with opencode's post-compaction preserved tail — the pruner protects
- * recency between compactions, so rebuilding a fat tail right after paying for
- * a summary wastes the savings.
- */
+/** Budget of recent tokens initially kept verbatim after the summary. */
 const KEEP_RECENT_TOKENS = 8_000;
+const MIN_MATERIAL_REDUCTION_RATIO = 0.05;
+const MIN_MATERIAL_REDUCTION_TOKENS = 256;
+
+function hasMaterialReduction(before: number, after: number): boolean {
+  return (
+    before - after >= Math.max(MIN_MATERIAL_REDUCTION_TOKENS, before * MIN_MATERIAL_REDUCTION_RATIO)
+  );
+}
 
 /**
  * Compact a conversation by summarizing older messages via LLM.
@@ -705,18 +801,22 @@ export async function compact(
     projectId?: string;
     baseUrl?: string;
     contextWindow: number;
+    /** The active-context trigger this rewrite must land below. */
+    targetTokens?: number;
     signal?: AbortSignal;
     approvedPlanPath?: string;
   },
 ): Promise<{ messages: Message[]; result: CompactionResult }> {
   const originalCount = messages.length;
   const tokensBeforeEstimate = estimateConversationTokens(messages);
+  const targetTokens = Math.max(1, Math.ceil(options.targetTokens ?? options.contextWindow * 0.85));
   options.signal?.throwIfAborted();
 
   log("INFO", "compaction", `Starting compaction`, {
     messageCount: String(originalCount),
     estimatedTokens: String(tokensBeforeEstimate),
     contextWindow: String(options.contextWindow),
+    targetTokens: String(targetTokens),
   });
 
   // Find the cut point — keep ~8K tokens of recent conversation. Completed
@@ -751,14 +851,20 @@ export async function compact(
         reason: "too_few_messages",
         originalCount,
         newCount: messages.length,
+        summarizedCount: 0,
+        retainedCount: Math.max(0, messages.length - 1),
         tokensBeforeEstimate,
         tokensAfterEstimate: tokensBeforeEstimate,
+        targetTokens,
+        reductionStatus: "not_attempted",
       },
     };
   }
 
-  // Track file operations from the messages being summarized
-  const fileOps = extractFileOperations(middleMessages);
+  // Summarize the full non-system history. The retained tail may be tightened
+  // after generation, so every message that could be removed must be represented.
+  const summarizationSource = messages.slice(1);
+  const fileOps = extractFileOperations(summarizationSource);
 
   // Build file tracking section
   let fileTrackingSection = "";
@@ -780,38 +886,54 @@ export async function compact(
     accountId: options.accountId,
   });
 
-  // Prepare messages: truncate tool results, strip thinking blocks
-  const preparedMessages = prepareMessagesForSummary(middleMessages);
+  const previousSummary = findLatestPreviousSummary(summarizationSource);
+  const classifiedMessages = classifyMessagesForSummary(summarizationSource);
 
-  // Budget: summary model context - output tokens - system/user prompt overhead (~1K)
+  // Budget: summary model context - output tokens - system/user prompt overhead (~1K).
+  // Prior compacted memory is pinned separately, never presented as a fresh human turn.
   const promptOverhead = 1000;
   const tokenBudget = summaryContextWindow - MAX_SUMMARY_OUTPUT_TOKENS - promptOverhead;
-  const selectedMessages = selectMessagesInBudget(preparedMessages, tokenBudget);
+  const previousSummaryMessage: Message | undefined = previousSummary
+    ? {
+        role: "user",
+        content: `<previous-summary>\n${truncateString(previousSummary.text, USER_MSG_MAX_CHARS)}\n</previous-summary>`,
+      }
+    : undefined;
+  const previousSummaryTokens = previousSummaryMessage
+    ? estimateMessageTokens(previousSummaryMessage)
+    : 0;
+  const selectedMessages = selectMessagesInBudget(
+    classifiedMessages,
+    Math.max(0, tokenBudget - previousSummaryTokens),
+  );
 
   log("INFO", "compaction", `Summarizing ${middleMessages.length} messages`, {
     summaryModel: summaryModel.id,
     summaryContextWindow: String(summaryContextWindow),
     tokenBudget: String(tokenBudget),
-    preparedMessages: String(preparedMessages.length),
-    selectedMessages: String(selectedMessages.length),
-    droppedMessages: String(preparedMessages.length - selectedMessages.length),
+    preparedMessages: String(classifiedMessages.length),
+    selectedMessages: String(selectedMessages.length + (previousSummaryMessage ? 1 : 0)),
+    droppedMessages: String(classifiedMessages.length - selectedMessages.length),
+    previousSummary: String(!!previousSummaryMessage),
     filesRead: String(fileOps.read.size),
     filesModified: String(fileOps.modified.size),
     recentKept: String(recentMessages.length),
   });
 
-  // Build the summary messages array following the Nao pattern:
-  // [system, ...actual conversation messages, user prompt to summarize]
-  // Add plan preservation instruction if an approved plan is active
+  // Add plan preservation and summary-update instructions when applicable.
   const planPreservation = options.approvedPlanPath
     ? `\n\n### APPROVED PLAN PRESERVATION\n` +
       `An approved implementation plan exists at: ${options.approvedPlanPath}\n` +
       `You MUST preserve all references to this plan and its approval status in the summary. ` +
       `The agent is following this plan for implementation — do not lose this context.`
     : "";
+  const updateInstruction = previousSummaryMessage
+    ? "\n\nUpdate the anchored <previous-summary> with the newer evidence. Do not treat it as a new human request."
+    : "";
 
   const summaryMessages: Message[] = [
-    { role: "system", content: COMPACTION_SYSTEM_PROMPT + planPreservation },
+    { role: "system", content: COMPACTION_SYSTEM_PROMPT + planPreservation + updateInstruction },
+    ...(previousSummaryMessage ? [previousSummaryMessage] : []),
     ...selectedMessages,
     { role: "user", content: COMPACTION_USER_PROMPT },
   ];
@@ -909,87 +1031,162 @@ export async function compact(
     }
   }
 
-  // Fallback: build an extractive summary from message metadata
+  // Fallback: preserve prior compacted memory and append a fresh extractive update.
   if (summaryText.length === 0) {
     log("WARN", "compaction", `All summary attempts failed — using fallback extractive summary`);
-    summaryText = buildFallbackSummary(middleMessages, fileOps);
+    const fallbackUpdate = buildFallbackSummary(
+      classifyMessagesForSummary(summarizationSource),
+      fileOps,
+    );
+    summaryText = previousSummary
+      ? `${previousSummary.text}\n\n## Update since the previous summary\n${fallbackUpdate}`
+      : fallbackUpdate;
   }
 
-  // Build new messages array
-  const summaryMessage: Message = {
+  const summaryPayload = `${summaryText}${fileTrackingSection}`;
+  const makeSummaryMessage = (payload: string): Message => ({
     role: "user",
-    content: `[Previous conversation summary]\n\n${summaryText}${fileTrackingSection}`,
+    content: `[Previous conversation summary]\n\n${payload}`,
+    provenance: { source: "runtime", kind: "compaction_summary", visibility: "summary" },
+  });
+
+  const acknowledgement: Message = {
+    role: "assistant",
+    content:
+      "I have the full context from the summary above, including where work left off and the next step. I'll continue the task from there.",
+    provenance: { source: "runtime", kind: "compaction_ack", visibility: "hidden" },
   };
 
-  // Skip the assistant ack when recentMessages starts with an assistant message
-  // to prevent consecutive assistant messages that the Anthropic API rejects.
-  // This happens when findRecentCutPoint backs up from a tool to an assistant.
-  const skipAck = recentMessages.length > 0 && recentMessages[0].role === "assistant";
-
-  const newMessages: Message[] = [
-    systemMessage,
-    summaryMessage,
-    ...(skipAck
-      ? []
-      : [
-          {
-            role: "assistant" as const,
-            content:
-              "I have the full context from the summary above, including where work left off and the next step. I'll continue the task from there.",
-          },
-        ]),
-    ...recentMessages,
-  ];
-
-  // Repair tool_use / tool_result pairing in the final message array.
-  // Despite cut-point logic, edge cases (e.g., the trailing-assistant pop
-  // below, or future code paths) could leave orphaned blocks.
-  repairToolPairing(newMessages);
-
-  // Ensure the conversation doesn't end with an assistant message.
-  // Some models reject "assistant prefill" — the conversation must end
-  // with a user (or tool) message so the LLM can generate a fresh response.
-  // Never pop below the base messages (system + summary [+ ack]) — removing
-  // those would leave only the summary, causing `ggcoder continue`
-  // to restore just 1 message instead of the full session.
-  const minMessages = skipAck ? 2 : 3;
-  while (
-    newMessages.length > minMessages &&
-    newMessages[newMessages.length - 1].role === "assistant"
-  ) {
-    newMessages.pop();
+  interface Candidate {
+    messages: Message[];
+    tailStart: number;
+    skipAck: boolean;
+    tokens: number;
   }
 
-  const tokensAfterEstimate = estimateConversationTokens(newMessages);
-  const reduction = Math.round((1 - tokensAfterEstimate / tokensBeforeEstimate) * 100);
+  const buildCandidate = (tailStart: number, payload = summaryPayload): Candidate => {
+    const tail = compactHistoricalToolCallArgs(messages.slice(tailStart));
+    const skipAck = tail.length === 0 || tail[0].role === "assistant";
+    const candidateMessages: Message[] = [
+      systemMessage,
+      makeSummaryMessage(payload),
+      ...(skipAck ? [] : [acknowledgement]),
+      ...tail,
+    ];
+    repairToolPairing(candidateMessages);
 
-  // Everything before the retained tail collapsed into the summary (+ ack).
-  // Callers use this to move transcript anchors onto the new indices; without
-  // it, restored Ken bubbles / autopilot verdicts / error rows keep their
-  // pre-compaction positions and land far below where they happened.
-  //
-  // newNonSystemCount is measured AFTER repairToolPairing and the
-  // trailing-assistant pop above, both of which can drop messages from the
-  // retained tail. Deriving the new length from summarizedCount alone would
-  // overshoot by exactly those messages and push tail anchors past the end —
-  // reintroducing the dropped/bottom-clamped markers this remap exists to fix.
+    const minMessages = skipAck ? 2 : 3;
+    while (
+      candidateMessages.length > minMessages &&
+      candidateMessages[candidateMessages.length - 1].role === "assistant"
+    ) {
+      candidateMessages.pop();
+    }
+    return {
+      messages: candidateMessages,
+      tailStart,
+      skipAck,
+      tokens: estimateConversationTokens(candidateMessages),
+    };
+  };
+
+  // Tighten the verbatim tail progressively until the rewrite lands below the
+  // same trigger that initiated compaction. Atomic tool groups remain whole.
+  const tailStarts = [KEEP_RECENT_TOKENS, 4_000, 2_000, 1_000]
+    .map((budget) => findRecentCutPoint(messages, budget))
+    .filter((start, index, starts) => starts.indexOf(start) === index);
+  tailStarts.push(messages.length); // summary-only fallback
+
+  let candidate: Candidate | undefined;
+  let smallestCandidate: Candidate | undefined;
+  for (const tailStart of tailStarts) {
+    const attempt = buildCandidate(tailStart);
+    if (!smallestCandidate || attempt.tokens < smallestCandidate.tokens)
+      smallestCandidate = attempt;
+    if (
+      attempt.tokens < targetTokens &&
+      hasMaterialReduction(tokensBeforeEstimate, attempt.tokens)
+    ) {
+      candidate = attempt;
+      break;
+    }
+  }
+
+  // Bound an unexpectedly verbose generated summary only when summary-only
+  // context still misses the target. The system message is never truncated.
+  if (!candidate) {
+    const systemTokens = estimateMessageTokens(systemMessage);
+    const summaryTokenAllowance = Math.max(0, targetTokens - systemTokens - 16);
+    const summaryCharAllowance = Math.floor(summaryTokenAllowance * 3.5);
+    if (summaryCharAllowance > 0 && summaryPayload.length > summaryCharAllowance) {
+      const bounded = buildCandidate(
+        messages.length,
+        truncateString(summaryPayload, summaryCharAllowance),
+      );
+      if (!smallestCandidate || bounded.tokens < smallestCandidate.tokens)
+        smallestCandidate = bounded;
+      if (
+        bounded.tokens < targetTokens &&
+        hasMaterialReduction(tokensBeforeEstimate, bounded.tokens)
+      ) {
+        candidate = bounded;
+      }
+    }
+  }
+
+  if (!candidate) {
+    const tokensAfterEstimate = smallestCandidate?.tokens ?? tokensBeforeEstimate;
+    const reductionStatus: CompactionReductionStatus =
+      tokensAfterEstimate >= targetTokens ? "above_target" : "insufficient_reduction";
+    log("WARN", "compaction", "Compaction rejected", {
+      tokensBefore: String(tokensBeforeEstimate),
+      tokensAfter: String(tokensAfterEstimate),
+      targetTokens: String(targetTokens),
+      reductionStatus,
+    });
+    return {
+      messages: [...messages],
+      result: {
+        compacted: false,
+        reason: reductionStatus,
+        originalCount,
+        newCount: messages.length,
+        summarizedCount: 0,
+        retainedCount: Math.max(0, messages.length - 1),
+        tokensBeforeEstimate,
+        tokensAfterEstimate,
+        targetTokens,
+        reductionStatus,
+      },
+    };
+  }
+
+  const newMessages = candidate.messages;
+  const tokensAfterEstimate = candidate.tokens;
+  const summarizedCount = messages
+    .slice(0, candidate.tailStart)
+    .filter((message) => message.role !== "system").length;
+  const prefixCount = candidate.skipAck ? 1 : 2;
+  const newNonSystemCount = newMessages.filter((message) => message.role !== "system").length;
+  // Count the final repaired tail, not the pre-repair source slice: pairing
+  // repair and trailing-assistant removal can shorten what was actually copied.
+  const retainedCount = Math.max(0, newNonSystemCount - prefixCount);
+  const reduction = Math.round((1 - tokensAfterEstimate / tokensBeforeEstimate) * 100);
   const anchorRemap: CompactionAnchorRemap = {
-    summarizedCount: messages.slice(0, recentStart).filter((m) => m.role !== "system").length,
-    prefixCount: skipAck ? 1 : 2,
-    newNonSystemCount: newMessages.filter((m) => m.role !== "system").length,
+    summarizedCount,
+    prefixCount,
+    newNonSystemCount,
   };
 
   log("INFO", "compaction", `Compaction complete`, {
     originalMessages: String(originalCount),
     newMessages: String(newMessages.length),
+    summarizedCount: String(summarizedCount),
+    retainedCount: String(retainedCount),
     tokensBefore: String(tokensBeforeEstimate),
     tokensAfter: String(tokensAfterEstimate),
+    targetTokens: String(targetTokens),
     reduction: `${reduction}%`,
-    newMessageRoles: newMessages.map((m) => m.role).join(","),
-    summaryMessagePreview:
-      typeof summaryMessage.content === "string"
-        ? summaryMessage.content.slice(0, 300)
-        : "(non-string)",
   });
 
   return {
@@ -998,8 +1195,12 @@ export async function compact(
       compacted: true,
       originalCount,
       newCount: newMessages.length,
+      summarizedCount,
+      retainedCount,
       tokensBeforeEstimate,
       tokensAfterEstimate,
+      targetTokens,
+      reductionStatus: "material",
       anchorRemap,
     },
   };

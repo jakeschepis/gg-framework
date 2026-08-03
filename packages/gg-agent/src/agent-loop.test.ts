@@ -1220,7 +1220,10 @@ describe("agentLoop", () => {
     const partialIdx = texts.findIndex((t) => t === partial);
     expect(partialIdx).toBeGreaterThan(-1);
     expect(messages[partialIdx].role).toBe("assistant");
-    expect(messages[partialIdx + 1].role).toBe("user");
+    expect(messages[partialIdx + 1]).toMatchObject({
+      role: "user",
+      provenance: { source: "runtime", kind: "continuation", visibility: "hidden" },
+    });
     expect(texts[partialIdx + 1]).toContain("cut off");
     expect(texts.some((t) => t === "and the second half.")).toBe(true);
   }, 30_000);
@@ -1801,7 +1804,9 @@ describe("agentLoop turn budget extension", () => {
     const continuation = messages.find(
       (m) => m.role === "user" && typeof m.content === "string" && m.content.includes("turn limit"),
     );
-    expect(continuation).toBeDefined();
+    expect(continuation).toMatchObject({
+      provenance: { source: "runtime", kind: "continuation", visibility: "hidden" },
+    });
     // The original request is already in `messages`; echoing it back would be
     // paid-for duplication of tokens the model can already see.
     expect(continuation!.content).not.toContain("do the long thing");
@@ -1946,7 +1951,9 @@ describe("agentLoop truncation handling", () => {
         typeof m.content === "string" &&
         m.content.includes("output-token limit"),
     );
-    expect(continuation).toBeDefined();
+    expect(continuation).toMatchObject({
+      provenance: { source: "runtime", kind: "continuation", visibility: "hidden" },
+    });
     // Both parts are preserved in history — no replay.
     const assistantTexts = messages
       .filter((m) => m.role === "assistant")

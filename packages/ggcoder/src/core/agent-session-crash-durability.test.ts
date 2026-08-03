@@ -94,10 +94,16 @@ describe("session durability across a mid-run crash", () => {
     const run = await runFixture();
 
     // The process must have been killed, not exited cleanly — otherwise the
-    // post-loop flush ran and this proves nothing.
+    // post-loop flush ran and this proves nothing. Windows reports forced
+    // termination as a non-zero exit code rather than a POSIX signal.
     expect(run.stdout, run.stderr).toContain("CRASHING");
     expect(run.stdout).not.toContain("NO_CRASH");
-    expect(run.signal).toBe("SIGKILL");
+    if (process.platform === "win32") {
+      expect(run.signal).toBeNull();
+      expect(run.code).not.toBe(0);
+    } else {
+      expect(run.signal).toBe("SIGKILL");
+    }
 
     const sessionPath = /^SESSION (.+)$/m.exec(run.stdout)?.[1];
     expect(sessionPath, run.stdout).toBeTruthy();

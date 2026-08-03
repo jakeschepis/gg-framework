@@ -63,7 +63,11 @@ afterEach(async () => {
   await Promise.all(activeManagers.map((instance) => instance.shutdownAll()));
   await Promise.all(activeManagers.map((instance) => instance.waitForPersistence()));
   await Promise.all(
-    tempDirs.splice(0).map((directory) => fs.rm(directory, { recursive: true, force: true })),
+    tempDirs
+      .splice(0)
+      .map((directory) =>
+        fs.rm(directory, { recursive: true, force: true, maxRetries: 10, retryDelay: 100 }),
+      ),
   );
 });
 
@@ -238,13 +242,41 @@ describe("SubAgentManager", () => {
     expect(instance.completionGate().unresolved).toBe(0);
   });
 
-  it("reaps idle workers and retains a bounded closed snapshot", async () => {
-    const instance = manager({ idleTimeoutMs: 5 });
+  it("reaps idle workers and resumes them from the durable child session", async () => {
+    const root = await tempDir();
+    const cwd = path.join(root, "project");
+    const sessionRootDir = path.join(root, "sessions");
+    await fs.mkdir(cwd, { recursive: true });
+    const instance = manager({
+      idleTimeoutMs: 5,
+      cwd,
+      sessionRootDir,
+      store: new SubAgentStore(path.join(root, "state")),
+    });
     const child = await instance.spawn("short", "fast", "fake");
-    await instance.wait([child.agent_id], "all", 500);
-    await new Promise((resolve) => setTimeout(resolve, 30));
-    expect(instance.list().find((item) => item.agent_id === child.agent_id)?.state).toBe("closed");
-    await expect(instance.followup(child.agent_id, "late")).rejects.toThrow("reaped");
+    const completed = await instance.wait([child.agent_id], "all", 500);
+    const childSessionPath = completed.agents[0]?.child_session_path;
+    expect(childSessionPath?.startsWith(sessionRootDir)).toBe(true);
+    await vi.waitFor(
+      () =>
+        expect(instance.list().find((item) => item.agent_id === child.agent_id)?.state).toBe(
+          "closed",
+        ),
+      { timeout: 2_000 },
+    );
+
+    const requestSpy = vi.spyOn(
+      instance as unknown as { request: (...args: unknown[]) => Promise<Record<string, unknown>> },
+      "request",
+    );
+    await instance.followup(child.agent_id, "late");
+    const initialize = requestSpy.mock.calls.find(([, command]) => command === "initialize");
+    expect(initialize?.[2]).toMatchObject({
+      options: { childSessionPath },
+    });
+    const resumed = await instance.wait([child.agent_id], "all", 500);
+    expect(resumed.agents[0]).toMatchObject({ state: "completed", collected: true });
+    expect(resumed.agents[0]?.output).toContain("late");
   });
 
   it("fails closed until active and terminal child results are collected", async () => {

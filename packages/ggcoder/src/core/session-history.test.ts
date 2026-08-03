@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest";
+import type { Message } from "@kenkaiiii/gg-ai";
 import type {
   AutopilotMarkerPayload,
   AppMarkerPayload,
@@ -10,11 +11,93 @@ import {
   normalizeAutopilotMarkersForHistory,
   normalizeAppMarkersForHistory,
   normalizeKenTurnsForHistory,
+  reconstructCheckpointHistory,
+  replayMessagesInOrder,
   restoreUserRow,
   restoreAssistantTexts,
   detectPromptCommand,
   resolveRestoredCommand,
 } from "./session-history.js";
+
+describe("reconstructCheckpointHistory", () => {
+  const summary = (text: string): Message => ({
+    role: "user",
+    content: `[Previous conversation summary]\n\n${text}`,
+    provenance: { source: "runtime", kind: "compaction_summary", visibility: "summary" },
+  });
+  const acknowledgement: Message = {
+    role: "assistant",
+    content:
+      "I have the full context from the summary above, including where work left off and the next step.",
+    provenance: { source: "runtime", kind: "compaction_ack", visibility: "hidden" },
+  };
+  const original: Message[] = [
+    { role: "user", content: "original question" },
+    { role: "assistant", content: "original answer" },
+    { role: "user", content: "retained question" },
+    { role: "assistant", content: "retained answer" },
+  ];
+  const afterFirst: Message[] = [
+    { role: "user", content: "after first compaction" },
+    { role: "assistant", content: "first follow-up answer" },
+  ];
+  const afterSecond: Message[] = [
+    { role: "user", content: "after second compaction" },
+    { role: "assistant", content: "second follow-up answer" },
+  ];
+
+  it("replays three generations chronologically without retained tails or summaries duplicated", () => {
+    const restored = reconstructCheckpointHistory([
+      { header: { id: "original" }, messages: original },
+      {
+        header: { id: "first", parentSessionId: "original" },
+        messages: [summary("first summary"), acknowledgement, ...original.slice(2), ...afterFirst],
+      },
+      {
+        header: { id: "second", parentSessionId: "first" },
+        messages: [summary("second summary"), acknowledgement, ...afterFirst, ...afterSecond],
+      },
+    ]);
+
+    expect(restored).toEqual([...original, ...afterFirst, ...afterSecond]);
+    for (const message of [...original.slice(2), ...afterFirst, ...afterSecond]) {
+      expect(restored.filter((candidate) => candidate.content === message.content)).toHaveLength(1);
+    }
+    expect(restored.some((message) => String(message.content).includes("summary"))).toBe(false);
+  });
+
+  it("keeps the oldest readable checkpoint summary when its parent is unavailable", () => {
+    const fallback = summary("recoverable context");
+    const restored = reconstructCheckpointHistory([
+      {
+        header: { id: "first", parentSessionId: "missing" },
+        messages: [fallback, acknowledgement, ...afterFirst],
+      },
+      {
+        header: { id: "second", parentSessionId: "first" },
+        messages: [summary("replacement"), acknowledgement, ...afterFirst, ...afterSecond],
+      },
+    ]);
+
+    expect(restored).toEqual([fallback, ...afterFirst, ...afterSecond]);
+  });
+
+  it("never consumes repeated messages appended after the retained-tail boundary", () => {
+    const repeated: Message[] = [
+      { role: "user", content: "repeat me" },
+      { role: "assistant", content: "same answer" },
+    ];
+    const restored = reconstructCheckpointHistory([
+      { header: { id: "original" }, messages: [...repeated, ...repeated] },
+      {
+        header: { id: "child", parentSessionId: "original", retainedMessageCount: 2 },
+        messages: [summary("replacement"), acknowledgement, ...repeated, ...repeated],
+      },
+    ]);
+
+    expect(restored).toEqual([...repeated, ...repeated, ...repeated]);
+  });
+});
 
 describe("normalizeAutopilotMarkersForHistory", () => {
   it("drops out-of-range compacted-session markers and dedupes exact all-clear rows", () => {
@@ -221,5 +304,35 @@ describe("restoreAssistantTexts", () => {
   it("passes plain string content through as one bubble", () => {
     expect(restoreAssistantTexts("hello")).toEqual(["hello"]);
     expect(restoreAssistantTexts("  ")).toEqual([]);
+  });
+});
+
+describe("replayMessagesInOrder", () => {
+  it("flushes an anchored marker immediately after a tool result", async () => {
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: [{ type: "tool_call", id: "t1", name: "read", args: {} }],
+      },
+      {
+        role: "tool",
+        content: [{ type: "tool_result", toolCallId: "t1", content: "result" }],
+      },
+      { role: "assistant", content: "after tool" },
+    ];
+    const replayed: string[] = [];
+
+    await replayMessagesInOrder(
+      messages,
+      (message) => {
+        replayed.push(message.role === "assistant" ? "assistant" : "tool");
+        if (message.role === "tool") return;
+      },
+      (count) => {
+        if (count === 2) replayed.push("error-marker");
+      },
+    );
+
+    expect(replayed).toEqual(["assistant", "tool", "error-marker", "assistant"]);
   });
 });

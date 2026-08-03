@@ -9,6 +9,7 @@ import {
 import {
   ProviderError,
   type Message,
+  type MessageProvenance,
   type Provider,
   type Usage,
   type ThinkingLevel,
@@ -46,8 +47,18 @@ import {
 } from "./session-manager.js";
 import { ExtensionLoader } from "./extensions/loader.js";
 import type { ExtensionContext } from "./extensions/types.js";
-import { shouldCompact, compact, type CompactionAnchorRemap } from "./compaction/compactor.js";
-import { remapAnchorForCompaction, stripRecordedPosition } from "./session-history.js";
+import {
+  shouldCompact,
+  compact,
+  type CompactionAnchorRemap,
+  type CompactionResult,
+} from "./compaction/compactor.js";
+import {
+  getHistoryMessageVisibility,
+  remapAnchorForCompaction,
+  stripRecordedPosition,
+} from "./session-history.js";
+import { sourceFingerprint as computeSourceFingerprint } from "./session-compaction.js";
 import {
   getAuthStorageKeys,
   getContextWindow,
@@ -83,6 +94,7 @@ import { createToolSearchTool } from "../tools/tool-search.js";
 import { log } from "./logger.js";
 import { setEstimatorModel, calibrateEstimatorFromUsage } from "./compaction/token-estimator.js";
 import { calculateActiveContextTokens } from "./compaction/active-context.js";
+import { resolveCompactionPolicy } from "./compaction/policy.js";
 import { pruneStaleToolResults } from "./compaction/tool-result-pruner.js";
 import { discoverAgents } from "./agents.js";
 import { enhancePrompt, type EnhanceResult } from "../utils/prompt-enhancer.js";
@@ -391,6 +403,8 @@ export class AgentSession {
   private compactionOccurred = false;
   private lastCompactionCompacted = false;
   private compactionRetryAfter = 0;
+  /** A restored oversized checkpoint must be canonicalized before its first prompt is persisted. */
+  private deferredCompactionPending = false;
   /** Latest provider count, anchored to the assistant response it measured. */
   private providerContext: { usage: Usage; anchor: Message } | null = null;
   private originalRequest = "";
@@ -449,6 +463,7 @@ export class AgentSession {
   private additionalRoots: string[] = [];
 
   private sessionId = "";
+  private checkpointGeneration = 0;
   /** Stable identity shared by compaction and approved-plan checkpoint files. */
   private conversationId = "";
   /** Original user-authored prompt, retained when internal messages replace history. */
@@ -596,7 +611,10 @@ export class AgentSession {
       getBaseUrl: () => this.baseUrl,
       getCacheKey: () => this.getPromptCacheKey(),
       getMaxPerModel: () => this.settingsManager.get("subagentMaxPerModel"),
-      disableAsyncSubagents: this.opts.subagentWorker,
+      // A persistent child is already the single allowed fan-out level. Blocking
+      // `subagent` here created a timeout sandwich: the nested call could consume
+      // the child's entire 10-minute turn budget, discarding all nested results.
+      disableSubagents: this.opts.subagentWorker,
       onSubAgentState: (snapshot) => this.eventBus.emit("subagent_state", snapshot),
       notifications: this.notifications,
       // Plan mode: only wired when the host supplies callbacks. The ref is
@@ -1039,16 +1057,24 @@ export class AgentSession {
   /**
    * Process user input. Handles slash commands or runs agent loop.
    */
-  async prompt(content: string): Promise<void> {
+  async prompt(
+    content: string,
+    provenance: MessageProvenance = {
+      source: "human",
+      kind: "prompt",
+      visibility: "transcript",
+    },
+    options: { disableTools?: boolean } = {},
+  ): Promise<void> {
+    await this.adoptDeferredCheckpointBeforePrompt();
     const slash = await this.resolveSlashInput(content);
     if (slash?.kind === "template") {
-      // Inject the prompt-template command as a user message to the agent, then
-      // run as a normal prompt (push message + agent loop).
-      const userMessage: Message = { role: "user", content: slash.fullPrompt };
+      // Prompt templates remain human-originated: the user invoked the command.
+      const userMessage: Message = { role: "user", content: slash.fullPrompt, provenance };
       this.messages.push(userMessage);
       await this.persistMessage(userMessage);
       this.lastPersistedIndex = this.messages.length;
-      await this.runLoop();
+      await this.runLoop(options);
       return;
     }
     if (slash?.kind === "command") {
@@ -1061,12 +1087,12 @@ export class AgentSession {
     }
 
     // Push user message
-    const userMessage: Message = { role: "user", content };
+    const userMessage: Message = { role: "user", content, provenance };
     this.messages.push(userMessage);
     await this.persistMessage(userMessage);
     this.lastPersistedIndex = this.messages.length;
 
-    await this.runLoop();
+    await this.runLoop(options);
   }
 
   /**
@@ -1077,9 +1103,14 @@ export class AgentSession {
    * attachments are always a direct conversational turn.
    */
   async promptWithAttachments(text: string, attachments: SessionAttachment[]): Promise<void> {
+    await this.adoptDeferredCheckpointBeforePrompt();
     const parts = this.buildAttachmentParts(text, attachments);
     if (parts.length === 0) return;
-    const userMessage: Message = { role: "user", content: parts };
+    const userMessage: Message = {
+      role: "user",
+      content: parts,
+      provenance: { source: "human", kind: "prompt", visibility: "transcript" },
+    };
     this.messages.push(userMessage);
     await this.persistMessage(userMessage);
     this.lastPersistedIndex = this.messages.length;
@@ -1290,6 +1321,7 @@ export class AgentSession {
         ? {
             role: "user",
             content: buildNotificationSteeringText(notified.map((entry) => entry.text)),
+            provenance: { source: "runtime", kind: "notification", visibility: "hidden" },
           }
         : null;
     if (notificationMessage) {
@@ -1314,8 +1346,13 @@ export class AgentSession {
       // (not merged): each persists as its own user message, so a resumed
       // session shows the same number of bubbles the live run did.
       const steeringMessages = queued.map((m): Message => {
+        const provenance: MessageProvenance = {
+          source: "human",
+          kind: "steering",
+          visibility: "transcript",
+        };
         if (m.attachments.length === 0) {
-          return { role: "user", content: wrapSteeringText(m.text) };
+          return { role: "user", content: wrapSteeringText(m.text), provenance };
         }
         // Queued attachments ride the same native-block path as a non-queued
         // attachment prompt, prefixed with the steering framing.
@@ -1323,7 +1360,7 @@ export class AgentSession {
           { type: "text", text: STEERING_PREFIX },
           ...this.buildAttachmentParts(m.text, m.attachments),
         ];
-        return { role: "user", content: parts };
+        return { role: "user", content: parts, provenance };
       });
       return notificationMessage ? [...steeringMessages, notificationMessage] : steeringMessages;
     }
@@ -1530,11 +1567,15 @@ export class AgentSession {
         : []),
       "Do not describe those files as compiler-clean without other evidence.",
     ];
-    return { role: "user", content: `${String(message.content)}\n\n${notes.join(" ")}` };
+    return {
+      role: "user",
+      provenance: message.provenance,
+      content: `${String(message.content)}\n\n${notes.join(" ")}`,
+    };
   }
 
   /** Auto-compact if needed, run agent loop with auth retry, and persist messages. */
-  private async runLoop(): Promise<void> {
+  private async runLoop(options: { disableTools?: boolean } = {}): Promise<void> {
     this.refreshSystemPromptTail();
     // One-shot cache-key marker per session so turn_end cacheRead numbers
     // in the log can be traced back to a specific routing namespace —
@@ -1574,7 +1615,14 @@ export class AgentSession {
         provider: this.provider,
         accountId: creds.accountId,
       });
-      const threshold = this.settingsManager.get("compactThreshold");
+      const policy = resolveCompactionPolicy({
+        provider: this.provider,
+        model: this.model,
+        contextWindow,
+        threshold: this.settingsManager.get("compactThreshold"),
+        accountId: creds.accountId,
+        approvedPlanPath: this.approvedPlanPath,
+      });
       let activeTokens: number | undefined;
       if (this.providerContext) {
         const anchorIndex = this.messages.lastIndexOf(this.providerContext.anchor);
@@ -1587,9 +1635,17 @@ export class AgentSession {
           this.providerContext = null;
         }
       }
-      if (shouldCompact(this.messages, contextWindow, threshold, activeTokens)) {
+      log("INFO", "compaction", "Pre-run compaction decision", {
+        provider: this.provider,
+        model: this.model,
+        transport: this.provider === "openai" && creds.accountId ? "codex_oauth" : "public_api",
+        contextWindow: String(contextWindow),
+        activeTokens: activeTokens === undefined ? "estimated" : String(activeTokens),
+        triggerLimit: String(policy.targetTokens),
+      });
+      if (shouldCompact(this.messages, contextWindow, policy.threshold, activeTokens)) {
         try {
-          await this.compact(creds);
+          await this.compact(creds, "automatic");
           if (this.lastCompactionCompacted) {
             // Re-grounding hook keys off this — the context was just summarized.
             this.compactionOccurred = true;
@@ -1621,8 +1677,8 @@ export class AgentSession {
       const generator = agentLoop(loopMessages, {
         provider: this.provider,
         model: this.model,
-        tools: this.tools,
-        webSearch: true,
+        tools: options.disableTools ? [] : this.tools,
+        webSearch: !options.disableTools,
         maxTokens: this.maxTokens,
         maxTurns: this.opts.maxTurns,
         maxTurnExtensions: this.opts.maxTurnExtensions,
@@ -1687,6 +1743,7 @@ export class AgentSession {
               this.providerContext = null;
               log("INFO", "compaction", "Pruned stale tool outputs", {
                 prunedResults: String(pruneResult.prunedResults),
+                compactedToolCalls: String(pruneResult.compactedToolCalls),
                 freedTokens: String(pruneResult.freedTokens),
               });
             }
@@ -1712,12 +1769,28 @@ export class AgentSession {
               provider: this.provider,
               accountId,
             });
-            const threshold = this.settingsManager.get("compactThreshold");
+            const policy = resolveCompactionPolicy({
+              provider: this.provider,
+              model: this.model,
+              contextWindow,
+              threshold: this.settingsManager.get("compactThreshold"),
+              accountId,
+              approvedPlanPath: this.approvedPlanPath,
+            });
             const activeTokens = calculateActiveContextTokens(messages, {
               usage,
               pendingMessages,
             });
-            if (!shouldCompact(messages, contextWindow, threshold, activeTokens)) return messages;
+            log("INFO", "compaction", "In-flight compaction decision", {
+              provider: this.provider,
+              model: this.model,
+              transport: this.provider === "openai" && accountId ? "codex_oauth" : "public_api",
+              contextWindow: String(contextWindow),
+              activeTokens: String(activeTokens),
+              triggerLimit: String(policy.targetTokens),
+            });
+            if (!shouldCompact(messages, contextWindow, policy.threshold, activeTokens))
+              return messages;
           }
 
           // compact() operates on this.messages, while an earlier transform may
@@ -1725,12 +1798,15 @@ export class AgentSession {
           // so the current tool results are included in the summary.
           this.messages = messages;
           try {
-            await this.compact({
-              accessToken: apiKey,
-              accountId,
-              projectId,
-              baseUrl: effectiveBaseUrl,
-            });
+            await this.compact(
+              {
+                accessToken: apiKey,
+                accountId,
+                projectId,
+                baseUrl: effectiveBaseUrl,
+              },
+              force ? "forced" : "automatic",
+            );
           } catch (error) {
             this.messages = messages;
             this.compactionRetryAfter = Date.now() + 30_000;
@@ -2005,15 +2081,93 @@ export class AgentSession {
     this.messages.push({
       role: "user",
       content: `[Model switched from ${from} to ${to}. Everything above was produced under the previous model; continue the current task from here.]`,
+      provenance: { source: "runtime", kind: "model_switch", visibility: "hidden" },
     });
   }
 
-  async compact(existingCredentials?: {
-    accessToken: string;
-    accountId?: string;
-    projectId?: string;
-    baseUrl?: string;
-  }): Promise<void> {
+  private async adoptCompactionCheckpoint(
+    loaded: Awaited<ReturnType<SessionManager["load"]>>,
+  ): Promise<void> {
+    const systemMessage = this.messages[0];
+    const loadedMessages = this.sessionManager.getMessages(loaded.entries, loaded.header.leafId);
+    this.messages = [systemMessage, ...loadedMessages];
+    this.sessionId = loaded.header.id;
+    this.conversationId = loaded.header.conversationId ?? loaded.header.id;
+    this.checkpointGeneration = loaded.header.generation ?? 0;
+    this.currentLeafId = loaded.header.leafId;
+    this.setSessionPath(loaded.path);
+    this.kenTurns = this.sessionManager.getKenTurns(loaded.entries, loaded.header.leafId);
+    this.autopilotMarkers = this.sessionManager.getAutopilotMarkers(
+      loaded.entries,
+      loaded.header.leafId,
+    );
+    this.appMarkers = this.sessionManager.getAppMarkers(loaded.entries, loaded.header.leafId);
+    this.turnMetrics = this.sessionManager.getTurnMetrics(loaded.entries);
+    this.lastPersistedIndex = this.messages.length;
+    this.providerContext = null;
+    await this.subAgentManager?.rebindParentSession(this.sessionId);
+  }
+
+  /** Canonicalize a deferred restore before a new prompt can fork stale history. */
+  private async adoptDeferredCheckpointBeforePrompt(): Promise<void> {
+    if (!this.deferredCompactionPending || !this.conversationId) return;
+    this.deferredCompactionPending = false;
+    const canonicalPath = await this.sessionManager.resolveCanonicalSession(
+      this.conversationId,
+      this.cwd,
+    );
+    if (!canonicalPath || canonicalPath === this.sessionPath) return;
+    await this.adoptCompactionCheckpoint(await this.sessionManager.load(canonicalPath));
+  }
+
+  private async persistCompactionCheckpoint(
+    sourceFingerprint: string,
+    result: CompactionResult,
+  ): Promise<void> {
+    const parentSessionId = this.sessionId || undefined;
+    const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
+      conversationId: this.conversationId || undefined,
+      generation: this.checkpointGeneration + 1,
+      parentSessionId,
+      sourceFingerprint,
+      retainedMessageCount:
+        result.retainedCount === 0
+          ? 0
+          : this.messages
+              .slice(-result.retainedCount)
+              .filter((message) => getHistoryMessageVisibility(message) !== "hidden").length,
+      preview: this.sessionPreview || undefined,
+    });
+    this.sessionId = session.id;
+    this.checkpointGeneration = session.header.generation ?? 0;
+    this.conversationId = session.header.conversationId ?? session.id;
+    this.currentLeafId = null;
+    this.setSessionPath(session.path);
+    await this.subAgentManager?.rebindParentSession(this.sessionId);
+
+    for (const message of this.messages) {
+      if (message.role !== "system") await this.persistMessage(message);
+    }
+    this.lastPersistedIndex = this.messages.length;
+    await this.rePersistTurnMetrics();
+    await this.rePersistKenTurns();
+    await this.rePersistAutopilotMarkers();
+    await this.rePersistAppMarkers();
+    await this.persistAppMarker("compaction", {
+      originalCount: result.originalCount,
+      newCount: result.newCount,
+    });
+  }
+
+  async compact(
+    existingCredentials?: {
+      accessToken: string;
+      accountId?: string;
+      projectId?: string;
+      baseUrl?: string;
+    },
+    mode: "manual" | "automatic" | "forced" = "manual",
+  ): Promise<void> {
     this.lastCompactionCompacted = false;
     const creds =
       existingCredentials ??
@@ -2024,81 +2178,137 @@ export class AgentSession {
       provider: this.provider,
       accountId: creds.accountId,
     });
-    this.eventBus.emit("compaction_start", { messageCount: this.messages.length });
-    const result = await compact(this.messages, {
+    const policy = resolveCompactionPolicy({
       provider: this.provider,
       model: this.model,
-      apiKey: creds.accessToken,
-      accountId: creds.accountId,
-      projectId: creds.projectId,
-      baseUrl: this.baseUrl ?? creds.baseUrl,
       contextWindow,
-      signal: this.opts.signal,
+      threshold: this.settingsManager.get("compactThreshold"),
+      accountId: creds.accountId,
+      approvedPlanPath: this.approvedPlanPath,
     });
+    const originalCount = this.messages.length;
+    this.eventBus.emit("compaction_start", { messageCount: originalCount });
 
-    this.messages = result.messages;
-    this.lastCompactionCompacted = result.result.compacted;
-
-    if (!result.result.compacted) {
-      this.eventBus.emit("compaction_end", {
-        compacted: false,
-        originalCount: result.result.originalCount,
-        newCount: result.result.newCount,
+    const runCompactor = () =>
+      compact(this.messages, {
+        provider: this.provider,
+        model: this.model,
+        apiKey: creds.accessToken,
+        accountId: creds.accountId,
+        projectId: creds.projectId,
+        baseUrl: this.baseUrl ?? creds.baseUrl,
+        contextWindow,
+        targetTokens: policy.targetTokens,
+        signal: this.opts.signal,
+        approvedPlanPath: this.approvedPlanPath,
       });
-      return;
-    }
 
-    this.providerContext = null;
+    let finalCount = originalCount;
 
-    // Compaction rewrote the message list, so every transcript anchor recorded
-    // against the old indices must move with it — otherwise the markers are
-    // re-persisted pointing at positions that no longer mean anything and
-    // replay far below where they happened (or past the end).
-    this.remapMarkerAnchors(result.result.anchorRemap);
-
-    // Transient sessions (Ken chat/autopilot, subagent spawns) must NEVER touch
-    // the session store: without this guard, the first auto-compaction called
-    // sessionManager.create() and assigned a real sessionPath, silently turning
-    // the "in-memory only" session into a persisted one — every later turn (and
-    // every further compaction) then leaked a Ken transcript file into the
-    // project's session list. Compact in memory only and keep sessionPath empty.
-    if (this.opts.transient) {
-      this.lastPersistedIndex = this.messages.length;
-    } else {
-      // Persist compacted messages to a new session file so `ggcoder continue`
-      // picks up the compacted state instead of the full original history.
-      const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
-        conversationId: this.conversationId || undefined,
-        preview: this.sessionPreview || undefined,
-      });
-      this.sessionId = session.id;
-      this.conversationId = session.header.conversationId ?? session.id;
-      this.setSessionPath(session.path);
-      await this.subAgentManager?.rebindParentSession(this.sessionId);
-
-      // Write compacted messages (skip system — it's rebuilt on load)
-      for (const msg of this.messages) {
-        if (msg.role === "system") continue;
-        await this.persistMessage(msg);
+    if (this.opts.transient || !this.conversationId) {
+      const result = await runCompactor();
+      finalCount = result.result.newCount;
+      this.messages = result.messages;
+      this.lastCompactionCompacted = result.result.compacted;
+      if (result.result.compacted) {
+        this.providerContext = null;
+        this.remapMarkerAnchors(result.result.anchorRemap);
+        this.lastPersistedIndex = this.messages.length;
       }
-      this.lastPersistedIndex = this.messages.length;
-      // Carry evidence records into the new file so they survive compaction.
-      await this.rePersistTurnMetrics();
-      await this.rePersistKenTurns();
-      await this.rePersistAutopilotMarkers();
-      await this.rePersistAppMarkers();
-      // Persist the compaction counts so a resumed session's quiet notice can
-      // show the same "N → M messages" summary the live run did.
-      await this.persistAppMarker("compaction", {
-        originalCount: result.result.originalCount,
-        newCount: result.result.newCount,
+    } else {
+      const conversationId = this.conversationId;
+      await this.sessionManager.withCompactionLease(conversationId, this.opts.signal, async () => {
+        let sourceFingerprint = computeSourceFingerprint(this.messages);
+        const canonicalPath = await this.sessionManager.resolveCanonicalSession(
+          conversationId,
+          this.cwd,
+        );
+        if (canonicalPath && canonicalPath !== this.sessionPath) {
+          const newest = await this.sessionManager.load(canonicalPath);
+          if (newest.header.sourceFingerprint === sourceFingerprint) {
+            await this.adoptCompactionCheckpoint(newest);
+            this.lastCompactionCompacted = true;
+            finalCount = this.messages.length;
+            return;
+          }
+          // The canonical branch contains different progress. Rebase onto it before
+          // compacting so a stale caller cannot supersede newer history by generation.
+          await this.adoptCompactionCheckpoint(newest);
+          sourceFingerprint = computeSourceFingerprint(this.messages);
+        }
+
+        const attempt = await this.sessionManager.readCompactionAttemptState(conversationId);
+        const attemptActive = !attempt?.expiresAt || Date.parse(attempt.expiresAt) > Date.now();
+        if (
+          mode === "automatic" &&
+          attempt?.fingerprint === sourceFingerprint &&
+          attempt.policyKey === policy.policyKey &&
+          attemptActive
+        ) {
+          if (attempt.outcome === "success" && attempt.checkpointId) {
+            const checkpointPath = await this.sessionManager.findById(
+              this.cwd,
+              attempt.checkpointId,
+            );
+            if (checkpointPath) {
+              const checkpoint = await this.sessionManager.load(checkpointPath);
+              if (checkpoint.header.sourceFingerprint === sourceFingerprint) {
+                await this.adoptCompactionCheckpoint(checkpoint);
+                this.lastCompactionCompacted = true;
+                finalCount = this.messages.length;
+                return;
+              }
+            }
+          } else if (attempt.outcome === "failed" || attempt.outcome === "noop") {
+            return;
+          }
+        }
+
+        try {
+          const result = await runCompactor();
+          finalCount = result.result.newCount;
+          this.messages = result.messages;
+          this.lastCompactionCompacted = result.result.compacted;
+          if (!result.result.compacted) {
+            await this.sessionManager.writeCompactionAttemptState(conversationId, {
+              fingerprint: sourceFingerprint,
+              policyKey: policy.policyKey,
+              outcome: "noop",
+              updatedAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 30_000).toISOString(),
+            });
+            return;
+          }
+
+          this.providerContext = null;
+          this.remapMarkerAnchors(result.result.anchorRemap);
+          await this.persistCompactionCheckpoint(sourceFingerprint, result.result);
+          await this.sessionManager.writeCompactionAttemptState(conversationId, {
+            fingerprint: sourceFingerprint,
+            policyKey: policy.policyKey,
+            outcome: "success",
+            checkpointId: this.sessionId,
+            updatedAt: new Date().toISOString(),
+          });
+        } catch (error) {
+          await this.sessionManager
+            .writeCompactionAttemptState(conversationId, {
+              fingerprint: sourceFingerprint,
+              policyKey: policy.policyKey,
+              outcome: "failed",
+              updatedAt: new Date().toISOString(),
+              expiresAt: new Date(Date.now() + 30_000).toISOString(),
+            })
+            .catch(() => {});
+          throw error;
+        }
       });
     }
 
     this.eventBus.emit("compaction_end", {
-      compacted: true,
-      originalCount: result.result.originalCount,
-      newCount: result.result.newCount,
+      compacted: this.lastCompactionCompacted,
+      originalCount,
+      newCount: finalCount,
     });
   }
 
@@ -2107,6 +2317,7 @@ export class AgentSession {
     // explicit new sessions reset the conversation identity.
     if (!preserveConversation) {
       this.conversationId = "";
+      this.checkpointGeneration = 0;
       this.sessionPreview = "";
     }
     // A fresh session drops any in-flight plan state so its prompt is clean.
@@ -2144,6 +2355,7 @@ export class AgentSession {
     if (this.opts.transient) {
       this.sessionId = "";
       this.conversationId = "";
+      this.checkpointGeneration = 0;
       this.sessionPreview = "";
       this.setSessionPath("");
       this.lastPersistedIndex = this.messages.length;
@@ -2843,20 +3055,30 @@ export class AgentSession {
   }
 
   private async createNewSession(): Promise<void> {
+    const continuingConversation = Boolean(this.conversationId && this.sessionId);
     const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
       conversationId: this.conversationId || undefined,
+      generation: continuingConversation ? this.checkpointGeneration + 1 : 0,
+      parentSessionId: continuingConversation ? this.sessionId : undefined,
       preview: this.sessionPreview || undefined,
     });
     this.sessionId = session.id;
+    this.checkpointGeneration = session.header.generation ?? 0;
     this.conversationId = session.header.conversationId ?? session.id;
     this.setSessionPath(session.path);
     this.lastPersistedIndex = this.messages.length;
   }
 
   private async loadExistingSession(sessionPath: string): Promise<void> {
-    const loaded = await this.sessionManager.load(sessionPath);
+    // A stale physical checkpoint is only an address, not the conversation tip.
+    // Resolve every resume—not just over-threshold/deferred compaction resumes—
+    // before reading history so the next prompt cannot continue an old branch.
+    const canonicalPath =
+      (await this.sessionManager.resolveCanonicalSession(sessionPath, this.cwd)) ?? sessionPath;
+    const loaded = await this.sessionManager.load(canonicalPath);
     // Use the leaf from the header to walk the correct branch
     const loadedMessages = this.sessionManager.getMessages(loaded.entries, loaded.header.leafId);
+    this.checkpointGeneration = loaded.header.generation ?? 0;
     this.conversationId = loaded.header.conversationId ?? loaded.header.id;
     const legacyLabel = [...loaded.entries]
       .reverse()
@@ -2910,13 +3132,33 @@ export class AgentSession {
       provider: this.provider,
       accountId: creds.accountId,
     });
+    this.sessionId = loaded.header.id;
+    this.setSessionPath(loaded.path);
+    this.lastPersistedIndex = this.messages.length;
+
+    const loadPolicy = resolveCompactionPolicy({
+      provider: this.provider,
+      model: this.model,
+      contextWindow,
+      threshold: this.settingsManager.get("compactThreshold"),
+      accountId: creds.accountId,
+      approvedPlanPath: this.approvedPlanPath,
+    });
+    log("INFO", "compaction", "Restore compaction decision", {
+      provider: this.provider,
+      model: this.model,
+      transport: this.provider === "openai" && creds.accountId ? "codex_oauth" : "public_api",
+      contextWindow: String(contextWindow),
+      activeTokens: "estimated",
+      triggerLimit: String(loadPolicy.targetTokens),
+    });
     const needsLoadCompaction =
       this.settingsManager.get("autoCompact") &&
-      shouldCompact(this.messages, contextWindow, this.settingsManager.get("compactThreshold"));
+      shouldCompact(this.messages, contextWindow, loadPolicy.threshold);
     if (needsLoadCompaction && this.opts.deferLoadCompaction) {
-      // Host readiness is gated on initialize() — don't block it on a summary
-      // LLM call (up to 30s). runLoop()'s pre-run auto-compaction picks this
-      // up on the first prompt and emits compaction_start/_end for the UI.
+      // Canonicalize again immediately before the first prompt is persisted:
+      // another process may create the shared checkpoint after this load.
+      this.deferredCompactionPending = true;
       log(
         "INFO",
         "session",
@@ -2925,57 +3167,11 @@ export class AgentSession {
     } else if (needsLoadCompaction) {
       await this.subAgentManager?.hydrate(loaded.header.id);
       log("INFO", "session", `Restored session exceeds context — auto-compacting`);
-      const compacted = await compact(this.messages, {
-        provider: this.provider,
-        model: this.model,
-        apiKey: creds.accessToken,
-        accountId: creds.accountId,
-        projectId: creds.projectId,
-        baseUrl: this.baseUrl ?? creds.baseUrl,
-        contextWindow,
-        signal: this.opts.signal,
-      });
-      this.messages = compacted.messages;
-      // Same anchor rebase as compact(): the restored markers were recorded
-      // against the pre-compaction transcript.
-      this.remapMarkerAnchors(compacted.result.anchorRemap);
-      log("INFO", "session", `Auto-compaction complete`, {
-        before: String(compacted.result.originalCount),
-        after: String(compacted.result.newCount),
-      });
-
-      // Compaction rewrote history, so the on-disk file no longer reflects
-      // what's in memory — fork a fresh session file for the compacted state
-      // (mirrors compact()'s own persistence) so `ggcoder continue` picks up
-      // the summary instead of the full original transcript.
-      const session = await this.sessionManager.create(this.cwd, this.provider, this.model, {
-        conversationId: this.conversationId || undefined,
-        preview: this.sessionPreview || undefined,
-      });
-      this.sessionId = session.id;
-      this.conversationId = session.header.conversationId ?? session.id;
-      this.setSessionPath(session.path);
-      await this.subAgentManager?.rebindParentSession(this.sessionId);
-      this.currentLeafId = null;
-
-      // Re-persist (compacted) messages — skip system, it's rebuilt on load
-      for (const msg of this.messages) {
-        if (msg.role === "system") continue;
-        await this.persistMessage(msg);
+      await this.compact(creds, "automatic");
+      if (this.lastCompactionCompacted) {
+        await this.recordInterruptedRuns(interruptedRuns);
+        return;
       }
-      this.lastPersistedIndex = this.messages.length;
-      // Carry restored evidence into the continuation file.
-      await this.rePersistTurnMetrics();
-      await this.rePersistKenTurns();
-      await this.rePersistAutopilotMarkers();
-      await this.rePersistAppMarkers();
-      // Record this load-time auto-compaction's counts for the resumed notice.
-      await this.persistAppMarker("compaction", {
-        originalCount: compacted.result.originalCount,
-        newCount: compacted.result.newCount,
-      });
-      await this.recordInterruptedRuns(interruptedRuns);
-      return;
     }
 
     // Plain resume (no compaction needed): keep using the original session
@@ -3018,8 +3214,12 @@ export class AgentSession {
   }
 
   private async persistMessage(message: Message): Promise<void> {
-    if (!this.sessionPreview && message.role === "user") {
-      this.sessionPreview = getUserSessionPrompt(message.content) ?? "";
+    if (
+      !this.sessionPreview &&
+      message.role === "user" &&
+      (message.provenance?.source === "human" || !message.provenance)
+    ) {
+      this.sessionPreview = getUserSessionPrompt(message.content, message.provenance) ?? "";
     }
     // Transient sessions (subagent spawns) have no session file — skip.
     if (!this.sessionPath) return;
@@ -3039,7 +3239,7 @@ export class AgentSession {
   private createSlashCommandContext(): SlashCommandContext {
     return {
       switchModel: (provider, model) => this.switchModel(provider, model),
-      compact: () => this.compact(),
+      compact: () => this.compact(undefined, "manual"),
       newSession: () => this.newSession(),
       listSessions: async () => {
         const sessions = await this.sessionManager.list(this.cwd);

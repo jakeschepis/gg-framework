@@ -106,7 +106,11 @@ describe("AgentSession background-process completion gate", () => {
     await manager.start("sleep 30", process.cwd());
 
     expect(internal.getHookFollowUpMessages()).toEqual([
-      { role: "user", content: "Collect child agent recovered-child before finishing." },
+      {
+        role: "user",
+        content: "Collect child agent recovered-child before finishing.",
+        provenance: { source: "runtime", kind: "completion_gate", visibility: "hidden" },
+      },
     ]);
     expect(internal.processGateInjected).toBe(0);
   });

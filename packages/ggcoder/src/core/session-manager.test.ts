@@ -1,7 +1,8 @@
-import { mkdtemp, readFile, rm, utimes, readdir, writeFile } from "node:fs/promises";
+import { mkdir, mkdtemp, readFile, rm, utimes, readdir, writeFile } from "node:fs/promises";
 import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
+import crypto from "node:crypto";
 import { afterEach, describe, expect, it } from "vitest";
 import {
   SessionManager,
@@ -85,6 +86,8 @@ describe("SessionManager conversation identity", () => {
     const original = await manager.create("/repo", "anthropic", "test-model");
     const checkpoint = await manager.create("/repo", "anthropic", "test-model", {
       conversationId: original.header.conversationId,
+      generation: 1,
+      parentSessionId: original.id,
       preview: `  Original   request ${"x".repeat(100)}  `,
     });
     const loadedCheckpoint = await manager.load(checkpoint.path);
@@ -94,6 +97,141 @@ describe("SessionManager conversation identity", () => {
     expect(checkpoint.header.conversationId).toBe(original.id);
     expect(loadedCheckpoint.header.conversationId).toBe(original.id);
     expect(loadedCheckpoint.header.preview).toBe(`Original request ${"x".repeat(63)}`);
+  });
+
+  it("canonicalizes stale physical ids and paths to the highest generation", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager = new SessionManager(sessionsDir);
+    const original = await manager.create("/repo", "anthropic", "test-model");
+    const first = await manager.create("/repo", "anthropic", "test-model", {
+      conversationId: original.id,
+      generation: 1,
+      parentSessionId: original.id,
+      sourceFingerprint: "a".repeat(64),
+    });
+    const newest = await manager.create("/repo", "anthropic", "test-model", {
+      conversationId: original.id,
+      generation: 2,
+      parentSessionId: first.id,
+      sourceFingerprint: "b".repeat(64),
+    });
+    await manager.appendEntry(newest.path, entry("latest-message"));
+
+    // Generation wins even if an older checkpoint has a newer filesystem time.
+    const future = new Date(Date.now() + 60_000);
+    await utimes(first.path, future, future);
+
+    expect(await manager.findById("/repo", original.id)).toBe(newest.path);
+    expect(await manager.findById("/repo", first.id)).toBe(newest.path);
+    expect(await manager.resolveCanonicalSession(original.path)).toBe(newest.path);
+    expect((await manager.load(original.path)).header.id).toBe(newest.id);
+    expect(await manager.getMostRecent("/repo")).toBe(newest.path);
+  });
+
+  it("loads ancestry oldest first and stops before corrupt or missing parents", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager = new SessionManager(sessionsDir);
+    const original = await manager.create("/original-repo", "anthropic", "test-model");
+    const first = await manager.create("/second-repo", "anthropic", "test-model", {
+      conversationId: original.id,
+      generation: 1,
+      parentSessionId: original.id,
+    });
+    const newest = await manager.create("/third-repo", "anthropic", "test-model", {
+      conversationId: original.id,
+      generation: 2,
+      parentSessionId: first.id,
+    });
+
+    expect(
+      (await manager.loadCheckpointChain(original.path)).map((item) => item.header.id),
+    ).toEqual([original.id, first.id, newest.id]);
+
+    await writeFile(first.path, `${JSON.stringify(first.header)}\nnot-json\n`);
+    expect((await manager.loadCheckpointChain(newest.path)).map((item) => item.header.id)).toEqual([
+      newest.id,
+    ]);
+
+    await rm(first.path);
+    expect((await manager.loadCheckpointChain(newest.path)).map((item) => item.header.id)).toEqual([
+      newest.id,
+    ]);
+  });
+});
+
+describe("SessionManager compaction coordination", () => {
+  it("serializes two independent managers for the same conversation", async () => {
+    const sessionsDir = await makeTempDir();
+    const firstManager = new SessionManager(sessionsDir);
+    const secondManager = new SessionManager(sessionsDir);
+    const order: string[] = [];
+    let releaseFirst!: () => void;
+    let firstStarted!: () => void;
+    const started = new Promise<void>((resolve) => {
+      firstStarted = resolve;
+    });
+    const hold = new Promise<void>((resolve) => {
+      releaseFirst = resolve;
+    });
+
+    const first = firstManager.withCompactionLease("conversation", undefined, async () => {
+      order.push("first:start");
+      firstStarted();
+      await hold;
+      order.push("first:end");
+    });
+    await started;
+    const second = secondManager.withCompactionLease("conversation", undefined, async () => {
+      order.push("second:start");
+      order.push("second:end");
+    });
+    await new Promise((resolve) => setTimeout(resolve, 20));
+    expect(order).toEqual(["first:start"]);
+    releaseFirst();
+    await Promise.all([first, second]);
+
+    expect(order).toEqual(["first:start", "first:end", "second:start", "second:end"]);
+  });
+
+  it("recovers a dead-owner lease and ignores coordination storage during discovery", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager = new SessionManager(sessionsDir);
+    const conversationId = "dead-owner";
+    const key = crypto.createHash("sha256").update(conversationId).digest("hex");
+    const lockPath = path.join(sessionsDir, ".compaction-coordination", `${key}.lock`);
+    await mkdir(lockPath, { recursive: true });
+    await writeFile(
+      path.join(lockPath, "owner.json"),
+      JSON.stringify({ token: "dead", pid: 2_147_483_647, createdAt: new Date().toISOString() }),
+      "utf-8",
+    );
+
+    await expect(
+      manager.withCompactionLease(conversationId, undefined, async () => "recovered"),
+    ).resolves.toBe("recovered");
+    expect(await manager.listAllSummaries()).toEqual([]);
+  });
+
+  it("recovers an old corrupt lease and round-trips attempt state", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager = new SessionManager(sessionsDir);
+    const conversationId = "corrupt-owner";
+    const key = crypto.createHash("sha256").update(conversationId).digest("hex");
+    const lockPath = path.join(sessionsDir, ".compaction-coordination", `${key}.lock`);
+    await mkdir(lockPath, { recursive: true });
+    const old = new Date(Date.now() - 120_000);
+    await utimes(lockPath, old, old);
+
+    await manager.withCompactionLease(conversationId, undefined, async () => undefined);
+    const state = {
+      fingerprint: "a".repeat(64),
+      policyKey: "openai:model:0.85",
+      outcome: "noop" as const,
+      updatedAt: new Date().toISOString(),
+      expiresAt: new Date(Date.now() + 30_000).toISOString(),
+    };
+    await manager.writeCompactionAttemptState(conversationId, state);
+    expect(await manager.readCompactionAttemptState(conversationId)).toEqual(state);
   });
 });
 
@@ -486,6 +624,26 @@ describe("SessionManager.getMostRecent", () => {
 
     const mostRecent = await manager.getMostRecent(cwd);
     expect(mostRecent).toBe(sessionA.path);
+  });
+
+  it("sorts conversations by activity after selecting each canonical checkpoint", async () => {
+    const sessionsDir = await makeTempDir();
+    const manager = new SessionManager(sessionsDir);
+    const cwd = "/proj/cross-conversation-recency";
+
+    const olderConversation = await manager.create(cwd, "anthropic", "test-model");
+    const olderCheckpoint = await manager.create(cwd, "anthropic", "test-model", {
+      conversationId: olderConversation.id,
+      generation: 5,
+      parentSessionId: olderConversation.id,
+    });
+    await manager.appendEntry(olderCheckpoint.path, entry("older checkpoint message"));
+    await new Promise((resolve) => setTimeout(resolve, 5));
+
+    const recentConversation = await manager.create(cwd, "anthropic", "test-model");
+    await manager.appendEntry(recentConversation.path, entry("recent conversation message"));
+
+    expect(await manager.getMostRecent(cwd)).toBe(recentConversation.path);
   });
 });
 

@@ -261,6 +261,7 @@ export function buildLoopBreakMessage(reasons: readonly string[], final = false)
   const reasonText = reasons.length > 0 ? ` Triggered because: ${reasons.join(", ")}.` : "";
   return {
     role: "user",
+    provenance: { source: "runtime", kind: "review_follow_up", visibility: "hidden" },
     content: `${final ? LOOP_BREAK_FINAL_PROMPT : LOOP_BREAK_PROMPT}${reasonText}`,
   };
 }

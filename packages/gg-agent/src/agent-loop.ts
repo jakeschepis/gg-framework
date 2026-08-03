@@ -1114,7 +1114,15 @@ export async function* agentLoop(
               role: "assistant" as const,
               content: [{ type: "text" as const, text: attemptText }],
             });
-            messages.push({ role: "user" as const, content: PARTIAL_CONTINUATION_PROMPT });
+            messages.push({
+              role: "user" as const,
+              content: PARTIAL_CONTINUATION_PROMPT,
+              provenance: {
+                source: "runtime" as const,
+                kind: "continuation" as const,
+                visibility: "hidden" as const,
+              },
+            });
             preservedChars = attemptText.length;
           }
           diag("retry", {
@@ -1343,7 +1351,15 @@ export async function* agentLoop(
               model: options.model,
             });
             yield { type: "truncated" as const, reason: "max_tokens" as const, continued: true };
-            messages.push({ role: "user" as const, content: MAX_TOKENS_CONTINUATION_PROMPT });
+            messages.push({
+              role: "user" as const,
+              content: MAX_TOKENS_CONTINUATION_PROMPT,
+              provenance: {
+                source: "runtime" as const,
+                kind: "continuation" as const,
+                visibility: "hidden" as const,
+              },
+            });
             continue;
           }
           yield { type: "truncated" as const, reason: "max_tokens" as const, continued: false };
@@ -1520,6 +1536,11 @@ export async function* agentLoop(
             messages.push({
               role: "user" as const,
               content: turnBudgetContinuationPrompt(),
+              provenance: {
+                source: "runtime" as const,
+                kind: "continuation" as const,
+                visibility: "hidden" as const,
+              },
             });
           }
         }
