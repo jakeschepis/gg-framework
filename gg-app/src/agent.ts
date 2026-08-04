@@ -1071,6 +1071,37 @@ export async function saveSettings(projectsRoot: string): Promise<void> {
   await invoke("app_settings_save", { projectsRoot });
 }
 
+export interface InstalledPlugin {
+  schemaVersion: 1;
+  id: string;
+  name: string;
+  version: string;
+  entry: string;
+  description?: string;
+  commands?: string[];
+  installPath: string;
+}
+
+export async function listPlugins(): Promise<InstalledPlugin[]> {
+  await waitForReady();
+  const result = await invoke<{ plugins: InstalledPlugin[] }>("agent_plugins");
+  return result.plugins;
+}
+
+export async function installPluginBundle(
+  bundlePath: string,
+): Promise<{ plugin: InstalledPlugin; restartRequired: boolean }> {
+  await waitForReady();
+  return invoke("agent_install_plugin", { bundlePath });
+}
+
+export async function removePluginBundle(
+  pluginId: string,
+): Promise<{ removed: string; restartRequired: boolean }> {
+  await waitForReady();
+  return invoke("agent_remove_plugin", { pluginId });
+}
+
 export interface PermissionsStatus {
   /** False on platforms with nothing to grant (Windows/Linux today) — the
    *  caller should hide the permissions row entirely rather than show a

@@ -1,5 +1,41 @@
 # @kenkaiiii/ggcoder
 
+## 5.34.0
+
+### Minor Changes
+
+- Add ACP file diffs and tool locations, publish plan progress as `plan` updates, and implement session/resume, session/close, session/delete, session_info_update, and message ids
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.34.0
+- @kenkaiiii/gg-agent@5.34.0
+- @kenkaiiii/gg-core@5.34.0
+
+## 5.33.0
+
+### Minor Changes
+
+- Emit ACP `usage_update` session notifications so clients can show context-window usage, including the post-compaction drop and usage on session/new and session/load
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.33.0
+- @kenkaiiii/gg-agent@5.33.0
+- @kenkaiiii/gg-core@5.33.0
+
+## 5.32.0
+
+### Minor Changes
+
+- Count Gemini reasoning tokens toward billed output usage, gate verification claims behind a fail-closed command classifier, select context by relevance when compacting, and add portable Agent Plugin bundles. Also ships an opt-in OS command sandbox.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.32.0
+- @kenkaiiii/gg-agent@5.32.0
+- @kenkaiiii/gg-core@5.32.0
+
 ## 5.31.0
 
 ### Minor Changes

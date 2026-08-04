@@ -1708,6 +1708,75 @@ async fn agent_save_settings(
         .map_err(|e| e.to_string())
 }
 
+#[tauri::command]
+async fn agent_plugins(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .get(format!("{}/plugins", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn agent_install_plugin(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    bundle_path: String,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!("{}/plugins/install", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .json(&serde_json::json!({ "bundlePath": bundle_path }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
+#[tauri::command]
+async fn agent_remove_plugin(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    plugin_id: String,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let mut endpoint = reqwest::Url::parse(&format!("{}/plugins/", sidecar_base(port)))
+        .map_err(|e| e.to_string())?;
+    endpoint
+        .path_segments_mut()
+        .map_err(|_| "invalid sidecar URL".to_string())?
+        .push(&plugin_id);
+    let res = client
+        .delete(endpoint)
+        .header("x-gg-session", &gg_sid)
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    res.error_for_status()
+        .map_err(|e| e.to_string())?
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())
+}
+
 // ── Native app settings (~/.gg/gg-app.json) ───────────────────────────────
 // The project folder is a plain home-dir file with NOTHING to do with the
 // agent, so Rust reads/writes it directly. This makes the home-screen Settings
@@ -2404,7 +2473,11 @@ fn app_auth_logout(app: tauri::AppHandle, provider: String) -> Result<serde_json
     // directly, or their pickers keep offering models the user can no longer
     // authenticate against and the login screen still shows them connected.
     broadcast_agent_event(&app, "models_change", serde_json::json!({}));
-    broadcast_agent_event(&app, "auth_change", serde_json::json!({ "provider": provider }));
+    broadcast_agent_event(
+        &app,
+        "auth_change",
+        serde_json::json!({ "provider": provider }),
+    );
     Ok(serde_json::json!({ "ok": true }))
 }
 
@@ -4597,6 +4670,9 @@ pub fn run() {
             agent_files,
             agent_settings,
             agent_save_settings,
+            agent_plugins,
+            agent_install_plugin,
+            agent_remove_plugin,
             agent_create_project,
             app_settings_get,
             app_settings_save,

@@ -111,6 +111,11 @@ import { AUTH_PROVIDERS, type AuthProviderMeta } from "./core/auth-providers.js"
 import { ensureAppDirs, loadSavedSettings } from "./config.js";
 import { SettingsManager, type Settings } from "./core/settings-manager.js";
 import {
+  installPlugin,
+  listInstalledPlugins,
+  removePlugin,
+} from "./core/extensions/plugin-bundles.js";
+import {
   getModel,
   getDefaultThinkingLevel,
   getContextWindow,
@@ -2992,6 +2997,46 @@ async function createSession(
         clearInterval(keepAlive);
         clients.delete(client);
       });
+      return;
+    }
+
+    if (method === "GET" && url === "/plugins") {
+      void listInstalledPlugins(paths.extensionsDir)
+        .then((plugins) => json(res, 200, { plugins }))
+        .catch((error) => {
+          captureSidecarError(error, "app-sidecar.plugins.list");
+          json(res, 500, { error: error instanceof Error ? error.message : String(error) });
+        });
+      return;
+    }
+
+    if (method === "POST" && url === "/plugins/install") {
+      void readBody(req, res).then(async (raw) => {
+        if (raw === null) return;
+        try {
+          const bundlePath = (JSON.parse(raw) as { bundlePath?: unknown }).bundlePath;
+          if (typeof bundlePath !== "string" || !path.isAbsolute(bundlePath)) {
+            json(res, 400, { error: "bundlePath must be an absolute path" });
+            return;
+          }
+          const plugin = await installPlugin(bundlePath, paths.extensionsDir);
+          json(res, 200, { plugin, restartRequired: true });
+        } catch (error) {
+          captureSidecarError(error, "app-sidecar.plugins.install");
+          json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        }
+      });
+      return;
+    }
+
+    if (method === "DELETE" && url.startsWith("/plugins/")) {
+      const pluginId = decodeURIComponent(url.slice("/plugins/".length));
+      void removePlugin(pluginId, paths.extensionsDir)
+        .then(() => json(res, 200, { removed: pluginId, restartRequired: true }))
+        .catch((error) => {
+          captureSidecarError(error, "app-sidecar.plugins.remove");
+          json(res, 400, { error: error instanceof Error ? error.message : String(error) });
+        });
       return;
     }
 

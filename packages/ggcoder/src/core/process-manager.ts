@@ -7,7 +7,7 @@ import os from "node:os";
 import crypto from "node:crypto";
 import { killProcessTree } from "../utils/process.js";
 import { getSafeToolEnv } from "../tools/safe-env.js";
-import { resolveShell } from "./shell.js";
+import { resolveShell, type ShellResolution } from "./shell.js";
 import type { AgentNotificationQueue } from "./agent-notifications.js";
 
 export interface BackgroundProcess {
@@ -120,7 +120,7 @@ export class ProcessManager {
 
   constructor(private readonly ops: ProcessManagerOps = {}) {}
 
-  async start(command: string, cwd: string): Promise<StartResult> {
+  async start(command: string, cwd: string, launch?: ShellResolution): Promise<StartResult> {
     await fsp.mkdir(BG_DIR, { recursive: true });
 
     const id = crypto.randomUUID().slice(0, 8);
@@ -129,7 +129,7 @@ export class ProcessManager {
 
     // Cross-platform shell (see core/shell.ts): bash on POSIX, Git Bash on
     // Windows, cmd.exe fallback. Same resolution as the foreground bash tool.
-    const shell = resolveShell(command);
+    const shell = launch ?? resolveShell(command);
     const child = spawn(shell.file, shell.args, {
       cwd,
       detached: true,

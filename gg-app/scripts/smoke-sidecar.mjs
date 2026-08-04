@@ -129,6 +129,23 @@ function smokeOpenSrc(node) {
   console.log("smoke: bundled opensrc starts cleanly");
 }
 
+/** Bash executes through SRT's copied physical CLI; bundling it is load-bearing. */
+function smokeSandboxRuntime(node) {
+  const bin = join(
+    srcTauri,
+    "sidecar",
+    "node_modules",
+    "@anthropic-ai",
+    "sandbox-runtime",
+    "dist",
+    "cli.js",
+  );
+  if (!existsSync(bin)) fail(`bundled sandbox runtime missing: ${bin}`);
+  const help = execFileSync(node, [bin, "--help"], { encoding: "utf8" });
+  if (!help.includes("sandbox")) fail("bundled sandbox runtime did not return its CLI help");
+  console.log("smoke: bundled sandbox runtime starts cleanly");
+}
+
 async function main() {
   if (!existsSync(sidecar)) fail(`bundled sidecar missing: ${sidecar}`);
   if (!existsSync(evidenceSkill)) fail(`bundled evidence-led-ui skill missing: ${evidenceSkill}`);
@@ -138,6 +155,7 @@ async function main() {
   await smokeKencode(node);
   smokeTypescriptLanguageServer(node);
   smokeOpenSrc(node);
+  smokeSandboxRuntime(node);
 
   const child = spawn(node, [sidecar], {
     env: { ...process.env, GG_APP_PORT: "0", GG_APP_CWD: process.cwd() },

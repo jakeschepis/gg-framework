@@ -103,21 +103,26 @@ not built — see the matrix comment in `release.yml`.
 `.github/workflows/ci.yml`'s `app` job exercises the same cross-OS spawn path on
 every push/PR (stage + bundle + smoke + `cargo test`) without a full bundle.
 
-### Required secrets
+### Protected release environment and required secrets
+
+Create a GitHub Actions environment named **`desktop-production`**, require the
+release approvers there, restrict deployment to protected `v*` tags, and store
+all secrets below in that environment—not as unprotected repository secrets.
+The workflow validates the tag is on `main` and fails before building if any
+target-required credential is missing.
 
 Updater signing (every OS):
 
-| Secret | Purpose |
-|---|---|
-| `TAURI_SIGNING_PRIVATE_KEY` | minisign private key for updater signatures. **Must match** `plugins.updater.pubkey` in `tauri.conf.json`. |
-| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | password for that key. |
+| Secret                               | Purpose                                                                                                    |
+| ------------------------------------ | ---------------------------------------------------------------------------------------------------------- |
+| `TAURI_SIGNING_PRIVATE_KEY`          | minisign private key for updater signatures. **Must match** `plugins.updater.pubkey` in `tauri.conf.json`. |
+| `TAURI_SIGNING_PRIVATE_KEY_PASSWORD` | password for that key.                                                                                     |
 
 If the updater key is lost, rotate both the key and the `pubkey` in
 `tauri.conf.json` (old installs won't auto-update across the rotation).
 
-macOS code signing + notarization (only consumed by the macOS matrix legs;
-leave unset to ship an unsigned build — the workflow stays green):
-
+macOS code signing + notarization (required on the macOS matrix leg; an absent
+value fails preflight rather than publishing an unsigned build):
 | Secret | Purpose |
 |---|---|
 | `APPLE_CERTIFICATE` | base64 of the exported **Developer ID Application** `.p12`. |
@@ -131,8 +136,8 @@ leave unset to ship an unsigned build — the workflow stays green):
 ## macOS signing setup (one-time)
 
 1. **Create a Developer ID Application certificate.** On your Mac, Keychain
-   Access → Certificate Assistant → *Request a Certificate From a Certificate
-   Authority* to make a CSR. In the Apple Developer portal
+   Access → Certificate Assistant → _Request a Certificate From a Certificate
+   Authority_ to make a CSR. In the Apple Developer portal
    (Certificates, IDs & Profiles) create a **Developer ID Application**
    certificate, upload the CSR, download the `.cer`, and open it to install
    into your login keychain.
@@ -151,8 +156,9 @@ leave unset to ship an unsigned build — the workflow stays green):
    Security → App-Specific Passwords → generate one (→ `APPLE_PASSWORD`). Never
    commit it; store it only as a GitHub secret. If one leaks, revoke and
    regenerate.
-5. **Add all seven secrets** under repo Settings → Secrets and variables →
-   Actions, then push a `v*` tag to trigger the release.
+5. **Add all seven Apple secrets** plus both updater-signing secrets to the
+   protected `desktop-production` environment, then push a `v*` tag that points
+   to a commit on `main`. An environment reviewer must approve before the jobs run.
 
 > Notarization uses the Apple ID path (`APPLE_ID` + `APPLE_PASSWORD` +
 > `APPLE_TEAM_ID`). To switch to the App Store Connect API key path instead, set

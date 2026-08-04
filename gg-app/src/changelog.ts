@@ -22,6 +22,32 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.39.2",
+    date: "2026-08-03",
+    items: [
+      "Watch me work inside your own editor. Every file I change now shows up as a proper side by side diff instead of a wall of text, and your editor follows along to the exact file and line I am touching. Reviewing my work just became a glance instead of a chore.",
+      "My plan is now your live to do list. When I map out a job in `Plan Mode`, you see every step appear in your editor and tick off in real time as I finish them. No more wondering how far along I am.",
+      "Your saved conversations are finally yours to manage from anywhere. Pick one back up right where you left it, close it, or delete it for good, all without leaving your editor. Each one even names itself from what you asked.",
+    ],
+  },
+  {
+    version: "0.39.1",
+    date: "2026-08-03",
+    items: [
+      "Your phone remote and other `ACP` clients now show a live context meter. I report exactly how full the window is as the conversation moves, so you can see the room you have left instead of guessing. Best part: when GG Coder compacts a long session, you watch the usage drop on the spot, and a resumed chat shows its context the moment it opens rather than after the first reply.",
+    ],
+  },
+  {
+    version: "0.39.0",
+    date: "2026-08-03",
+    items: [
+      "GG Coder can no longer tell you a check passed when it did not. I taught it to judge every command it runs, so a `--watch` that never finishes, a build that rewrites files, or a `--help` that proves nothing all get rejected as evidence. Only real, finished checks like `tsc --noEmit` count now.",
+      "Your long sessions stay sharper for longer. When the conversation gets trimmed, I now pick what to keep based on what you just asked, so the error, the file, and the decision that actually matter survive instead of whatever happened to be most recent.",
+      "You can install `Agent Plugins` straight from Settings. One portable file adds new commands and abilities, and I check every bundle before it lands so a bad one cannot touch anything outside its own folder.",
+      "Gemini usage finally reads true. Its thinking tokens were quietly missing from your totals, so every long reasoning run looked cheaper than it was. Now the number you see is the number you pay.",
+    ],
+  },
+  {
     version: "0.38.0",
     date: "2026-08-01",
     items: [

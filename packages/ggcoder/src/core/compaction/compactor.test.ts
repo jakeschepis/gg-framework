@@ -734,6 +734,46 @@ describe("compact", () => {
     expect(result.result.tokensAfterEstimate).toBeLessThan(result.result.targetTokens);
   });
 
+  it("feeds query-relevant older evidence to the summarizer when its prompt budget is constrained", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockImplementation((request) => {
+      const requestText = (request.messages as Message[])
+        .map((message) =>
+          typeof message.content === "string" ? message.content : JSON.stringify(message.content),
+        )
+        .join("\n");
+      expect(requestText).toContain("OLD_EVIDENCE_MARKER");
+      return mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "Relevant summary." },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 50 },
+        }),
+      ) as never;
+    });
+
+    const messages: Message[] = [makeMessage("system", "sys")];
+    messages.push(makeMessage("user", `Original account task ${"a".repeat(10_000)}`));
+    for (let index = 0; index < 100; index++) {
+      const detail =
+        index === 5
+          ? "OAuth verifier mismatch root cause OLD_EVIDENCE_MARKER"
+          : `Unrelated dashboard detail ${index}`;
+      messages.push(makeMessage("user", `${detail} ${"x".repeat(10_000)}`));
+      messages.push(makeMessage("assistant", `Handled detail ${index}`));
+    }
+    messages.push(makeMessage("user", "Fix the OAuth verifier mismatch."));
+
+    const result = await compact(messages, baseOptions);
+    expect(mockStream).toHaveBeenCalled();
+    expect(result.result.contextSelection).toMatchObject({
+      strategy: "query_aware",
+      queryTerms: expect.any(Number),
+      selectedTokens: expect.any(Number),
+      droppedMessages: expect.any(Number),
+    });
+  });
+
   it("updates an anchored prior summary and preserves the approved plan reference", async () => {
     const mockStream = vi.mocked(stream);
     mockStream.mockImplementation((request) => {

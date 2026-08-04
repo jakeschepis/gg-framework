@@ -51,6 +51,7 @@ import {
   shouldCompact,
   compact,
   type CompactionAnchorRemap,
+  type CompactionContextSelection,
   type CompactionResult,
 } from "./compaction/compactor.js";
 import {
@@ -595,6 +596,18 @@ export class AgentSession {
       getNetworkPolicy: () => ({
         mode: this.settingsManager.get("networkMode"),
         allow: this.settingsManager.get("networkAllow"),
+      }),
+      getSandboxPolicy: () => ({
+        mode: this.settingsManager.get("sandboxMode"),
+        // networkAllow always applies. Choosing "allowlist" is the user taking
+        // over network policy, so the built-in developer defaults drop out and
+        // only their hosts remain reachable.
+        allowedDomains: this.settingsManager.get("networkAllow"),
+        strictDomains: this.settingsManager.get("networkMode") === "allowlist",
+        // Same source of truth as getWriteGuardSettings, so bash and the write
+        // tool agree on which roots are writable.
+        additionalRoots: this.additionalRoots,
+        allowOutsideWorkspaceWrites: this.settingsManager.get("allowOutsideWorkspaceWrites"),
       }),
       authStorage: this.authStorage,
       onFileRead: (filePath) => this.reviewCoverage.recordRead(filePath),
@@ -2189,8 +2202,9 @@ export class AgentSession {
     const originalCount = this.messages.length;
     this.eventBus.emit("compaction_start", { messageCount: originalCount });
 
-    const runCompactor = () =>
-      compact(this.messages, {
+    let contextSelection: CompactionContextSelection | undefined;
+    const runCompactor = async () => {
+      const output = await compact(this.messages, {
         provider: this.provider,
         model: this.model,
         apiKey: creds.accessToken,
@@ -2202,9 +2216,11 @@ export class AgentSession {
         signal: this.opts.signal,
         approvedPlanPath: this.approvedPlanPath,
       });
+      contextSelection = output.result.contextSelection;
+      return output;
+    };
 
     let finalCount = originalCount;
-
     if (this.opts.transient || !this.conversationId) {
       const result = await runCompactor();
       finalCount = result.result.newCount;
@@ -2309,6 +2325,18 @@ export class AgentSession {
       compacted: this.lastCompactionCompacted,
       originalCount,
       newCount: finalCount,
+      ...(contextSelection
+        ? {
+            selectionStrategy: contextSelection.strategy,
+            selectedMessages: contextSelection.selectedMessages,
+            selectedTokens: contextSelection.selectedTokens,
+            droppedMessages: contextSelection.droppedMessages,
+            queryTerms: contextSelection.queryTerms,
+            ...(contextSelection.fallbackReason
+              ? { selectionFallback: contextSelection.fallbackReason }
+              : {}),
+          }
+        : {}),
     });
   }
 
@@ -2435,6 +2463,45 @@ export class AgentSession {
       planMode: this.planModeRef.current,
       accountId: this.lastAccountId,
     };
+  }
+
+  /**
+   * Tokens currently in context and the window they are measured against.
+   *
+   * Uses the same accounting as the compaction decision: authoritative provider
+   * usage when we have it (it includes the system prompt and tool schemas),
+   * plus a local estimate of anything appended after that sample. A client
+   * reading this right after a compaction sees the drop, because compaction
+   * clears the retained provider sample along with the messages it measured.
+   *
+   * `costUsd` is present only when EVERY recorded turn has an authoritative
+   * price; a partial sum would read as a full session cost and understate it.
+   */
+  getContextUsage(): { used: number; size: number; costUsd?: number } {
+    const size = getContextWindow(this.model, {
+      provider: this.provider,
+      accountId: this.lastAccountId,
+    });
+
+    let used: number;
+    const anchorIndex = this.providerContext
+      ? this.messages.lastIndexOf(this.providerContext.anchor)
+      : -1;
+    if (this.providerContext && anchorIndex >= 0) {
+      used = calculateActiveContextTokens(this.messages, {
+        usage: this.providerContext.usage,
+        pendingMessages: this.messages.slice(anchorIndex + 1),
+      });
+    } else {
+      used = calculateActiveContextTokens(this.messages);
+    }
+
+    const costUsd =
+      this.turnMetrics.length > 0 && this.turnMetrics.every((m) => m.cost.status === "known")
+        ? this.turnMetrics.reduce((sum, m) => sum + (m.cost.status === "known" ? m.cost.usd : 0), 0)
+        : undefined;
+
+    return costUsd === undefined ? { used, size } : { used, size, costUsd };
   }
 
   getPlanMode(): boolean {

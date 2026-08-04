@@ -11,7 +11,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { resolveShell, type ResolveShellOpts } from "./shell.js";
+import { resolveShell, type ResolveShellOpts, type ShellResolution } from "./shell.js";
 import { killProcessTree } from "../utils/process.js";
 
 export interface PersistentRunResult {
@@ -29,6 +29,7 @@ export class PersistentShell {
     private readonly env: NodeJS.ProcessEnv,
     private readonly maxOutputBytes: number,
     private readonly shellOpts?: ResolveShellOpts,
+    private readonly launch?: ShellResolution,
   ) {}
 
   /** True while a previous persistent command is still running. */
@@ -46,7 +47,9 @@ export class PersistentShell {
     // Windows the caller only reaches persist mode when Git Bash was found,
     // but Git for Windows puts `cmd\` on PATH and `bash.exe` in `bin\` — so a
     // bare `bash` spawn is ENOENT and every persist-mode command failed.
-    const child = spawn(resolveShell("", this.shellOpts).file, ["--norc", "--noprofile"], {
+    const resolved = this.launch ?? resolveShell("", this.shellOpts);
+    const args = this.launch ? resolved.args : ["--norc", "--noprofile"];
+    const child = spawn(resolved.file, args, {
       cwd: this.cwd,
       stdio: ["pipe", "pipe", "pipe"],
       env: this.env,

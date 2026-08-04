@@ -6,6 +6,7 @@ import {
   type ToolResult,
 } from "@kenkaiiii/gg-ai";
 import { estimateConversationTokens, estimateMessageTokens } from "./token-estimator.js";
+import { findLatestHumanQuery, selectQueryAwareContext } from "./query-aware-selector.js";
 import { getSummaryModel, getContextWindow } from "../model-registry.js";
 import { kimiCodingHeaders, isKimiCodingEndpoint } from "../oauth/kimi.js";
 import { log } from "../logger.js";
@@ -144,6 +145,15 @@ export type CompactionReductionStatus =
   | "above_target"
   | "not_attempted";
 
+export interface CompactionContextSelection {
+  strategy: "query_aware" | "fallback";
+  selectedMessages: number;
+  selectedTokens: number;
+  droppedMessages: number;
+  queryTerms: number;
+  fallbackReason?: string;
+}
+
 export interface CompactionResult {
   /** Whether messages were actually reduced below the configured trigger target. */
   compacted: boolean;
@@ -159,6 +169,8 @@ export interface CompactionResult {
   tokensAfterEstimate: number;
   targetTokens: number;
   reductionStatus: CompactionReductionStatus;
+  /** Retrieval/compression diagnostics for the summarizer input. */
+  contextSelection?: CompactionContextSelection;
   /** How the collapse shifted message positions, so callers can move transcript
    *  anchors (Ken turns, autopilot verdicts, app markers) onto the rewritten
    *  message list instead of leaving them pointing at pre-compaction indices.
@@ -902,10 +914,14 @@ export async function compact(
   const previousSummaryTokens = previousSummaryMessage
     ? estimateMessageTokens(previousSummaryMessage)
     : 0;
-  const selectedMessages = selectMessagesInBudget(
+  const query = findLatestHumanQuery(summarizationSource);
+  const contextSelection = selectQueryAwareContext(
     classifiedMessages,
+    query,
     Math.max(0, tokenBudget - previousSummaryTokens),
+    { fallback: selectMessagesInBudget },
   );
+  const selectedMessages = contextSelection.messages;
 
   log("INFO", "compaction", `Summarizing ${middleMessages.length} messages`, {
     summaryModel: summaryModel.id,
@@ -913,7 +929,13 @@ export async function compact(
     tokenBudget: String(tokenBudget),
     preparedMessages: String(classifiedMessages.length),
     selectedMessages: String(selectedMessages.length + (previousSummaryMessage ? 1 : 0)),
-    droppedMessages: String(classifiedMessages.length - selectedMessages.length),
+    droppedMessages: String(contextSelection.droppedMessages),
+    selectedTokens: String(contextSelection.selectedTokens),
+    selectionStrategy: contextSelection.strategy,
+    queryTerms: String(contextSelection.queryTerms),
+    ...(contextSelection.fallbackReason
+      ? { selectionFallback: contextSelection.fallbackReason }
+      : {}),
     previousSummary: String(!!previousSummaryMessage),
     filesRead: String(fileOps.read.size),
     filesModified: String(fileOps.modified.size),
@@ -1157,6 +1179,16 @@ export async function compact(
         tokensAfterEstimate,
         targetTokens,
         reductionStatus,
+        contextSelection: {
+          strategy: contextSelection.strategy,
+          selectedMessages: selectedMessages.length,
+          selectedTokens: contextSelection.selectedTokens,
+          droppedMessages: contextSelection.droppedMessages,
+          queryTerms: contextSelection.queryTerms,
+          ...(contextSelection.fallbackReason
+            ? { fallbackReason: contextSelection.fallbackReason }
+            : {}),
+        },
       },
     };
   }
@@ -1201,6 +1233,16 @@ export async function compact(
       tokensAfterEstimate,
       targetTokens,
       reductionStatus: "material",
+      contextSelection: {
+        strategy: contextSelection.strategy,
+        selectedMessages: selectedMessages.length,
+        selectedTokens: contextSelection.selectedTokens,
+        droppedMessages: contextSelection.droppedMessages,
+        queryTerms: contextSelection.queryTerms,
+        ...(contextSelection.fallbackReason
+          ? { fallbackReason: contextSelection.fallbackReason }
+          : {}),
+      },
       anchorRemap,
     },
   };
