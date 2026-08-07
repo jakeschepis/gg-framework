@@ -233,6 +233,16 @@ interface AppSettings {
    *  GG Coder's model (the historical behavior). Set → Ken (chat + autopilot)
    *  uses this model regardless of GG Coder's. */
   kenModels?: Record<string, KenModelPref>;
+  /** Extra folders scanned for projects alongside `projectsRoot`. */
+  projectRoots?: string[];
+  /** Project paths dismissed from the picker, as normalized cwds. */
+  hiddenProjects?: string[];
+}
+
+function stringArray(value: unknown): string[] | undefined {
+  if (!Array.isArray(value)) return undefined;
+  const out = value.filter((v): v is string => typeof v === "string" && v.trim().length > 0);
+  return out.length > 0 ? out : undefined;
 }
 
 function appSettingsFile(): string {
@@ -263,6 +273,8 @@ async function loadAppSettings(): Promise<AppSettings> {
         raw.projectModels && typeof raw.projectModels === "object" ? raw.projectModels : undefined,
       autopilot: raw.autopilot && typeof raw.autopilot === "object" ? raw.autopilot : undefined,
       kenModels: raw.kenModels && typeof raw.kenModels === "object" ? raw.kenModels : undefined,
+      projectRoots: stringArray(raw.projectRoots),
+      hiddenProjects: stringArray(raw.hiddenProjects),
     };
   } catch {
     return { projectsRoot: defaultProjectsRoot() };
@@ -2219,6 +2231,13 @@ async function createSession(
       allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
       transient: true,
       signal: kenAbort.signal,
+      // Ken belongs to THIS window, so its window is where an MCP prompt
+      // should appear. Passing the bridge also keeps every session in the
+      // daemon uniformly interactive, which is what lets them share ONE pooled
+      // MCP connection: the pool separates interactive from headless callers,
+      // because a connection declares its elicitation capability once, at
+      // initialize (see core/mcp/shared-pool.ts).
+      onMcpElicit: elicitations.onElicit,
       // Ken's bursty, spread-out turns (chat) outlast the default 5-min cache
       // TTL regardless of the user's global speedProfile pick.
       forceLongCacheRetention: true,
@@ -2288,6 +2307,10 @@ async function createSession(
       allowedMcpServers: KEN_ALLOWED_MCP_SERVERS,
       transient: true,
       signal: kenAutoAbort.signal,
+      // Same as Ken chat: this reviewer belongs to a window, so route prompts
+      // there, and keep the daemon's sessions uniformly interactive so they
+      // share one pooled MCP connection.
+      onMcpElicit: elicitations.onElicit,
       // Autopilot review rounds routinely span the injected GG Coder run
       // (often >5 min) regardless of the user's global speedProfile pick.
       forceLongCacheRetention: true,
@@ -3125,9 +3148,53 @@ async function createSession(
       return;
     }
 
+    // Dismiss a project from the picker (or restore it with hidden:false). The
+    // path is kept rather than the row: sessions in scratch dirs keep
+    // re-surfacing, so the user's decision has to outlive any one scan.
+    if (method === "POST" && url === "/projects/hidden") {
+      void readBody(req, res).then(async (raw) => {
+        if (raw === null) return;
+        let body: { path?: string; hidden?: boolean };
+        try {
+          body = JSON.parse(raw) as { path?: string; hidden?: boolean };
+        } catch {
+          json(res, 400, { error: "invalid JSON body" });
+          return;
+        }
+        const target = body.path?.trim();
+        if (!target) {
+          json(res, 400, { error: "path is required" });
+          return;
+        }
+        const key = path.resolve(target);
+        try {
+          const settings = await loadAppSettings();
+          const current = new Set((settings.hiddenProjects ?? []).map((p) => path.resolve(p)));
+          if (body.hidden === false) current.delete(key);
+          else current.add(key);
+          settings.hiddenProjects = current.size > 0 ? Array.from(current) : undefined;
+          await saveAppSettings(settings);
+          json(res, 200, { hidden: Array.from(current) });
+        } catch (err) {
+          captureSidecarError(err, "app-sidecar.projects.hidden");
+          json(res, 500, { error: err instanceof Error ? err.message : String(err) });
+        }
+      });
+      return;
+    }
+
     if (method === "GET" && url === "/projects") {
-      // Scan ggcoder + Claude Code + Codex session stores for known projects.
-      void discoverProjects()
+      // Session stores (ggcoder + Claude Code + Codex) for projects with
+      // history, plus a filesystem scan of the configured projects folder so
+      // projects you have not opened yet are still listed.
+      void loadAppSettings()
+        .then(({ projectsRoot, projectRoots, hiddenProjects }) =>
+          discoverProjects({
+            projectsRoot,
+            extraRoots: projectRoots,
+            hiddenPaths: hiddenProjects,
+          }),
+        )
         .then((projects) => json(res, 200, { projects }))
         .catch((err) => {
           captureSidecarError(err, "app-sidecar.projects.discover");

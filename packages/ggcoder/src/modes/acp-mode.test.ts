@@ -563,7 +563,7 @@ describe("ACP mode over stdio", () => {
     expect(haikuLevels.at(-1)).toMatchObject({ value: "high" });
     // The level set before the switch is still legal here, so it must survive.
     expect(afterModel.find((option) => option.id === "thinking")!.currentValue).toBe("high");
-  }, 20_000);
+  });
 
   it("clamps a thinking level the newly selected model cannot reach", async () => {
     client = new AcpClient();
@@ -591,7 +591,7 @@ describe("ACP mode over stdio", () => {
     // Reporting `max` here would be a control that lies: Haiku has no such tier,
     // so the session's real effort is `high` and the client must be told that.
     expect(options.find((option) => option.id === "thinking")!.currentValue).toBe("high");
-  }, 20_000);
+  });
 
   it("advertises plan mode in both the config options and the modes block", async () => {
     client = new AcpClient();
@@ -846,10 +846,7 @@ describe("ACP mode over stdio", () => {
       .received()
       .find((f) => f.params?.update?.sessionUpdate === "usage_update")!;
     expect(frame.params!.sessionId).toBe(sessionId);
-    // Spawning the agent and seeding its session files costs seconds on a CI
-    // runner, so every test here that drives a real child process buys headroom
-    // over vitest's 5s default rather than reporting a slow machine as a bug.
-  }, 20_000);
+  });
 
   it("reports context usage on session/load so a resumed conversation shows it", async () => {
     client = new AcpClient();
@@ -873,7 +870,7 @@ describe("ACP mode over stdio", () => {
       .received()
       .find((f) => f.params?.update?.sessionUpdate === "usage_update")!;
     expect(frame.params!.sessionId).toBe(newest!.sessionId);
-  }, 20_000);
+  });
 
   it("reports context usage after each model response", async () => {
     client = new AcpClient();
@@ -893,7 +890,7 @@ describe("ACP mode over stdio", () => {
     expect(turnUsage).toEqual([{ sessionUpdate: "usage_update", used: 9200, size: 200_000 }]);
     // Like every other turn notification, it must precede the response.
     expect(frames.at(-1)!.id).toBe(3);
-  }, 20_000);
+  });
 
   it("reports the post-compaction count, so a client can see the drop", async () => {
     client = new AcpClient();
@@ -920,7 +917,7 @@ describe("ACP mode over stdio", () => {
         cost: { amount: 0.25, currency: "USD" },
       },
     ]);
-  }, 20_000);
+  });
 
   it("sends file edits as a real diff instead of the tool's prose", async () => {
     client = new AcpClient();
@@ -967,7 +964,7 @@ describe("ACP mode over stdio", () => {
     // client is running somewhere else and cannot resolve them itself.
     const starts = updatesOfKind(frames, "tool_call");
     expect(starts[1]!.locations).toEqual([{ path: path.join(tmpProject, "created.txt") }]);
-  }, 20_000);
+  });
 
   it("publishes an approved plan and advances it from [DONE:n] markers", async () => {
     client = new AcpClient();
@@ -1002,7 +999,7 @@ describe("ACP mode over stdio", () => {
         { content: "Ship the thing", priority: "medium", status: "pending" },
       ],
     });
-  }, 20_000);
+  });
 
   it("names the session from its first prompt, once", async () => {
     client = new AcpClient();
@@ -1023,7 +1020,7 @@ describe("ACP mode over stdio", () => {
     expect(infos).toHaveLength(1);
     expect(infos[0]!.title).toBe("turn 3");
     expect(Date.parse(infos[0]!.updatedAt as string)).not.toBeNaN();
-  }, 20_000);
+  });
 
   it("resumes a stored session without replaying its transcript", async () => {
     client = new AcpClient();
@@ -1062,7 +1059,7 @@ describe("ACP mode over stdio", () => {
     // the newest checkpoint, not the pre-compaction transcript.
     expect(replied).toContain("after second compaction");
     expect(replied).not.toContain("newer: add the config panel");
-  }, 20_000);
+  });
 
   it("closes an active session and refuses to close an unknown one", async () => {
     client = new AcpClient();
@@ -1090,7 +1087,7 @@ describe("ACP mode over stdio", () => {
       params: { sessionId, prompt: [{ type: "text", text: "still there?" }] },
     });
     expect((await client.until(5)).at(-1)!.error!.code).toBe(-32602);
-  }, 20_000);
+  });
 
   it("waits for a cancelled turn to unwind before closing the session", async () => {
     client = new AcpClient();
@@ -1118,7 +1115,7 @@ describe("ACP mode over stdio", () => {
       await fs.readFile(path.join(tmpProject, "dispose-witness.json"), "utf8"),
     );
     expect(witness.disposedMidTurn).toBe(false);
-  }, 20_000);
+  });
 
   it("deletes a stored session, and succeeds when it is already gone", async () => {
     client = new AcpClient();
@@ -1146,7 +1143,7 @@ describe("ACP mode over stdio", () => {
       params: { sessionId: target.sessionId },
     });
     expect((await client.until(94)).at(-1)!.result).toEqual({});
-  }, 20_000);
+  });
 
   it("reports a refusal as its own stop reason", async () => {
     client = new AcpClient();
@@ -1198,7 +1195,7 @@ describe("ACP mode over stdio", () => {
           (update.content as { text?: string } | undefined)?.text === "after cancel",
       ),
     ).toBe(true);
-  }, 20_000);
+  });
 
   it("rejects unknown methods and prompts sent before a session exists", async () => {
     client = new AcpClient();
@@ -1220,7 +1217,7 @@ describe("ACP mode over stdio", () => {
     // can fall back instead of hanging.
     client.send({ jsonrpc: "2.0", id: 3, method: "session/fork", params: {} });
     expect((await client.until(3)).at(-1)!.error).toMatchObject({ code: -32601 });
-  }, 20_000);
+  });
 
   it("answers malformed input with a parse error and keeps serving", async () => {
     client = new AcpClient();
@@ -1243,4 +1240,12 @@ describe("ACP mode over stdio", () => {
     expect(await client.exit).toBe(0);
     expect(client.stderr).toContain("disposed=true");
   });
-});
+  // Every test in this suite spawns a real agent child process and seeds its
+  // session files, which costs seconds on a loaded CI runner. The headroom sits
+  // on the suite rather than on whichever tests happened to time out last, so a
+  // slow machine is never reported as a bug.
+  //
+  // Kept above the 20s harness budget in `until`/`untilUpdate` so a genuine hang
+  // surfaces their diagnostic (pending frames + child stderr) instead of
+  // vitest's bare "Test timed out".
+}, 30_000);

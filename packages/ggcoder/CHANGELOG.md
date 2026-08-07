@@ -1,5 +1,49 @@
 # @kenkaiiii/ggcoder
 
+## 5.35.0
+
+### Minor Changes
+
+- 3b9705d: Share MCP connections and language servers across sessions instead of spawning a set per session.
+
+  A daemon runs many sessions at once — one per window, plus Ken chat and Ken autopilot within each — and each used to spawn its own child process for every MCP server and every language server. Measured on a four-window daemon: 34 processes and 3.3 GB, most of it identical work duplicated.
+  - **MCP connections are now pooled per process** and reference counted, so one stdio child serves every session and exits when the last releases it. Sharing is the default for stdio servers; `shared: false` opts out a server that keeps per-caller state, and HTTP servers are never pooled because their auth and session id are per-connection. Elicitation is routed to the session whose tool call is in flight, and cancelled rather than guessed when that is ambiguous. A pooled server that exits on its own is retired from the pool, so the next session reconnects instead of inheriting a dead connection.
+  - **Language servers are now pooled per (server, project root)**, so two windows open on one repo share a single tsserver stack instead of running two. Servers left unused for five minutes are reclaimed, which also releases roots that no window has open.
+  - **tsserver runs two processes per root instead of four**, by disabling the syntax server and automatic typing acquisition — both exist for an interactive editor and are unused here — and caps its heap at the VS Code default.
+
+### Patch Changes
+
+- @kenkaiiii/gg-ai@5.35.0
+- @kenkaiiii/gg-agent@5.35.0
+- @kenkaiiii/gg-core@5.35.0
+
+## 5.34.3
+
+### Patch Changes
+
+- Rework auto-compaction summaries: lead with the next step, cut redundant user-message transcripts and read-file lists, and supersede prior summaries instead of concatenating them
+  - @kenkaiiii/gg-ai@5.34.3
+  - @kenkaiiii/gg-agent@5.34.3
+  - @kenkaiiii/gg-core@5.34.3
+
+## 5.34.2
+
+### Patch Changes
+
+- Prevent macOS temp folders from flooding and blanking the desktop project picker.
+  - @kenkaiiii/gg-ai@5.34.2
+  - @kenkaiiii/gg-agent@5.34.2
+  - @kenkaiiii/gg-core@5.34.2
+
+## 5.34.1
+
+### Patch Changes
+
+- List project folders on disk in project discovery, add hidden-project support, and never prune skill output from context
+  - @kenkaiiii/gg-ai@5.34.1
+  - @kenkaiiii/gg-agent@5.34.1
+  - @kenkaiiii/gg-core@5.34.1
+
 ## 5.34.0
 
 ### Minor Changes

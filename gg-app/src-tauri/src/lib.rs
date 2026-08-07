@@ -2857,6 +2857,38 @@ async fn agent_create_project(
     Ok(body)
 }
 
+/// Proxy: hide (or with `hidden: false`, restore) a project in the picker.
+#[tauri::command]
+async fn agent_set_project_hidden(
+    webview: WebviewWindow,
+    client: State<'_, reqwest::Client>,
+    path: String,
+    hidden: bool,
+) -> Result<serde_json::Value, String> {
+    let port = port_for(&webview).ok_or("daemon not ready")?;
+    let gg_sid = session_for(&webview).ok_or("session not ready")?;
+    let res = client
+        .post(format!("{}/projects/hidden", sidecar_base(port)))
+        .header("x-gg-session", &gg_sid)
+        .json(&serde_json::json!({ "path": path, "hidden": hidden }))
+        .send()
+        .await
+        .map_err(|e| e.to_string())?;
+    let status = res.status();
+    let body = res
+        .json::<serde_json::Value>()
+        .await
+        .map_err(|e| e.to_string())?;
+    if !status.is_success() {
+        let msg = body
+            .get("error")
+            .and_then(|v| v.as_str())
+            .unwrap_or("failed to update hidden projects");
+        return Err(msg.to_string());
+    }
+    Ok(body)
+}
+
 /// Proxy: discover known projects across ggcoder/Claude Code/Codex stores.
 #[tauri::command]
 async fn agent_projects(
@@ -4674,6 +4706,7 @@ pub fn run() {
             agent_install_plugin,
             agent_remove_plugin,
             agent_create_project,
+            agent_set_project_hidden,
             app_settings_get,
             app_settings_save,
             app_create_project,

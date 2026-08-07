@@ -7,6 +7,7 @@ import { streamOpenAICodex } from "./providers/openai-codex.js";
 import { streamGemini } from "./providers/gemini.js";
 import { providerRegistry } from "./provider-registry.js";
 import { clampProviderContextImages } from "./providers/transform.js";
+import { sanitizeMessagesForWire } from "./utils/well-formed.js";
 
 /** Z.AI coding API endpoint — the primary endpoint for all GLM models. */
 const GLM_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
@@ -195,8 +196,12 @@ export function stream(options: StreamOptions): StreamResult {
     throw new VideoUnsupportedError();
   }
   const wireMessages = stripMessageProvenance(options.messages);
+  // Unpaired surrogates (split emoji in tool args, char-indexed truncation, odd
+  // shell bytes) make the JSON body unparseable for every provider — and stay in
+  // history, so retries and model switches fail identically. Scrub them here,
+  // the one place all providers pass through.
   const messages = clampProviderContextImages(
-    wireMessages,
+    sanitizeMessagesForWire(wireMessages),
     options.provider,
     options.supportsImages,
   );

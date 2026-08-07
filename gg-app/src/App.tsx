@@ -118,6 +118,7 @@ import { formatWorkspaceTitle, WorkspaceHeader } from "./WorkspaceHeader";
 import { useProgress } from "./useProgress";
 import { LoginScreen } from "./LoginScreen";
 import { Markdown, PromptSendProvider } from "./Markdown";
+import { TranscriptList, type TranscriptListHandle } from "./TranscriptList";
 import { FooterSkeleton, TranscriptSkeleton, Skeleton } from "./Skeleton";
 import { useAppUpdate } from "./update";
 import { recoverPromptLabel } from "./prompt-labels";
@@ -360,6 +361,12 @@ function canHandleWindowFileDrop(): boolean {
 
 function App(): React.ReactElement {
   const [items, setItems] = useState<Item[]>([]);
+  // The transcript is virtualized (see TranscriptList): only rows near the
+  // viewport stay mounted, so cost tracks what's on screen instead of how long
+  // the session ran. Virtuoso needs the scroll element as a value, not just a
+  // ref, so keep it in state alongside `scrollRef` — which every existing
+  // stick-to-bottom path still uses unchanged.
+  const [scrollEl, setScrollEl] = useState<HTMLDivElement | null>(null);
   // Ken Kai (mentor agent): own running flag, token/thinking metrics, streaming
   // bubble, and `ken_*` SSE handling. Lives in its own hook; App just consumes
   // the state for rendering and delegates ken events to `handleKenEvent`.
@@ -740,6 +747,7 @@ function App(): React.ReactElement {
   // provider without re-subscribing the SSE listener on every state change.
   const stateRef = useRef<AgentState | null>(null);
   const scrollRef = useRef<HTMLDivElement>(null);
+  const transcriptRef = useRef<TranscriptListHandle>(null);
   const inputRef = useRef<HTMLTextAreaElement>(null);
   // NOTE: the build-session event machine's private refs (streaming bubble id,
   // rAF buffer, per-run accumulators, sub-agent / compaction group ids) now live
@@ -757,8 +765,20 @@ function App(): React.ReactElement {
   // and grow the content after this fires, so it's also called from each image's
   // onLoad to keep the newest content visible.
   const scrollToBottom = useCallback(() => {
+    // The transcript is virtualized, so the scroller's height is an estimate
+    // until rows materialize — `scrollHeight` alone lands short. Ask the list to
+    // scroll to its last row, and keep the raw scroll as a fallback for the
+    // states that render outside the list (wake screen, status line).
+    transcriptRef.current?.scrollToBottom();
     const el = scrollRef.current;
     if (el) el.scrollTo({ top: el.scrollHeight });
+  }, []);
+
+  // Feed the same node to both the ref (existing scroll machinery) and state
+  // (Virtuoso's customScrollParent, which needs a value to react to).
+  const attachScrollEl = useCallback((node: HTMLDivElement | null) => {
+    scrollRef.current = node;
+    setScrollEl(node);
   }, []);
 
   // Same as scrollToBottom, but a no-op while the user has scrolled up to read.
@@ -2391,7 +2411,7 @@ function App(): React.ReactElement {
         {workspaceMode === "code" && kenPowerBanner && (
           <KenPowerBanner mode={kenPowerBanner} onDone={() => setKenPowerBanner(null)} />
         )}
-        <div className="transcript" ref={scrollRef} onScroll={onTranscriptScroll}>
+        <div className="transcript" ref={attachScrollEl} onScroll={onTranscriptScroll}>
           {!hydrated && items.length === 0 ? (
             <TranscriptSkeleton />
           ) : (
@@ -2405,9 +2425,14 @@ function App(): React.ReactElement {
                   </div>
                 ))}
               <PromptSendProvider value={sendKenRecommendedPrompt}>
-                {items.map((it) => (
-                  <TranscriptRow key={it.id} item={it} onImageLoad={maybeScrollToBottom} />
-                ))}
+                <TranscriptList
+                  ref={transcriptRef}
+                  items={items}
+                  itemKey={(it) => it.id}
+                  scrollParent={scrollEl}
+                  isPinned={() => stickToBottomRef.current}
+                  renderItem={(it) => <TranscriptRow item={it} onImageLoad={maybeScrollToBottom} />}
+                />
               </PromptSendProvider>
             </>
           )}

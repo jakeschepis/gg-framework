@@ -1159,6 +1159,16 @@ export async function listProjects(): Promise<DiscoveredProject[]> {
   }
 }
 
+/**
+ * Hide a project from the picker, or restore it with `hidden: false`. Keyed by
+ * path so a dismissed scratch directory stays gone even though its sessions
+ * keep turning up in every scan.
+ */
+export async function setProjectHidden(projectPath: string, hidden: boolean): Promise<void> {
+  await waitForReady();
+  await invoke("agent_set_project_hidden", { path: projectPath, hidden });
+}
+
 /** A project file surfaced in the chat input's `@` picker. */
 export interface FileHit {
   /** Project-relative POSIX path, e.g. "src/App.tsx". */

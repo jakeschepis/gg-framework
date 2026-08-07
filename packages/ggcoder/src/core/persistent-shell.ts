@@ -11,6 +11,7 @@
  */
 import { spawn, type ChildProcess } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { sliceHead } from "@kenkaiiii/gg-ai";
 import { resolveShell, type ResolveShellOpts, type ShellResolution } from "./shell.js";
 import { killProcessTree } from "../utils/process.js";
 
@@ -137,7 +138,9 @@ export class PersistentShell {
         if (out.length > this.maxOutputBytes) {
           capped = true;
           scanTail = out.slice(-(sentinel.length + 16));
-          out = out.slice(0, this.maxOutputBytes);
+          // Surrogate-safe cut: splitting an emoji here strands a lone surrogate
+          // that later makes the provider request body invalid JSON.
+          out = sliceHead(out, this.maxOutputBytes);
         }
         onChunk?.(text);
         checkSentinel(capped ? scanTail : out, capped);

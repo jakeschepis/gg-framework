@@ -1,5 +1,5 @@
 import fs from "node:fs/promises";
-import { createReadStream } from "node:fs";
+import { createReadStream, realpathSync } from "node:fs";
 import readline from "node:readline";
 import os from "node:os";
 import path from "node:path";
@@ -9,7 +9,20 @@ import { getUserSessionPrompt } from "./session-preview.js";
 import { isSessionPath, openSessionReadStream, resolveSessionPath } from "./session-storage.js";
 import { parseForeignTranscript } from "./foreign-session-import.js";
 
-export type ProjectSource = "ggcoder" | "claude-code" | "codex";
+export type ProjectSource = "ggcoder" | "claude-code" | "codex" | "folder";
+
+export interface DiscoverProjectsOptions {
+  /** The user's configured projects folder; always scanned when set. */
+  projectsRoot?: string;
+  /**
+   * Extra folders the user has explicitly added as project roots. Scanned like
+   * `projectsRoot`; an explicit list beats inference, which stays as the
+   * zero-config default for people who never open Settings.
+   */
+  extraRoots?: readonly string[];
+  /** Project paths the user dismissed from the picker. */
+  hiddenPaths?: readonly string[];
+}
 
 export interface DiscoveredProject {
   name: string;
@@ -21,38 +34,62 @@ export interface DiscoveredProject {
 }
 
 /**
- * Scan ggcoder + Claude Code + Codex session stores and return one row per
- * project, sorted most-recent first. Duplicates (same cwd) are collapsed; the
- * `sources` field lists every store the project appeared in so the picker can
- * show a combined badge.
+ * Scan ggcoder + Claude Code + Codex session stores AND the user's project
+ * folders, returning one row per project sorted most-recent first. Duplicates
+ * (same cwd) are collapsed; the `sources` field lists every store the project
+ * appeared in so the picker can show a combined badge.
+ *
+ * Session stores alone only ever surface projects you have *already opened with
+ * an agent*, so a folder full of real projects stayed invisible until each one
+ * had been opened by some other route. The filesystem pass fixes that: it lists
+ * the direct children of every known project root, tagged `folder`.
  */
-export async function discoverProjects(): Promise<DiscoveredProject[]> {
+export async function discoverProjects(
+  options: DiscoverProjectsOptions = {},
+): Promise<DiscoveredProject[]> {
   const [gg, cc, cx] = await Promise.all([
     discoverGgcoderProjects(),
     discoverClaudeProjects(),
     discoverCodexProjects(),
   ]);
 
+  const fromSessions = [...gg, ...cc, ...cx];
+  const folders = await discoverFolderProjects(
+    resolveProjectRoots(options.projectsRoot, options.extraRoots, fromSessions),
+  );
+
   const byPath = new Map<string, DiscoveredProject>();
-  for (const p of [...gg, ...cc, ...cx]) {
+  for (const p of [...fromSessions, ...folders]) {
     const existing = byPath.get(p.path);
     if (!existing) {
       byPath.set(p.path, p);
       continue;
     }
+    // A folder's mtime is not activity: a checkout or a build touching the
+    // directory must not reorder a project above one you actually worked in.
+    // Session recency wins whenever any session store knows this project.
+    const merged = mergeSources(existing.sources, p.sources);
+    const sessionOnly = [existing, p].filter((row) => !isFolderOnly(row.sources));
     byPath.set(p.path, {
       name: existing.name,
       path: existing.path,
-      lastActiveMs: Math.max(existing.lastActiveMs, p.lastActiveMs),
+      lastActiveMs: Math.max(
+        ...(sessionOnly.length > 0 ? sessionOnly : [existing, p]).map((r) => r.lastActiveMs),
+      ),
       lastActiveDisplay: "", // recomputed below
-      sources: mergeSources(existing.sources, p.sources),
+      sources: merged,
     });
   }
 
-  const merged = Array.from(byPath.values()).map((p) => ({
-    ...p,
-    lastActiveDisplay: formatRelativeTime(p.lastActiveMs),
-  }));
+  // Hiding is by resolved path so a row dismissed once stays gone regardless of
+  // which store re-surfaces it later.
+  const hidden = new Set((options.hiddenPaths ?? []).map((p) => path.resolve(p)));
+  const merged = Array.from(byPath.values())
+    .filter((p) => !hidden.has(p.path))
+    .map((p) => ({
+      ...p,
+      lastActiveDisplay: formatRelativeTime(p.lastActiveMs),
+    }));
   merged.sort((a, b) => b.lastActiveMs - a.lastActiveMs);
   return merged;
 }
@@ -61,7 +98,12 @@ const SOURCE_ORDER: Record<ProjectSource, number> = {
   ggcoder: 0,
   "claude-code": 1,
   codex: 2,
+  folder: 3,
 };
+
+function isFolderOnly(sources: ProjectSource[]): boolean {
+  return sources.length === 1 && sources[0] === "folder";
+}
 
 function mergeSources(a: ProjectSource[], b: ProjectSource[]): ProjectSource[] {
   const set = new Set<ProjectSource>([...a, ...b]);
@@ -86,32 +128,53 @@ async function discoverGgcoderProjects(): Promise<DiscoveredProject[]> {
     return [];
   }
 
-  const results: DiscoveredProject[] = [];
-  for (const entry of entries) {
+  // Per-entry work is independent I/O (readdir + stat + a header read), so it
+  // runs concurrently; sequentially this dominated picker load time once a user
+  // had dozens of session stores.
+  const results = await mapConcurrent(entries, async (entry): Promise<DiscoveredProject | null> => {
     const dir = path.join(sessionsDir, entry);
     const mtime = await maxGgcoderSessionMtime(dir);
-    if (mtime === null) continue;
+    if (mtime === null) return null;
 
     const rawCwd =
       (await readFirstFromGgcoderDir(dir, ggcoderCwdExtractor)) ?? fallbackUnderscoreDecode(entry);
-    if (!rawCwd) continue;
+    if (!rawCwd) return null;
     // Normalize traversal segments (e.g. an agent launched with cwd
     // `.../src-tauri/../..`) so the basename isn't a stray "..", and drop any
     // Windows extended-length prefix so a session recorded as `\\?\C:\proj`
     // (what Rust's canonicalize used to hand the sidecar) resolves to the same
     // project as a plain `C:\proj` instead of listing a prefixed duplicate.
     const cwd = path.resolve(stripExtendedLengthPrefix(rawCwd));
-    if (!(await isDirectory(cwd))) continue;
+    if (!(await isDirectory(cwd))) return null;
 
-    results.push({
+    return {
       name: path.basename(cwd),
       path: cwd,
       lastActiveMs: mtime,
       lastActiveDisplay: formatRelativeTime(mtime),
       sources: ["ggcoder"],
-    });
-  }
-  return results;
+    };
+  });
+  return results.filter((p): p is DiscoveredProject => p !== null);
+}
+
+/**
+ * Bounded-concurrency `Promise.all`. Discovery fans out over hundreds of
+ * session files; an unbounded `Promise.all` exhausts the file-descriptor limit
+ * on a large store, while running sequentially is needlessly slow.
+ */
+const IO_CONCURRENCY = 32;
+
+async function mapConcurrent<T, R>(items: readonly T[], fn: (item: T) => Promise<R>): Promise<R[]> {
+  const out = new Array<R>(items.length);
+  let next = 0;
+  const workers = Array.from({ length: Math.min(IO_CONCURRENCY, items.length) }, async () => {
+    for (let i = next++; i < items.length; i = next++) {
+      out[i] = await fn(items[i]!);
+    }
+  });
+  await Promise.all(workers);
+  return out;
 }
 
 /**
@@ -164,26 +227,23 @@ async function discoverClaudeProjects(): Promise<DiscoveredProject[]> {
     return [];
   }
 
-  const results = await Promise.all(
-    entries.map(async (entry): Promise<DiscoveredProject | null> => {
-      const dir = path.join(projectsDir, entry);
-      const mtime = await maxJsonlMtime(dir);
-      if (mtime === null) return null;
+  const results = await mapConcurrent(entries, async (entry): Promise<DiscoveredProject | null> => {
+    const dir = path.join(projectsDir, entry);
+    const mtime = await maxJsonlMtime(dir);
+    if (mtime === null) return null;
 
-      const cwd =
-        (await readFirstFromJsonlDir(dir, claudeCwdExtractor)) ?? fallbackDashDecode(entry);
-      if (!cwd) return null;
-      if (!(await isDirectory(cwd))) return null;
+    const cwd = (await readFirstFromJsonlDir(dir, claudeCwdExtractor)) ?? fallbackDashDecode(entry);
+    if (!cwd) return null;
+    if (!(await isDirectory(cwd))) return null;
 
-      return {
-        name: path.basename(cwd),
-        path: cwd,
-        lastActiveMs: mtime,
-        lastActiveDisplay: formatRelativeTime(mtime),
-        sources: ["claude-code"],
-      };
-    }),
-  );
+    return {
+      name: path.basename(cwd),
+      path: cwd,
+      lastActiveMs: mtime,
+      lastActiveDisplay: formatRelativeTime(mtime),
+      sources: ["claude-code"],
+    };
+  });
   return results.filter((p): p is DiscoveredProject => p !== null);
 }
 
@@ -204,26 +264,156 @@ async function discoverCodexProjects(): Promise<DiscoveredProject[]> {
   // Process newest first so per-cwd we always start with the latest mtime.
   files.sort((a, b) => b.mtime - a.mtime);
 
+  const cwds = await mapConcurrent(files, (f) => readFirstFromFile(f.path, codexCwdExtractor));
+
   const byCwd = new Map<string, number>();
-  for (const f of files) {
-    const cwd = await readFirstFromFile(f.path, codexCwdExtractor);
-    if (!cwd) continue;
+  files.forEach((f, i) => {
+    const cwd = cwds[i];
+    if (!cwd) return;
     const prev = byCwd.get(cwd);
     if (prev === undefined || f.mtime > prev) byCwd.set(cwd, f.mtime);
+  });
+
+  const results = await mapConcurrent(
+    Array.from(byCwd),
+    async ([cwd, mtime]): Promise<DiscoveredProject | null> => {
+      if (!(await isDirectory(cwd))) return null;
+      return {
+        name: path.basename(cwd),
+        path: cwd,
+        lastActiveMs: mtime,
+        lastActiveDisplay: formatRelativeTime(mtime),
+        sources: ["codex"],
+      };
+    },
+  );
+  return results.filter((p): p is DiscoveredProject => p !== null);
+}
+
+/**
+ * How many already-known projects must share a parent directory before that
+ * parent is treated as a project root in its own right. Users keep more than
+ * one "projects folder" (the configured root plus wherever the rest actually
+ * live), but only one is configurable — so a directory that has repeatedly
+ * acted like a root is inferred from evidence rather than guessed.
+ */
+const INFERRED_ROOT_MIN_PROJECTS = 3;
+
+/** Directory names that are never a project of their own. */
+const FOLDER_SCAN_IGNORED = new Set([
+  "node_modules",
+  "dist",
+  "build",
+  "out",
+  "target",
+  "vendor",
+  "coverage",
+  "tmp",
+  "temp",
+  "Library",
+  "Applications",
+]);
+
+/**
+ * Which directories should be scanned for project folders: the configured root,
+ * plus any parent that already holds several known projects.
+ *
+ * Scanning the home directory or a filesystem/temp root would list mail, music
+ * and scratch dirs as "projects", so those are never roots no matter how many
+ * sessions point inside them.
+ */
+function resolveProjectRoots(
+  projectsRoot: string | undefined,
+  extraRoots: readonly string[] | undefined,
+  discovered: DiscoveredProject[],
+): string[] {
+  const roots = new Set<string>();
+  const configured = projectsRoot?.trim();
+  if (configured) roots.add(path.resolve(configured));
+  for (const extra of extraRoots ?? []) {
+    const trimmed = extra.trim();
+    if (trimmed) roots.add(path.resolve(trimmed));
   }
 
-  const results: DiscoveredProject[] = [];
-  for (const [cwd, mtime] of byCwd) {
-    if (!(await isDirectory(cwd))) continue;
-    results.push({
-      name: path.basename(cwd),
-      path: cwd,
-      lastActiveMs: mtime,
-      lastActiveDisplay: formatRelativeTime(mtime),
-      sources: ["codex"],
-    });
+  const counts = new Map<string, number>();
+  const seen = new Set<string>();
+  for (const project of discovered) {
+    if (seen.has(project.path)) continue;
+    seen.add(project.path);
+    const parent = path.dirname(project.path);
+    if (parent === project.path) continue;
+    counts.set(parent, (counts.get(parent) ?? 0) + 1);
   }
-  return results;
+  for (const [parent, count] of counts) {
+    if (count >= INFERRED_ROOT_MIN_PROJECTS && !isUnscannableRoot(parent)) roots.add(parent);
+  }
+
+  return Array.from(roots);
+}
+
+function isUnscannableRoot(dir: string): boolean {
+  const resolved = resolveExistingPath(dir);
+  if (resolved === resolveExistingPath(path.parse(resolved).root)) return true;
+  if (resolved === resolveExistingPath(os.homedir())) return true;
+  // Scratch checkouts and test fixtures cluster as direct children of the temp
+  // dir, which would otherwise infer it as a root and list every stale
+  // `tmp.XXXX` as a project. Resolve symlinks before comparing because macOS
+  // reports the same temp directory through both `/var` and `/private/var`.
+  // Only the temp dir itself is barred — a real projects folder below it is
+  // still scannable.
+  return resolved === resolveExistingPath(os.tmpdir());
+}
+
+function resolveExistingPath(dir: string): string {
+  const resolved = path.resolve(dir);
+  try {
+    return realpathSync(resolved);
+  } catch {
+    return resolved;
+  }
+}
+
+/**
+ * List the direct children of each project root as projects. Directory mtime
+ * stands in for "last active" — imprecise, but these rows are session-less by
+ * definition and merging keeps real session recency where it exists.
+ */
+async function discoverFolderProjects(roots: string[]): Promise<DiscoveredProject[]> {
+  const candidates: { name: string; path: string }[] = [];
+  for (const root of roots) {
+    let entries;
+    try {
+      entries = await fs.readdir(root, { withFileTypes: true });
+    } catch {
+      continue;
+    }
+    for (const entry of entries) {
+      if (!entry.isDirectory() && !entry.isSymbolicLink()) continue;
+      if (entry.name.startsWith(".")) continue;
+      if (FOLDER_SCAN_IGNORED.has(entry.name)) continue;
+      candidates.push({ name: entry.name, path: path.join(root, entry.name) });
+    }
+  }
+
+  // `stat` (not `lstat`) so a symlinked project folder resolves to its target:
+  // `readdir` reports a symlink as neither file nor directory, so checking the
+  // dirent alone would silently drop linked-in projects.
+  const rows = await mapConcurrent(candidates, async (c): Promise<DiscoveredProject | null> => {
+    try {
+      const stats = await fs.stat(c.path);
+      if (!stats.isDirectory()) return null;
+      return {
+        name: c.name,
+        path: c.path,
+        lastActiveMs: stats.mtimeMs,
+        lastActiveDisplay: formatRelativeTime(stats.mtimeMs),
+        sources: ["folder"],
+      };
+    } catch {
+      return null;
+    }
+  });
+  return rows.filter((r): r is DiscoveredProject => r !== null);
 }
 
 async function isDirectory(p: string): Promise<boolean> {

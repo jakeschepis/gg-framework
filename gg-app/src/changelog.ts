@@ -22,6 +22,54 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.41.0",
+    date: "2026-08-07",
+    items: [
+      "Your chat window just got a lot lighter on its feet. I now only draw the part of the conversation you are actually looking at, so a full day of work costs about the same as five minutes of it. My heaviest window dropped from `753 MB` to `380 MB` and the scrolling stayed buttery.",
+      "Giant command dumps no longer bury your chat. Anything long now folds into a neat preview with a `Show full output` button, so you skim the good part and open the rest only when you want it. Copy still grabs the whole thing, every time.",
+    ],
+  },
+  {
+    version: "0.40.1",
+    date: "2026-08-06",
+    items: [
+      "I hunted down the last big memory hog: the chat window itself. Marathon sessions used to keep every message and every screenshot loaded all day, quietly swelling each window into the gigabytes. Now I keep just the newest `120` messages live and park the rest behind a tidy `Show earlier messages` button, so your chat stays complete while your memory stays yours.",
+    ],
+  },
+  {
+    version: "0.40.0",
+    date: "2026-08-06",
+    items: [
+      "GG Coder just got dramatically lighter. I used to spin up a private set of background helpers for every single window, so four projects open meant four copies of everything doing identical work. Now they all share, and a four window session on my machine dropped from `3.3 GB` to about `900 MB`. Same speed, same features, far more room for everything else you are running.",
+      "Projects you walk away from now hand their memory back. Leave one alone for `5 minutes` and I quietly release the code intelligence holding it, then spin it straight back up the moment you return. No more watching the app get heavier all day just because you opened something once this morning.",
+    ],
+  },
+  {
+    version: "0.39.5",
+    date: "2026-08-05",
+    items: [
+      "I hold the thread on long sessions now. When a chat runs long enough that I have to compress my own memory, I lead with exactly what I was doing and what comes next, instead of burying it under a replay of everything you already said. Fewer dropped balls, less repeating yourself.",
+      "That same memory got leaner. I stopped hoarding lists of every file I had glanced at and stopped stacking old summaries on top of each other, so more of my `memory` goes to your actual work and long chats stay sharp for longer.",
+    ],
+  },
+  {
+    version: "0.39.4",
+    date: "2026-08-05",
+    items: [
+      "The `Choose a project` screen is back on its feet. I stopped `macOS` scratch folders from crashing the list, so your real projects load cleanly instead of leaving you staring at a black window.",
+    ],
+  },
+  {
+    version: "0.39.3",
+    date: "2026-08-05",
+    items: [
+      "Every one of your projects is finally on the `Choose a project` screen. It used to only show the ones you had already opened with an agent, so most of your work was invisible. Now I read your project folders straight off disk and list the lot. On my own machine that took it from `31` projects to `97`.",
+      "Spot something you never want to see in that list again? Hover it and hit the `\u00d7`. It is gone for good, and it stays gone next time you launch. Great for the scratch folders and stray temp directories that used to clutter the place up.",
+      "The project list also opens noticeably quicker. I got it scanning everything at once instead of one folder at a time, so it lands almost `2x` faster even with a hundred projects to sift through.",
+      "Skills now stick. When I load a skill to do a job properly, it can no longer get quietly dropped from my memory partway through a long session, so I keep working the way you asked all the way to the end.",
+    ],
+  },
+  {
     version: "0.39.2",
     date: "2026-08-03",
     items: [

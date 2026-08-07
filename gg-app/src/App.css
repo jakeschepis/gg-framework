@@ -1867,6 +1867,46 @@ body {
   font-size: 13px;
   line-height: 1.45;
 }
+/* Row + its hover-revealed hide affordance. The hide control can't nest inside
+   .picker-item (button-in-button is invalid), so it's an absolutely positioned
+   sibling. */
+.picker-item-wrap {
+  position: relative;
+  display: flex;
+}
+.picker-hide {
+  position: absolute;
+  top: 50%;
+  right: 8px;
+  transform: translateY(-50%);
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  width: 24px;
+  height: 24px;
+  padding: 0;
+  border: none;
+  border-radius: var(--radius-button);
+  background: transparent;
+  color: var(--text-dim);
+  font-family: var(--sans);
+  font-size: 15px;
+  line-height: 1;
+  cursor: pointer;
+  opacity: 0;
+  transition:
+    opacity var(--t-fast),
+    color var(--t-fast),
+    background-color var(--t-fast);
+}
+.picker-item-wrap:hover .picker-hide,
+.picker-hide:focus-visible {
+  opacity: 1;
+}
+.picker-hide:hover {
+  background: var(--surface-2);
+  color: var(--text);
+}
 .picker-item {
   display: flex;
   flex-direction: column;
@@ -3974,6 +4014,35 @@ body {
   animation: reveal-up 180ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
+/* ── "Show full output" control ──
+   Long fenced blocks and oversized rows fold to a preview so a single dump
+   cannot balloon the webview; this reveals the rest on demand. Sits under the
+   folded block, matching the code chrome around it. */
+.code-expand {
+  display: block;
+  width: 100%;
+  margin: 4px 0 0;
+  padding: 4px 10px;
+  font: inherit;
+  font-size: 11px;
+  text-align: left;
+  color: var(--text-dim, #8b8b8b);
+  background: transparent;
+  border: 1px solid var(--border, #2a2a2a);
+  border-radius: 6px;
+  cursor: pointer;
+  opacity: 0.8;
+  transition: opacity 120ms ease;
+}
+.code-expand:hover {
+  opacity: 1;
+}
+/* Fade the last preview line so a fold reads as "there is more", not "the end". */
+.code-block.folded pre {
+  mask-image: linear-gradient(to bottom, #000 60%, rgba(0, 0, 0, 0.25) 100%);
+  -webkit-mask-image: linear-gradient(to bottom, #000 60%, rgba(0, 0, 0, 0.25) 100%);
+}
+
 /* ── Wake screen: Matrix-style empty state (the app addressing the user) ──
    Fills the transcript area: faint brand-tinted digital rain behind a single
    line of terminal text that types itself out and rests on the invitation. */
@@ -4104,7 +4173,8 @@ body {
 .picker-reveal {
   display: contents;
 }
-.picker-reveal > .picker-item {
+.picker-reveal > .picker-item,
+.picker-reveal > .picker-item-wrap {
   animation: reveal-up 200ms cubic-bezier(0.22, 1, 0.36, 1) both;
 }
 
@@ -4113,7 +4183,8 @@ body {
   .transcript-reveal,
   .skeleton-msg,
   .skeleton-item,
-  .picker-reveal > .picker-item {
+  .picker-reveal > .picker-item,
+  .picker-reveal > .picker-item-wrap {
     animation-name: none;
   }
   .skeleton {
