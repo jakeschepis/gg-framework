@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { Message, ToolResult } from "@kenkaiiii/gg-ai";
-import { repairToolPairingAdjacent } from "./agent-loop.js";
+import { dropUnpairableToolExchanges, repairToolPairingAdjacent } from "./agent-loop.js";
 
 function assistantCall(...ids: string[]): Message {
   return {
@@ -72,13 +72,7 @@ describe("repairToolPairingAdjacent", () => {
 
     repairToolPairingAdjacent(messages);
 
-    expect(messages.map((m) => m.role)).toEqual([
-      "assistant",
-      "tool",
-      "user",
-      "assistant",
-      "tool",
-    ]);
+    expect(messages.map((m) => m.role)).toEqual(["assistant", "tool", "user", "assistant", "tool"]);
     expect(resultIds(messages[4])).toEqual(["search-1", "search-2"]);
     // Every remaining result pairs with the immediately preceding assistant.
     for (let i = 0; i < messages.length; i++) {
@@ -147,5 +141,132 @@ describe("repairToolPairingAdjacent", () => {
     repairToolPairingAdjacent(messages);
 
     expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+  });
+});
+
+function clone(messages: Message[]): Message[] {
+  return structuredClone(messages);
+}
+
+/** Every tool_use/tool_result block that would reach the provider wire. */
+function toolBlockCount(messages: Message[]): number {
+  let n = 0;
+  for (const msg of messages) {
+    if (!Array.isArray(msg.content)) continue;
+    if (msg.role === "tool") n += msg.content.length;
+    else n += (msg.content as { type: string }[]).filter((p) => p.type === "tool_call").length;
+  }
+  return n;
+}
+
+describe("dropUnpairableToolExchanges (400 retry path)", () => {
+  it("changes history that the pre-send repair leaves untouched", () => {
+    // The shape the adjacency repair is stable-but-wrong on: two assistant
+    // messages claim the same tool_call id. The repair inserts a synthetic
+    // result for the second, then drops it again as a duplicate id — so every
+    // pass ends with an orphaned tool_call and re-running it is a no-op.
+    const wedged: Message[] = [
+      assistantCall("dup"),
+      toolResults("dup"),
+      { role: "user", content: "again" },
+      assistantCall("dup"),
+      toolResults("dup"),
+    ];
+
+    repairToolPairingAdjacent(wedged);
+    const afterPreSend = clone(wedged);
+    // Pre-send pass is idempotent: the retry could not have changed anything.
+    repairToolPairingAdjacent(wedged);
+    expect(wedged).toEqual(afterPreSend);
+
+    const fallback = dropUnpairableToolExchanges(wedged);
+
+    expect(fallback.changed).toBe(true);
+    expect(fallback.strategy).toBe("dropped_unpairable");
+    expect(wedged).not.toEqual(afterPreSend);
+    // The orphaned second call is gone; the answered first exchange survives.
+    expect(wedged.map((m) => m.role)).toEqual(["assistant", "tool", "user"]);
+    expect(resultIds(wedged[1])).toEqual(["dup"]);
+  });
+
+  it("drops an assistant tool_call the repair would have papered over", () => {
+    const messages: Message[] = [assistantCall("a"), { role: "user", content: "next" }];
+
+    const fallback = dropUnpairableToolExchanges(messages);
+
+    expect(fallback.changed).toBe(true);
+    expect(fallback.droppedCalls).toBe(1);
+    // Repair would have inserted a synthetic result; the fallback deletes the call.
+    expect(messages.map((m) => m.role)).toEqual(["user"]);
+  });
+
+  it("keeps text alongside a dropped tool_call", () => {
+    const messages: Message[] = [
+      {
+        role: "assistant",
+        content: [
+          { type: "text", text: "on it" },
+          { type: "tool_call", id: "a", name: "bash", args: {} },
+        ],
+      },
+      { role: "user", content: "next" },
+    ];
+
+    dropUnpairableToolExchanges(messages);
+
+    expect(messages).toHaveLength(2);
+    expect(messages[0]!.content).toEqual([{ type: "text", text: "on it" }]);
+  });
+
+  it("drops a tool message whose assistant vanished", () => {
+    const messages: Message[] = [
+      { role: "user", content: "hi" },
+      toolResults("vanished"),
+      { role: "assistant", content: "done" },
+    ];
+
+    const fallback = dropUnpairableToolExchanges(messages);
+
+    expect(fallback.changed).toBe(true);
+    expect(fallback.droppedResults).toBe(1);
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant"]);
+  });
+
+  it("flattens tool exchanges to text when the history already pairs cleanly", () => {
+    // Nothing structural left to drop — the provider rejected a shape we don't
+    // model — so the retry must still send something different.
+    const messages: Message[] = [
+      { role: "user", content: "run it" },
+      assistantCall("a"),
+      toolResults("a"),
+      { role: "assistant", content: "done" },
+    ];
+    const before = clone(messages);
+
+    const fallback = dropUnpairableToolExchanges(messages);
+
+    expect(fallback.changed).toBe(true);
+    expect(fallback.strategy).toBe("flattened_to_text");
+    expect(messages).not.toEqual(before);
+    // Zero tool_use/tool_result blocks can reach the wire now.
+    expect(toolBlockCount(messages)).toBe(0);
+    expect(messages.map((m) => m.role)).toEqual(["user", "assistant", "user", "assistant"]);
+    // The output survives as text so no context is lost.
+    expect(JSON.stringify(messages[2]!.content)).toContain("output a");
+    expect(JSON.stringify(messages[1]!.content)).toContain("bash");
+  });
+
+  it("reports no change when there is no tool structure left to strip", () => {
+    const messages: Message[] = [
+      { role: "user", content: "hi" },
+      { role: "assistant", content: "hello" },
+    ];
+    const before = clone(messages);
+
+    const fallback = dropUnpairableToolExchanges(messages);
+
+    expect(fallback.changed).toBe(false);
+    expect(fallback.strategy).toBe("none");
+    expect(messages).toEqual(before);
   });
 });

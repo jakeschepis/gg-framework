@@ -6,6 +6,8 @@ export {
   isContextOverflow,
   isBillingError,
   isUsageLimitError,
+  isToolPairingError,
+  repairToolPairingAdjacent,
   setStreamDiagnostic,
 } from "./agent-loop.js";
 export type { StreamDiagnosticFn } from "./agent-loop.js";

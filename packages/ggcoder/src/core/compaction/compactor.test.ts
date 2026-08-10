@@ -1168,9 +1168,10 @@ describe("compact", () => {
     expect(remapAnchorForCompaction(oldNonSystem, remap!)).toBe(newNonSystem);
   });
 
-  // repairToolPairing and the trailing-assistant pop can shorten the retained
-  // tail AFTER the collapse is decided. Deriving the new length from
-  // summarizedCount alone then overshoots, pushing tail anchors past the end —
+  // repairToolPairingAdjacent and the trailing-assistant pop can change the
+  // length of the retained tail AFTER the collapse is decided (the repair drops
+  // orphaned tool messages and inserts synthetic ones). Deriving the new length
+  // from summarizedCount alone then misses, pushing tail anchors past the end —
   // where markers get dropped and Ken turns clamp to the bottom, which is the
   // exact symptom this remap exists to prevent.
   it("never maps an anchor past the end when the trailing assistant is popped", async () => {
@@ -1202,6 +1203,50 @@ describe("compact", () => {
     for (let anchor = 0; anchor <= oldNonSystem; anchor++) {
       expect(remapAnchorForCompaction(anchor, remap!)).toBeLessThanOrEqual(newNonSystem);
     }
+  });
+
+  // The compacted history is persisted, so stripping an unanswered tool_call
+  // erases the record that the agent ran the tool at all. The shared adjacency
+  // repair keeps the call and closes it with a synthetic interrupted result.
+  it("preserves an unanswered tool_call and fills a synthetic interrupted result", async () => {
+    const mockStream = vi.mocked(stream);
+    mockStream.mockReturnValue(
+      mockStreamResult(
+        Promise.resolve({
+          message: { role: "assistant", content: "Summary." },
+          stopReason: "end_turn",
+          usage: { inputTokens: 1000, outputTokens: 50 },
+        }),
+      ) as never,
+    );
+
+    // Turn interrupted mid-tool: the call was issued, the result never arrived.
+    const messages = buildConversation(30);
+    messages.push(makeMessage("user", "run the build"));
+    messages.push(makeToolCallMessage("bash", { command: "pnpm build" }, "tc-interrupted"));
+
+    const result = await compact(messages, baseOptions);
+    expect(result.result.compacted).toBe(true);
+
+    // The assistant tool_call block survives compaction verbatim.
+    const assistant = result.messages.find(
+      (m) =>
+        m.role === "assistant" &&
+        Array.isArray(m.content) &&
+        (m.content as ContentPart[]).some(
+          (p) => p.type === "tool_call" && (p as { id: string }).id === "tc-interrupted",
+        ),
+    );
+    expect(assistant).toBeDefined();
+
+    // ...and it is immediately followed by the synthetic result that satisfies
+    // Anthropic's adjacency invariant.
+    const next = result.messages[result.messages.indexOf(assistant!) + 1];
+    expect(next?.role).toBe("tool");
+    const filled = (next!.content as ToolResult[]).find((r) => r.toolCallId === "tc-interrupted");
+    expect(filled).toBeDefined();
+    expect(filled!.isError).toBe(true);
+    expect(filled!.content).toBe("Tool execution was interrupted.");
   });
 
   it("appends one merged modified-files block and never lists read files", async () => {

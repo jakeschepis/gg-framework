@@ -5,6 +5,7 @@ import {
   type ContentPart,
   type ToolResult,
 } from "@kenkaiiii/gg-ai";
+import { repairToolPairingAdjacent } from "@kenkaiiii/gg-agent";
 import { estimateConversationTokens, estimateMessageTokens } from "./token-estimator.js";
 import { findLatestHumanQuery, selectQueryAwareContext } from "./query-aware-selector.js";
 import { getSummaryModel, getContextWindow } from "../model-registry.js";
@@ -558,91 +559,6 @@ function messageToString(msg: Message): string {
       .join("\n\n");
   }
   return "";
-}
-
-/**
- * Collect all tool_call IDs from an assistant message.
- */
-function getToolCallIds(msg: Message): Set<string> {
-  const ids = new Set<string>();
-  if (msg.role === "assistant" && Array.isArray(msg.content)) {
-    for (const p of msg.content as ContentPart[]) {
-      if (p.type === "tool_call")
-        ids.add((p as ContentPart & { type: "tool_call"; id: string }).id);
-    }
-  }
-  return ids;
-}
-
-/**
- * Collect all tool_result IDs (toolCallId) from a tool message.
- */
-function getToolResultIds(msg: Message): Set<string> {
-  const ids = new Set<string>();
-  if (msg.role === "tool" && Array.isArray(msg.content)) {
-    for (const tr of msg.content as ToolResult[]) {
-      ids.add(tr.toolCallId);
-    }
-  }
-  return ids;
-}
-
-/**
- * Repair tool_use / tool_result pairing in a message array (mutates in place).
- *
- * Two repair strategies matching real-world patterns (Roo-Code, openclaw):
- * 1. Strip orphaned tool_call blocks from assistant messages when the next
- *    message doesn't contain their matching tool_result.
- * 2. Remove orphaned tool messages whose tool_use assistant was dropped.
- */
-function repairToolPairing(msgs: Message[]): void {
-  // Build a set of all tool_call IDs and tool_result IDs in the conversation
-  const allToolCallIds = new Set<string>();
-  const allToolResultIds = new Set<string>();
-  for (const msg of msgs) {
-    for (const id of getToolCallIds(msg)) allToolCallIds.add(id);
-    for (const id of getToolResultIds(msg)) allToolResultIds.add(id);
-  }
-
-  // Walk through and fix mismatches
-  for (let i = msgs.length - 1; i >= 0; i--) {
-    const msg = msgs[i];
-
-    // Remove tool messages whose tool_call IDs have no matching assistant
-    if (msg.role === "tool" && Array.isArray(msg.content)) {
-      const results = msg.content as ToolResult[];
-      const kept = results.filter((tr) => allToolCallIds.has(tr.toolCallId));
-      if (kept.length === 0) {
-        msgs.splice(i, 1);
-        continue;
-      }
-      if (kept.length < results.length) {
-        (msgs[i] as { content: ToolResult[] }).content = kept;
-      }
-    }
-
-    // Strip tool_call blocks from assistant messages that have no matching tool_result
-    if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      const parts = msg.content as ContentPart[];
-      const hasOrphans = parts.some(
-        (p) =>
-          p.type === "tool_call" &&
-          !allToolResultIds.has((p as ContentPart & { type: "tool_call"; id: string }).id),
-      );
-      if (hasOrphans) {
-        const kept = parts.filter(
-          (p) =>
-            p.type !== "tool_call" ||
-            allToolResultIds.has((p as ContentPart & { type: "tool_call"; id: string }).id),
-        );
-        if (kept.length === 0) {
-          (msgs[i] as { content: string | ContentPart[] }).content = "";
-        } else {
-          (msgs[i] as { content: ContentPart[] }).content = kept;
-        }
-      }
-    }
-  }
 }
 
 /** A previous compaction summary, separated from fresh conversation evidence. */
@@ -1207,7 +1123,11 @@ export async function compact(
       ...(skipAck ? [] : [acknowledgement]),
       ...tail,
     ];
-    repairToolPairing(candidateMessages);
+    // Shared with the agent loop so the persisted compacted history obeys the
+    // exact same adjacency invariant the wire does — including preserving
+    // assistant tool_call blocks with a synthetic interrupted result rather
+    // than erasing the record that a tool ran.
+    repairToolPairingAdjacent(candidateMessages);
 
     const minMessages = skipAck ? 2 : 3;
     while (

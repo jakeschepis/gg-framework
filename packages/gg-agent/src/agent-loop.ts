@@ -1185,13 +1185,26 @@ export async function* agentLoop(
           break;
         }
         // Tool pairing 400: orphaned tool_result or tool_use in message history.
-        // Run repair and retry once — if repair can't fix it, surface the error.
+        // `repairToolPairingAdjacent` already ran on this exact payload in the
+        // pre-send pass above and is idempotent, so re-running it here would
+        // re-send a byte-identical request. Escalate instead: drop what can't be
+        // paired, or flatten tool exchanges to text when the history already
+        // looks paired to us. If that changes nothing, a retry is pointless —
+        // fall through and surface the error.
         if (isToolPairingError(err) && !toolPairingRepaired) {
           toolPairingRepaired = true;
-          diag("tool_pairing_repair", { error: errMsg.slice(0, 200) });
-          repairToolPairingAdjacent(messages);
-          turn--;
-          continue;
+          const fallback = dropUnpairableToolExchanges(messages);
+          diag("tool_pairing_fallback", {
+            error: errMsg.slice(0, 200),
+            strategy: fallback.strategy,
+            droppedCalls: fallback.droppedCalls,
+            droppedResults: fallback.droppedResults,
+            flattened: fallback.flattened,
+          });
+          if (fallback.changed) {
+            turn--;
+            continue;
+          }
         }
         // Thinking-block integrity 400: a signed thinking block in the latest
         // assistant message couldn't be validated (commonly a partial signature
@@ -2219,6 +2232,202 @@ export function repairToolPairingAdjacent(messages: Message[]): void {
       (msg as { content: ToolResult[] }).content = filtered;
     }
   }
+}
+
+/** What {@link dropUnpairableToolExchanges} did to the history. */
+export interface ToolPairingFallback {
+  /** True when the array actually changed — only then is a retry worth sending. */
+  changed: boolean;
+  /** Which escalation ran: nothing left to do, structural drop, or full flatten. */
+  strategy: "none" | "dropped_unpairable" | "flattened_to_text";
+  /** assistant `tool_call` blocks removed. */
+  droppedCalls: number;
+  /** `tool_result` entries removed. */
+  droppedResults: number;
+  /** messages rewritten as plain text (only for `flattened_to_text`). */
+  flattened: number;
+}
+
+/** Passes are monotone (they only remove), so this cap is pure paranoia. */
+const MAX_PAIRING_FALLBACK_PASSES = 10;
+
+/**
+ * Last-resort escalation after the provider rejected a payload that
+ * {@link repairToolPairingAdjacent} already blessed. That pass runs before
+ * every LLM call and is idempotent, so re-running it on the 400 path cannot
+ * change the payload — this is the strictly stronger pass that can.
+ *
+ * Two tiers, first one that changes something wins:
+ *
+ *  1. **Drop, don't synthesize.** Where the adjacency repair fills a missing
+ *     result with a synthetic marker, this deletes the `tool_call` instead, and
+ *     deletes any `tool_result` not adjacent to an assistant carrying its id or
+ *     duplicating an id already answered. That reaches shapes the repair is
+ *     stable-but-wrong on — notably the same tool_call id used by two assistant
+ *     messages, where the repair endlessly inserts and then drops the second
+ *     result, leaving an orphaned `tool_call` on the wire every time.
+ *  2. **Flatten to text.** If tier 1 finds nothing (the history looks perfectly
+ *     paired to us, yet the provider still 400s — a shape we don't model), every
+ *     tool exchange is rewritten as plain text: `tool_call` blocks become text,
+ *     `tool` messages become user text messages. The conversation survives, the
+ *     request carries zero tool_use/tool_result blocks, and no pairing rule can
+ *     be violated.
+ *
+ * Mutates in place. `changed: false` means there was no tool structure left to
+ * strip — a retry would be byte-identical, so the caller should surface the error.
+ */
+export function dropUnpairableToolExchanges(messages: Message[]): ToolPairingFallback {
+  let droppedCalls = 0;
+  let droppedResults = 0;
+
+  for (let pass = 0; pass < MAX_PAIRING_FALLBACK_PASSES; pass++) {
+    let changedThisPass = false;
+
+    // Result side: a tool_result survives only when its tool_call sits in the
+    // immediately preceding assistant message and no earlier result answered it.
+    const answered = new Set<string>();
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i]!;
+      if (msg.role !== "tool" || !Array.isArray(msg.content)) continue;
+      const adjacentIds = toolCallIdsOf(messages[i - 1]);
+      const results = msg.content as ToolResult[];
+      const kept = results.filter((r) => {
+        if (!adjacentIds.has(r.toolCallId) || answered.has(r.toolCallId)) return false;
+        answered.add(r.toolCallId);
+        return true;
+      });
+      if (kept.length === results.length) continue;
+      droppedResults += results.length - kept.length;
+      changedThisPass = true;
+      if (kept.length === 0) {
+        messages.splice(i, 1);
+        i--;
+      } else {
+        (msg as { content: ToolResult[] }).content = kept;
+      }
+    }
+
+    // Call side: a tool_call survives only when the very next message answers it
+    // and no earlier tool_call already claimed that id.
+    const claimed = new Set<string>();
+    for (let i = 0; i < messages.length; i++) {
+      const msg = messages[i]!;
+      if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+      const content = msg.content as ContentPart[];
+      if (!content.some((p) => p.type === "tool_call")) continue;
+
+      const next = messages[i + 1];
+      const answeredIds = new Set<string>();
+      if (next?.role === "tool" && Array.isArray(next.content)) {
+        for (const r of next.content as ToolResult[]) answeredIds.add(r.toolCallId);
+      }
+
+      const kept = content.filter((p) => {
+        if (p.type !== "tool_call") return true;
+        const id = (p as ToolCall).id;
+        if (answeredIds.has(id) && !claimed.has(id)) {
+          claimed.add(id);
+          return true;
+        }
+        droppedCalls++;
+        return false;
+      });
+      if (kept.length === content.length) continue;
+      changedThisPass = true;
+      // Thinking-only leftovers carry no answer for the user and can trip
+      // Anthropic's thinking-position checks — drop the message instead.
+      if (kept.some((p) => p.type !== "thinking")) {
+        (msg as { content: ContentPart[] }).content = kept;
+      } else {
+        messages.splice(i, 1);
+        i--;
+      }
+    }
+
+    if (!changedThisPass) break;
+  }
+
+  if (droppedCalls > 0 || droppedResults > 0) {
+    return {
+      changed: true,
+      strategy: "dropped_unpairable",
+      droppedCalls,
+      droppedResults,
+      flattened: 0,
+    };
+  }
+
+  const flattened = flattenToolExchangesToText(messages);
+  return {
+    changed: flattened > 0,
+    strategy: flattened > 0 ? "flattened_to_text" : "none",
+    droppedCalls: 0,
+    droppedResults: 0,
+    flattened,
+  };
+}
+
+/** Ids of the `tool_call` blocks in `msg`, empty for anything else. */
+function toolCallIdsOf(msg: Message | undefined): Set<string> {
+  const ids = new Set<string>();
+  if (msg?.role !== "assistant" || !Array.isArray(msg.content)) return ids;
+  for (const p of msg.content as ContentPart[]) {
+    if (p.type === "tool_call") ids.add((p as ToolCall).id);
+  }
+  return ids;
+}
+
+/**
+ * Rewrite every tool exchange as plain text, in place. `tool_call` blocks become
+ * text blocks; `tool` messages become user text messages carrying the same
+ * output (Anthropic already sees tool messages as `user` on the wire, so the
+ * role sequence is unchanged). Returns the number of messages rewritten.
+ */
+function flattenToolExchangesToText(messages: Message[]): number {
+  const namesById = new Map<string, string>();
+  for (const msg of messages) {
+    if (msg.role !== "assistant" || !Array.isArray(msg.content)) continue;
+    for (const p of msg.content as ContentPart[]) {
+      if (p.type === "tool_call") namesById.set((p as ToolCall).id, (p as ToolCall).name);
+    }
+  }
+
+  let rewritten = 0;
+  for (let i = 0; i < messages.length; i++) {
+    const msg = messages[i]!;
+
+    if (msg.role === "assistant" && Array.isArray(msg.content)) {
+      const content = msg.content as ContentPart[];
+      if (!content.some((p) => p.type === "tool_call")) continue;
+      (msg as { content: ContentPart[] }).content = content.map((p) =>
+        p.type === "tool_call"
+          ? { type: "text" as const, text: `[called ${(p as ToolCall).name}]` }
+          : p,
+      );
+      rewritten++;
+      continue;
+    }
+
+    if (msg.role === "tool" && Array.isArray(msg.content)) {
+      const text = (msg.content as ToolResult[])
+        .map((r) => {
+          const name = namesById.get(r.toolCallId) ?? "tool";
+          return `[${name} result${r.isError ? " (error)" : ""}]\n${toolResultPlainText(r.content)}`;
+        })
+        .join("\n\n");
+      messages[i] = { role: "user", content: [{ type: "text", text }] };
+      rewritten++;
+    }
+  }
+  return rewritten;
+}
+
+/** Flatten tool result content to text; non-text blocks become a marker. */
+function toolResultPlainText(content: ToolResult["content"]): string {
+  if (typeof content === "string") return content;
+  return content
+    .map((part) => (part.type === "text" ? part.text : `[${part.type} omitted]`))
+    .join("\n");
 }
 
 /**
