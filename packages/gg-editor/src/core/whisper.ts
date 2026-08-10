@@ -61,10 +61,7 @@ export interface Transcript {
  *                              `chunking_strategy: "auto"` for inputs > 30s.
  */
 export type OpenAITranscriptionModel =
-  | "whisper-1"
-  | "gpt-4o-transcribe"
-  | "gpt-4o-mini-transcribe"
-  | "gpt-4o-transcribe-diarize";
+  "whisper-1" | "gpt-4o-transcribe" | "gpt-4o-mini-transcribe" | "gpt-4o-transcribe-diarize";
 
 export interface TranscribeOptions {
   /** Force a backend; otherwise auto-pick (whisperx if diarize=true, else local first, then api). */

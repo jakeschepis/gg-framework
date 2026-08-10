@@ -256,13 +256,7 @@ export type StreamEvent =
 // ── Stop Reasons ───────────────────────────────────────────
 
 export type StopReason =
-  | "end_turn"
-  | "tool_use"
-  | "max_tokens"
-  | "pause_turn"
-  | "stop_sequence"
-  | "refusal"
-  | "error";
+  "end_turn" | "tool_use" | "max_tokens" | "pause_turn" | "stop_sequence" | "refusal" | "error";
 
 // ── Response ───────────────────────────────────────────────
 

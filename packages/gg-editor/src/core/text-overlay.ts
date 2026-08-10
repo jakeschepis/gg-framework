@@ -26,12 +26,7 @@
 import { assColor, buildAss, type AssCue, type AssOptions, type AssStyle } from "./ass.js";
 
 export type LowerThirdPosition =
-  | "bottom-left"
-  | "bottom-center"
-  | "bottom-right"
-  | "top-left"
-  | "top-center"
-  | "top-right";
+  "bottom-left" | "bottom-center" | "bottom-right" | "top-left" | "top-center" | "top-right";
 
 export type LowerThirdAnimation = "slide-left" | "slide-right" | "fade" | "none";
 

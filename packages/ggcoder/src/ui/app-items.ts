@@ -1,4 +1,5 @@
 import type { PasteInfo } from "./components/InputArea.js";
+import type { PromptSegment } from "../utils/prompt-enhancer.js";
 import type { SubAgentInfo } from "./components/SubAgentPanel.js";
 import type { LanguageId } from "../core/language-detector.js";
 import type { SessionSummary } from "./session-summary.js";
@@ -19,6 +20,12 @@ export interface UserItem {
   pasteInfo?: PasteInfo;
   /** Inline previews for attached images, rendered after the user row. */
   imagePreviews?: ImagePreview[];
+  /**
+   * Ctrl+E prompt-enhancer segments, attached only when the text sent is byte
+   * -identical to what the enhancer produced. Drives the highlighted terms and
+   * teaching footnotes in both the live row and the scrollback serializer.
+   */
+  enhancements?: PromptSegment[];
   id: string;
 }
 

@@ -353,8 +353,7 @@ function BossAppInner({ boss, resetUI, terminalHistoryPrinter }: BossAppProps): 
   }
 
   const lastPendingHistoryItem = state.pendingFlush[state.pendingFlush.length - 1] as
-    | BossDisplayItem
-    | undefined;
+    BossDisplayItem | undefined;
   const lastHistoryItem = state.history[state.history.length - 1] as BossDisplayItem | undefined;
   const livePane = (
     <BossStreamingTurnView

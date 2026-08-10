@@ -4,6 +4,7 @@ import { useTerminalSize } from "./hooks/useTerminalSize.js";
 import { useChatLayoutMeasurements } from "./hooks/useChatLayoutMeasurements.js";
 import { useTaskPickerController } from "./hooks/useTaskPickerController.js";
 import { useModeState } from "./hooks/useModeState.js";
+import { useAutopilot, type UseAutopilotResult } from "./hooks/useAutopilot.js";
 import { useSessionPersistence } from "./hooks/useSessionPersistence.js";
 import { useContextCompaction } from "./hooks/useContextCompaction.js";
 import { useDoublePress } from "./hooks/useDoublePress.js";
@@ -18,6 +19,11 @@ import {
   killTask,
 } from "./stores/taskbar-store.js";
 import { playNotificationSound } from "../utils/sound.js";
+import { enhanceDraft } from "../utils/prompt-enhancer.js";
+import {
+  enhancementsForSubmittedText,
+  type PendingEnhancement,
+} from "./utils/user-message-display.js";
 import {
   type Message,
   type Provider,
@@ -46,7 +52,6 @@ import { SessionSummaryDisplay } from "./components/SessionSummary.js";
 import type { SlashCommandInfo } from "./components/SlashCommandMenu.js";
 import type { ProcessManager } from "../core/process-manager.js";
 import { useTheme, useSetTheme, type ThemeName } from "./theme/theme.js";
-import { useTerminalTitle } from "./hooks/useTerminalTitle.js";
 import { getGitBranch } from "../utils/git.js";
 import { getAuthStorageKeys, getModel, getVideoByteLimit } from "../core/model-registry.js";
 import { SessionManager, type TurnMetricPayload } from "../core/session-manager.js";
@@ -58,6 +63,14 @@ import {
 } from "../core/auto-update.js";
 import { SettingsManager, type Settings } from "../core/settings-manager.js";
 import { PROMPT_COMMANDS } from "../core/prompt-commands.js";
+import {
+  countAssistantMessages,
+  extractTurnToolCalls,
+  isMechanicalOnlyTurn,
+  isWorkflowCommandText,
+  shouldStartAutopilotCycle,
+} from "../core/autopilot-gate.js";
+import { IMPLEMENT_PLAN_PROMPT, loadWorkflowCommandSpecs } from "../core/autopilot-runtime.js";
 import { getAnnouncedLanguages, markLanguagesAnnounced } from "../core/setup-history.js";
 import { loadCustomCommands, type CustomCommand } from "../core/custom-commands.js";
 import { detectLanguages, type LanguageId } from "../core/language-detector.js";
@@ -218,6 +231,7 @@ export interface AppProps {
   version: string;
   showTokenUsage?: boolean;
   idealReviewEnabled?: boolean;
+  autopilotEnabled?: boolean;
   onSlashCommand?: (input: string) => Promise<string | null>;
   loggedInProviders?: Provider[];
   credentialsByProvider?: Record<
@@ -337,6 +351,7 @@ export interface AppProps {
     planMode?: boolean;
     sessionStats?: SessionStats;
     idealReviewEnabled?: boolean;
+    autopilotEnabled?: boolean;
   };
 }
 
@@ -361,6 +376,68 @@ function extractToolImagePreviews(details: unknown): ImagePreview[] | undefined 
   return valid.length > 0 ? valid : undefined;
 }
 
+/**
+ * Everything the post-turn autopilot gate reads, injected instead of closed
+ * over. Module-level + dependency-injected so every path that finishes an
+ * agent turn shares ONE gate implementation and it stays unit-testable without
+ * mounting the whole App.
+ */
+export interface AutopilotTurnDeps {
+  autopilot: Pick<UseAutopilotResult, "isEnabled" | "isActive" | "runCycleAfterTurn">;
+  /** The live conversation, read AFTER the turn finished. */
+  messages: () => Message[];
+  /** True when the user interrupted the turn (Esc / Ctrl+C). */
+  cancelled: () => boolean;
+  /** True when the turn ended inside plan mode. */
+  planMode: () => boolean;
+  /** True when the turn submitted a plan awaiting a verdict. */
+  planPending: () => boolean;
+}
+
+/**
+ * Autopilot's review gate for a just-finished turn: decide, log the reason,
+ * and run the cycle when it passes.
+ *
+ * `assistantsBefore` / `messagesBefore` MUST be captured before the run — they
+ * are what makes "did this turn produce reviewable work" answerable.
+ *
+ * Every path that drives `agentLoop.run` on the user's behalf calls this:
+ * `handleSubmit` AND the post-remount `pendingAction` effect (plan approval's
+ * implementation turn, task-picker runs). The pendingAction paths used to skip
+ * the gate entirely, so the turn that writes all the code after a plan was
+ * approved was never reviewed.
+ */
+export async function reviewTurnWithAutopilot(
+  deps: AutopilotTurnDeps,
+  originalRequest: string,
+  assistantsBefore: number,
+  messagesBefore: number,
+  opts?: { workflowCommand?: boolean },
+): Promise<void> {
+  // The `isActive` guard makes this a no-op for autopilot's OWN injected runs —
+  // they're already inside a cycle and must never start a nested one.
+  if (!deps.autopilot.isEnabled() || deps.autopilot.isActive()) return;
+  const messages = deps.messages();
+  const decision = shouldStartAutopilotCycle({
+    enabled: true,
+    cancelled: deps.cancelled(),
+    planMode: deps.planMode(),
+    // A submitted plan (exit_plan fired) routes into the PLAN review branch.
+    planPending: deps.planPending(),
+    workflowCommand: opts?.workflowCommand ?? false,
+    assistantMessagesAdded: countAssistantMessages(messages) - assistantsBefore,
+    // Turns that only ran a background process, a read-only lookup, or a
+    // commit/push have nothing for Ken to review — skip the API call.
+    mechanicalOnly: isMechanicalOnlyTurn(extractTurnToolCalls(messages, messagesBefore)),
+  });
+  if (!decision.start) {
+    log("INFO", "autopilot", "autopilot skipped", { reason: decision.reason });
+    return;
+  }
+  log("INFO", "autopilot", "autopilot cycle starting", { kind: decision.kind });
+  await deps.autopilot.runCycleAfterTurn(originalRequest);
+}
+
 export function App(props: AppProps) {
   const theme = useTheme();
   const switchTheme = useSetTheme();
@@ -380,9 +457,6 @@ export function App(props: AppProps) {
   const [quittingSummary, setQuittingSummary] = useState<SessionSummaryItem["summary"] | null>(
     null,
   );
-  // Native terminal title keeps the active project visible outside the app frame.
-  const [titleRunning, setTitleRunning] = useState(false);
-
   // Completed transcript rows are kept as durable session data but are no longer
   // rendered through Ink history. They are serialized once into real terminal
   // scrollback via terminalHistoryPrinter, while Ink owns only live rows and
@@ -466,10 +540,22 @@ export function App(props: AppProps) {
   );
   // Signal that pushes text into the InputArea composer (e.g. restoring queued
   // messages after an interrupt). Bumping `nonce` triggers the injection even
-  // when the text is identical to a prior restore.
-  const [composerInject, setComposerInject] = useState<{ text: string; nonce: number } | null>(
-    null,
-  );
+  // when the text is identical to a prior restore. `mode: "replace"` swaps the
+  // whole draft instead of appending — used by Ctrl+E prompt enhancement.
+  const [composerInject, setComposerInject] = useState<{
+    text: string;
+    nonce: number;
+    mode?: "append" | "replace";
+  } | null>(null);
+  // Ctrl+E prompt enhancement. The draft is never cleared optimistically, so a
+  // failed or cancelled call simply leaves the user's original text in place.
+  const [enhancing, setEnhancing] = useState(false);
+  const enhanceAbortRef = useRef<AbortController | null>(null);
+  // Last enhancement handed to the composer: the exact plain text injected plus
+  // the corrected-term segments that describe it. Consumed on submit and only
+  // when the submitted text still equals `plain` — any edit makes the offsets
+  // stale, and a stale highlight would teach the wrong word.
+  const lastEnhancementRef = useRef<PendingEnhancement | null>(null);
   const agentRunningRef = useRef(false);
   const [runAllTasks, setRunAllTasks] = useState(props.sessionStore?.runAllTasks ?? false);
   const runAllTasksRef = useRef(props.sessionStore?.runAllTasks ?? false);
@@ -491,8 +577,17 @@ export function App(props: AppProps) {
   );
   // Suppress "done" status when a plan overlay is about to open
   const planOverlayPendingRef = useRef(false);
+  // Path of a plan submitted this turn and still awaiting a verdict. Autopilot
+  // reviews it instead of the work; cleared once anyone decides on it.
+  const pendingPlanPathRef = useRef<string | null>(null);
+  // Late-bound so autopilot's auto-accept can reuse the very same approval path
+  // the user's Accept button takes (defined further down the component).
+  const handleApprovePlanRef = useRef<((planPath: string) => void) | null>(null);
+  // Set by Esc/Ctrl+C: suppresses the autopilot review of an interrupted turn.
+  const autopilotCancelledRef = useRef(false);
   const [gitBranch, setGitBranch] = useState<string | null>(null);
-  useTerminalTitle({ isRunning: titleRunning, cwd: displayedCwd, gitBranch });
+  const gitBranchRef = useRef<string | null>(null);
+  gitBranchRef.current = gitBranch;
   const [currentModel, setCurrentModel] = useState(props.model);
   const [currentProvider, setCurrentProvider] = useState(props.provider);
   const currentProviderRef = useRef(props.provider);
@@ -582,7 +677,8 @@ export function App(props: AppProps) {
 
   const sessionStore = props.sessionStore;
 
-  const { planMode, rebuildSystemPrompt, replaceSystemPrompt, setPlanModeAndPrompt } = useModeState({
+  const { planMode, rebuildSystemPrompt, replaceSystemPrompt, setPlanModeAndPrompt } = useModeState(
+    {
       initialPlanMode: props.sessionStore?.planMode ?? props.planModeRef?.current ?? false,
       skills: props.skills,
       planModeRef: props.planModeRef,
@@ -595,7 +691,12 @@ export function App(props: AppProps) {
       approvedPlanPathRef,
       injectedLanguagesRef,
       messagesRef,
-    });
+    },
+  );
+  // Synchronous mirror of plan mode for callbacks that run outside render
+  // (autopilot's gate must never prompt into a read-only plan-mode session).
+  const planModeStateRef = useRef(planMode);
+  planModeStateRef.current = planMode;
 
   const {
     pendingHistoryFlushRef,
@@ -1827,10 +1928,87 @@ export function App(props: AppProps) {
   );
   agentLoopRef.current = agentLoop;
 
-  // Sync terminal title with agent loop state
-  useEffect(() => {
-    setTitleRunning(agentLoop.isRunning);
-  }, [agentLoop.isRunning]);
+  // ── Autopilot (Ctrl+A) ─────────────────────────────────
+  // Ken reviews each finished turn and injects fix prompts until clear. The
+  // loop itself is shared core (see hooks/useAutopilot.ts); this only supplies
+  // the TUI's own run/notify/plan wiring.
+  const autopilot = useAutopilot({
+    initialEnabled: props.sessionStore?.autopilotEnabled ?? props.autopilotEnabled ?? false,
+    cwd: props.cwd,
+    gitBranchRef,
+    providerRef: currentProviderRef,
+    modelRef: currentModelRef,
+    messagesRef,
+    isPlanMode: () => planModeStateRef.current,
+    runPrompt: (framed) => agentLoopRef.current?.run(framed) ?? Promise.resolve(),
+    notify: (notice) =>
+      setLiveItems((prev) => [
+        ...prev,
+        {
+          kind: "ideal_hook",
+          text: notice.text,
+          tone: notice.tone === "warning" ? "warning" : "review",
+          id: getId(),
+        },
+      ]),
+    onEnabledChange: (next) => {
+      if (props.sessionStore) props.sessionStore.autopilotEnabled = next;
+      if (!props.settingsFile) return;
+      void (async () => {
+        const sm = new SettingsManager(props.settingsFile as string);
+        await sm.load();
+        await sm.set("autopilotEnabled", next);
+      })().catch(() => {});
+    },
+    pendingPlanPath: () => pendingPlanPathRef.current,
+    acceptPlan: (planPath) => {
+      // The TUI's approve path remounts the whole tree and drives the
+      // implementation turn itself via sessionStore.pendingAction, so the
+      // cycle can't continue across it. Returning false ends this cycle
+      // silently; the remounted app reviews the implementation turn on its own.
+      // This false is the hook's documented contract, not an oversight — that's
+      // why useAutopilot exposes no runImplement option (see its module header).
+      pendingPlanPathRef.current = null;
+      setLiveItems((prev) => [
+        ...prev,
+        {
+          kind: "ideal_hook",
+          text: "Autopilot: plan approved — implementing.",
+          tone: "review",
+          id: getId(),
+        },
+      ]);
+      handleApprovePlanRef.current?.(planPath);
+      return Promise.resolve(false);
+    },
+  });
+
+  /** Bind the shared autopilot gate (see reviewTurnWithAutopilot) to this
+   *  window's live refs. Called by handleSubmit and by the pendingAction
+   *  effect — both must review, or the path that skips it silently loses
+   *  autopilot for entire turns. */
+  const maybeRunAutopilotAfterTurn = useCallback(
+    (
+      originalRequest: string,
+      assistantsBefore: number,
+      messagesBefore: number,
+      opts?: { workflowCommand?: boolean },
+    ): Promise<void> =>
+      reviewTurnWithAutopilot(
+        {
+          autopilot,
+          messages: () => messagesRef.current,
+          cancelled: () => autopilotCancelledRef.current,
+          planMode: () => planModeStateRef.current,
+          planPending: () => pendingPlanPathRef.current !== null,
+        },
+        originalRequest,
+        assistantsBefore,
+        messagesBefore,
+        opts,
+      ),
+    [autopilot],
+  );
 
   // Mirror agent running state into sessionStore so renderApp's resize
   // handler and overlay toggles can skip their unmount/remount while the
@@ -1914,13 +2092,31 @@ export function App(props: AppProps) {
         { kind: "info", text: action.infoText as string, id: getId() },
       ]);
     }
-    void agentLoop.run(action.prompt).catch((err: unknown) => {
-      const errMsg = err instanceof Error ? err.message : String(err);
-      log("ERROR", "error", errMsg);
-      if (agentLoop.isRunning) {
-        agentLoop.reset();
+    // Captured BEFORE the run, exactly as handleSubmit does — the gate needs
+    // the pre-turn position to judge what this turn actually produced.
+    const assistantsBefore = countAssistantMessages(messagesRef.current);
+    const messagesBefore = messagesRef.current.length;
+    void (async () => {
+      try {
+        await agentLoop.run(action.prompt);
+      } catch (err) {
+        const errMsg = err instanceof Error ? err.message : String(err);
+        log("ERROR", "error", errMsg);
+        if (agentLoop.isRunning) {
+          agentLoop.reset();
+        }
+        setLiveItems((prev) => [...prev, toErrorItem(err, getId())]);
+        return;
       }
-      setLiveItems((prev) => [...prev, toErrorItem(err, getId())]);
+      // Autopilot reviews this turn too. It is the ONLY review the plan's
+      // implementation turn ever gets: handleApprovePlan remounts the tree and
+      // hands IMPLEMENT_PLAN_PROMPT here, so the turn that writes all the code
+      // never passes through handleSubmit.
+      await maybeRunAutopilotAfterTurn(action.prompt, assistantsBefore, messagesBefore);
+    })().catch((err: unknown) => {
+      log("ERROR", "autopilot", "pending action review failed", {
+        message: err instanceof Error ? err.message : String(err),
+      });
     });
     // Intentional one-shot: run once on mount, never re-fire on re-render.
   }, []);
@@ -1960,6 +2156,31 @@ export function App(props: AppProps) {
             text: next
               ? "Ideal review enabled. Use /ideal-off to disable it."
               : "Ideal review disabled. Use /ideal-on to enable it.",
+            id: getId(),
+          },
+        ]);
+        return;
+      }
+
+      // /autopilot [on|off] — same toggle as Ctrl+A, for people who type.
+      if (/^\/(autopilot|ap)(\s|$)/.test(trimmed)) {
+        const arg = trimmed.split(/\s+/)[1]?.toLowerCase();
+        if (arg && arg !== "on" && arg !== "off") {
+          setLiveItems((prev) => [
+            ...prev,
+            { kind: "info", text: "Usage: /autopilot [on|off]", id: getId() },
+          ]);
+          return;
+        }
+        const next = arg ? arg === "on" : !autopilot.isEnabled();
+        autopilot.setEnabled(next);
+        setLiveItems((prev) => [
+          ...prev,
+          {
+            kind: "info",
+            text: next
+              ? "Autopilot on — Ken reviews each finished turn and drives the fixes. /autopilot off or Ctrl+A to stop."
+              : "Autopilot off.",
             id: getId(),
           },
         ]);
@@ -2120,6 +2341,10 @@ export function App(props: AppProps) {
           `Queued message: ${trimmed.length > 80 ? trimmed.slice(0, 80) + "..." : trimmed}`,
         );
         agentLoop.queueMessage(userContent, input);
+        // The queued copy re-surfaces later via `onQueuedStart`, which rebuilds
+        // the row from message content alone — there is nowhere to carry the
+        // segments through, so drop them rather than let them go stale.
+        lastEnhancementRef.current = null;
         let displayText = input;
         if (hasImages) {
           const { cleanText } = await extractMediaPaths(input, props.cwd);
@@ -2154,6 +2379,12 @@ export function App(props: AppProps) {
         );
         imagePreviews = built.length > 0 ? built : undefined;
       }
+      // Ctrl+E highlights survive only an unedited send: the segments describe
+      // the exact text the enhancer produced, so anything else is a mismatch.
+      // (`getUserMessageDisplayParts` re-checks this too — belt and braces.)
+      const enhancement = lastEnhancementRef.current;
+      lastEnhancementRef.current = null;
+      const enhancements = enhancementsForSubmittedText(enhancement, displayText);
       const userItem: UserItem = {
         kind: "user",
         text: displayText,
@@ -2161,6 +2392,7 @@ export function App(props: AppProps) {
         videoCount: videoCount > 0 ? videoCount : undefined,
         imagePreviews,
         pasteInfo,
+        enhancements,
         id: getId(),
       };
       setLastUserMessage(input);
@@ -2186,7 +2418,11 @@ export function App(props: AppProps) {
           .catch(() => {});
       }
 
-      // Run agent
+      // Run agent. A fresh user turn clears the previous turn's autopilot
+      // interrupt so the gate judges this turn on its own merits.
+      autopilotCancelledRef.current = false;
+      const assistantsBefore = countAssistantMessages(messagesRef.current);
+      const messagesBefore = messagesRef.current.length;
       try {
         await agentLoop.run(userContent);
       } catch (err) {
@@ -2205,10 +2441,20 @@ export function App(props: AppProps) {
             ? { kind: "stopped", text: "Request was stopped.", id: getId() }
             : toErrorItem(err, getId()),
         ]);
+        return;
       }
+
+      // Autopilot: review the turn we just finished. Guard first so a disabled
+      // (or already-cycling) autopilot never pays for the workflow-spec read.
+      if (!autopilot.isEnabled() || autopilot.isActive()) return;
+      await maybeRunAutopilotAfterTurn(input, assistantsBefore, messagesBefore, {
+        workflowCommand: isWorkflowCommandText(trimmed, await loadWorkflowCommandSpecs(props.cwd)),
+      });
     },
     [
       agentLoop,
+      autopilot,
+      maybeRunAutopilotAfterTurn,
       compactConversation,
       currentModel,
       finalizeSubmittedUserItem,
@@ -2227,6 +2473,19 @@ export function App(props: AppProps) {
   const handleDoubleExit = useDoublePress(setExitPending, showSessionSummaryAndExit);
 
   const handleAbort = useCallback(() => {
+    // Esc/Ctrl+C first cancels an in-flight prompt enhancement: the composer is
+    // frozen while one runs, so this is the user's only way out. The draft was
+    // never cleared, so cancelling costs nothing.
+    if (enhanceAbortRef.current) {
+      enhanceAbortRef.current.abort();
+      enhanceAbortRef.current = null;
+      setEnhancing(false);
+      return;
+    }
+    // Esc/Ctrl+C also stops autopilot: the cycle breaks between steps and the
+    // gate won't start a new one for the turn the user just interrupted.
+    autopilotCancelledRef.current = true;
+    autopilot.cancel();
     if (agentLoop.isRunning) {
       // Restore any unsent queued messages to the composer instead of dropping
       // them, so an interrupt never silently discards what the user typed.
@@ -2248,7 +2507,67 @@ export function App(props: AppProps) {
     } else {
       handleDoubleExit();
     }
-  }, [agentLoop, handleDoubleExit, props.subAgentManager, setLiveItems]);
+  }, [agentLoop, autopilot, handleDoubleExit, props.subAgentManager, setLiveItems]);
+
+  // Ctrl+E — rewrite the current draft with the ACTIVE model and swap it back
+  // into the composer. Runs as a one-off call (no agent loop, no tools) via the
+  // same `enhanceDraft` seam the gg-app sidecar's /enhance endpoint uses.
+  const handleEnhance = useCallback(
+    (draft: string) => {
+      if (!draft.trim() || enhanceAbortRef.current) return;
+      const controller = new AbortController();
+      enhanceAbortRef.current = controller;
+      setEnhancing(true);
+      void (async () => {
+        try {
+          const creds = await resolveCredentials();
+          const result = await enhanceDraft({
+            provider: currentProvider,
+            model: currentModel,
+            prompt: draft,
+            cwd: props.cwd,
+            apiKey: creds.apiKey,
+            accountId: creds.accountId,
+            projectId: creds.projectId,
+            baseUrl: activeBaseUrl,
+            signal: controller.signal,
+          });
+          if (controller.signal.aborted) return;
+          if (result.enhanced.trim()) {
+            lastEnhancementRef.current = result.segments.some((s) => s.kind === "term")
+              ? { plain: result.enhanced, segments: result.segments }
+              : null;
+            setComposerInject({
+              text: result.enhanced,
+              nonce: nextIdRef.current++,
+              mode: "replace",
+            });
+          }
+        } catch (err) {
+          // An aborted call is a user cancel, not a failure — stay silent and
+          // leave the untouched draft where it is.
+          if (controller.signal.aborted) return;
+          setLiveItems((prev) => [...prev, toErrorItem(err, getId(), "Enhance failed")]);
+        } finally {
+          if (enhanceAbortRef.current === controller) {
+            enhanceAbortRef.current = null;
+            setEnhancing(false);
+          }
+        }
+      })();
+    },
+    [activeBaseUrl, currentModel, currentProvider, props.cwd, resolveCredentials, setLiveItems],
+  );
+
+  // Drop an in-flight enhancement if the app unmounts mid-call (e.g. /quit),
+  // so the provider request doesn't outlive the UI it would resolve into.
+  useEffect(
+    () => () => {
+      enhanceAbortRef.current?.abort();
+      enhanceAbortRef.current = null;
+    },
+    [],
+  );
 
   const handleToggleThinking = useCallback(() => {
     setThinkingLevel((prev) => {
@@ -2276,6 +2595,9 @@ export function App(props: AppProps) {
       // Keep the ref in sync before any prompt rebuild so the identity (Claude
       // Code vs GG Coder) reflects the newly selected provider immediately.
       currentProviderRef.current = newProvider;
+      // The autopilot reviewer is a cached session created once, so it only
+      // follows the switch if we tell it (deferred if a cycle is running).
+      void autopilot.syncReviewerModel(newProvider, newModelId);
 
       const rebuildPromptWithTools = (tools: AgentTool[]) => {
         currentToolsRef.current = tools;
@@ -2414,6 +2736,7 @@ export function App(props: AppProps) {
       props.authStorage,
       props.rebuildReadTool,
       replaceSystemPrompt,
+      autopilot.syncReviewerModel,
     ],
   );
 
@@ -2483,13 +2806,26 @@ export function App(props: AppProps) {
         description: "Enter plan mode — research then implement",
         sectionTitle: "built-in",
       },
-      { name: "plans", aliases: [], description: "Open the plan browser", sectionTitle: "built-in" },
+      {
+        name: "plans",
+        aliases: [],
+        description: "Open the plan browser",
+        sectionTitle: "built-in",
+      },
       {
         name: idealReviewEnabled ? "ideal-off" : "ideal-on",
         aliases: [],
         description: idealReviewEnabled
           ? "Disable pre-final ideal review"
           : "Enable pre-final ideal review",
+        sectionTitle: "built-in",
+      },
+      {
+        name: "autopilot",
+        aliases: ["ap"],
+        description: autopilot.enabled
+          ? "Turn autopilot off (Ctrl+A)"
+          : "Let Ken review each turn and drive the fixes (Ctrl+A)",
         sectionTitle: "built-in",
       },
       {
@@ -2513,7 +2849,7 @@ export function App(props: AppProps) {
         sectionTitle: "built-in",
       },
     ];
-  }, [customCommands, idealReviewEnabled]);
+  }, [customCommands, idealReviewEnabled, autopilot.enabled]);
 
   const renderItem = (item: CompletedItem, index: number, items: CompletedItem[]) =>
     renderTranscriptItem({
@@ -2658,6 +2994,7 @@ export function App(props: AppProps) {
     footerStatusLayout,
     activityVisible,
     stallStatusVisible,
+    autopilotStatusVisible,
     statusSlotVisible,
     mainControlsRef,
     measuredLiveAreaRows,
@@ -2677,9 +3014,17 @@ export function App(props: AppProps) {
     displayedCwd,
     gitBranch,
     thinkingLevel,
+    // Must mirror the <Footer> props below — the footer's one-line/two-line
+    // decision depends on these labels, and this hook reserves the rows for it.
+    planMode,
+    autopilot: autopilot.enabled,
     exitPending,
     taskBarExpanded,
     liveToolFeedCount: liveToolFeed.length,
+    // Ken's review is a real model call that the agent loop knows nothing about;
+    // without this the TUI sits silent for its whole duration (worst with an
+    // IGNORE verdict, which prints nothing at all afterwards).
+    autopilotReviewing: autopilot.active,
   });
   useEffect(() => {
     liveLayoutRef.current = { columns, liveAreaRows: measuredLiveAreaRows };
@@ -2975,9 +3320,11 @@ export function App(props: AppProps) {
   );
 
   const handleExitPlanMode = useCallback(
-    async (_planPath: string): Promise<string> => {
+    async (planPath: string): Promise<string> => {
       await setPlanModeAndPrompt(false);
       planOverlayPendingRef.current = true;
+      // Route this turn into autopilot's PLAN branch (review the plan itself).
+      pendingPlanPathRef.current = planPath;
       setPlanAutoExpand(true);
       if (props.sessionStore) {
         props.sessionStore.overlay = "plan";
@@ -2997,6 +3344,7 @@ export function App(props: AppProps) {
 
   const handleClosePlanOverlay = () => {
     planOverlayPendingRef.current = false;
+    pendingPlanPathRef.current = null;
     if (props.resetUI && props.sessionStore && !agentLoop.isRunning) {
       props.sessionStore.overlay = null;
       props.sessionStore.planAutoExpand = false;
@@ -3017,6 +3365,7 @@ export function App(props: AppProps) {
       planPath,
     });
     planOverlayPendingRef.current = false;
+    pendingPlanPathRef.current = null;
 
     void (async () => {
       try {
@@ -3056,7 +3405,7 @@ export function App(props: AppProps) {
             planSteps: steps,
             sessionPath: newSessionPath,
             pendingAction: {
-              prompt: "The plan has been approved. Implement it now, following each step in order.",
+              prompt: IMPLEMENT_PLAN_PROMPT,
               planEvent: { event: "approved" },
             },
           });
@@ -3084,9 +3433,7 @@ export function App(props: AppProps) {
           },
         ]);
         setDoneStatus(null);
-        await agentLoop.run(
-          "The plan has been approved. Implement it now, following each step in order.",
-        );
+        await agentLoop.run(IMPLEMENT_PLAN_PROMPT);
       } catch (err) {
         const errMsg = err instanceof Error ? err.message : String(err);
         log("ERROR", "error", errMsg);
@@ -3097,6 +3444,7 @@ export function App(props: AppProps) {
 
   const handleRejectPlan = (planPath: string, feedback: string) => {
     planOverlayPendingRef.current = false;
+    pendingPlanPathRef.current = null;
     const rejectionMsg =
       `The plan at ${planPath} was rejected.\n\nFeedback: ${feedback}\n\n` +
       `Please revise the plan based on this feedback.`;
@@ -3130,8 +3478,25 @@ export function App(props: AppProps) {
     });
   };
 
+  handleApprovePlanRef.current = handleApprovePlan;
+
   const handleToggleTasks = () => {
     taskPicker.toggle();
+  };
+
+  // Ctrl+A — flip autopilot. The hook persists the new state itself.
+  const handleToggleAutopilot = () => {
+    const next = autopilot.toggle();
+    setLiveItems((prev) => [
+      ...prev,
+      {
+        kind: "info",
+        text: next
+          ? "Autopilot on — Ken reviews each finished turn and drives the fixes. Ctrl+A to turn off."
+          : "Autopilot off.",
+        id: getId(),
+      },
+    ]);
   };
 
   const fullScreenOverlay = isSkillsView ? "skills" : isPlanView ? "plan" : null;
@@ -3187,6 +3552,7 @@ export function App(props: AppProps) {
           statusSlotVisible={statusSlotVisible}
           activityVisible={activityVisible}
           stallStatusVisible={stallStatusVisible}
+          autopilotStatusVisible={autopilotStatusVisible}
           liveToolFeed={liveToolFeed}
           doneStatus={doneStatus}
           activityPhase={agentLoop.activityPhase}
@@ -3207,10 +3573,13 @@ export function App(props: AppProps) {
             onSubmit: handleSubmit,
             onAbort: handleAbort,
             injectText: composerInject,
+            onEnhance: handleEnhance,
+            enhancing,
             inputActive: !taskBarFocused && !overlay,
             onDownAtEnd: handleFocusTaskBar,
             onShiftTab: handleToggleThinking,
             onToggleTasks: handleToggleTasks,
+            onToggleAutopilot: handleToggleAutopilot,
             onToggleSkills: () => openOverlay("skills"),
             onToggleMarkdown: () => setRenderMarkdown((prev) => !prev),
             cwd: props.cwd,
@@ -3239,6 +3608,7 @@ export function App(props: AppProps) {
           contextWindowOptions={contextWindowOptions}
           displayedCwd={displayedCwd}
           gitBranch={gitBranch}
+          autopilot={autopilot.enabled}
           planMode={planMode}
           exitPending={exitPending}
           footerStatusLayout={footerStatusLayout}

@@ -58,6 +58,14 @@ import {
   type WorkflowCommandSpec,
 } from "./core/autopilot-gate.js";
 import { driveAutopilotCycle, frameAutopilotInjection } from "./core/autopilot-cycle.js";
+import {
+  KEN_ALLOWED_TOOLS,
+  KEN_ALLOWED_MCP_SERVERS,
+  MAX_AUTOPILOT_ROUNDS,
+  IMPLEMENT_PLAN_PROMPT,
+  lastAssistantText,
+  loadWorkflowCommandSpecs as loadWorkflowCommandSpecsFor,
+} from "./core/autopilot-runtime.js";
 import { validateKenModelPref, effectiveKenModel, type KenModelPref } from "./core/ken-model.js";
 import type { KenTurnPayload, AppMarkerPayload, RunOutcome } from "./core/session-manager.js";
 import {
@@ -1225,39 +1233,6 @@ async function main(): Promise<void> {
   parentWatch.unref?.();
 }
 
-/** Ken's read-only tool allow-list. Excludes every mutating tool (write/edit/
- *  bash/tasks/subagent/generate_image/enter_plan/exit_plan/task_*) so the mentor
- *  agent can research + see, but never change the repo. */
-const KEN_ALLOWED_TOOLS = [
-  "read",
-  "grep",
-  "find",
-  "ls",
-  "source_path",
-  "web_fetch",
-  "web_search",
-  "screenshot",
-];
-
-/** MCP servers Ken is allowed to use. kencode-search lets him look into real
- *  public repos / verify against actual code instead of assuming — core to how
- *  he's meant to work. Read-only research; no other MCP server is connected. */
-const KEN_ALLOWED_MCP_SERVERS = ["kencode-search"];
-
-/** Extract the plain text of the most recent assistant message (Ken's reply).
- *  Strips tool-call / image blocks, returning just the prose Ken streamed. */
-function lastAssistantText(messages: ReturnType<AgentSession["getMessages"]>): string {
-  for (let i = messages.length - 1; i >= 0; i--) {
-    const m = messages[i];
-    if (m.role !== "assistant") continue;
-    if (typeof m.content === "string") return m.content;
-    return m.content
-      .map((c) => (c.type === "text" && "text" in c && typeof c.text === "string" ? c.text : ""))
-      .join("");
-  }
-  return "";
-}
-
 /**
  * Assemble Ken's context digest for one `@Ken` question: git/env + the build
  * session's compaction summary + recent activity. Prepended to the user's
@@ -2114,8 +2089,6 @@ async function createSession(
   let autopilotActive = false;
   // Set by /cancel to break out of an in-flight autopilot cycle between steps.
   let autopilotCancelled = false;
-  // Hard cap on review→prompt→review rounds per user turn (loop safety).
-  const MAX_AUTOPILOT_ROUNDS = 3;
   const CANCEL_TIMEOUT_MS = 5_000;
   // Prompt bodies Autopilot Ken injected into the BUILD session this
   // conversation. Passed into every Ken digest so injected prompts render as
@@ -2147,17 +2120,11 @@ async function createSession(
     planGeneration++;
   }
 
-  // Workflow (prompt-template) commands: built-in + the project's custom
-  // `.gg/commands/*.md`. Used to gate autopilot off command turns and to label
-  // expanded templates in Ken's digests. Loaded fresh so a newly added custom
-  // command is picked up without a restart (mirrors GET /commands).
-  async function loadWorkflowCommandSpecs(): Promise<WorkflowCommandSpec[]> {
-    const custom = await loadCustomCommands(cwd).catch(() => []);
-    return [
-      ...PROMPT_COMMANDS.map((c) => ({ name: c.name, aliases: c.aliases, prompt: c.prompt })),
-      ...custom.map((c) => ({ name: c.name, aliases: [] as string[], prompt: c.prompt })),
-    ];
-  }
+  // Workflow (prompt-template) command specs for THIS window's project (see
+  // core/autopilot-runtime.ts). Loaded fresh on each call so a newly added
+  // custom command is picked up without a restart (mirrors GET /commands).
+  const loadWorkflowCommandSpecs = (): Promise<WorkflowCommandSpec[]> =>
+    loadWorkflowCommandSpecsFor(cwd);
 
   // ── Telegram serve (remote control via Telegram) ───────────
   // A single embedded serve session lives in this sidecar process. Only the main
@@ -2532,13 +2499,6 @@ async function createSession(
       if (pending) await syncKenAutoModel(pending.provider, pending.model);
     }
   }
-
-  // The prompt fed to the fresh session after a plan is accepted — the SAME
-  // string the webview sends on a manual Accept (see PlanReviewModal's accept
-  // handler in gg-app/src/App.tsx). Keep the two in lockstep so auto- and
-  // manual approval produce identical implementation turns.
-  const IMPLEMENT_PLAN_PROMPT =
-    "The plan has been approved. Implement it now, following each step in order.";
 
   // Drive the review→prompt→review loop for one finished user turn. Only ever
   // called after shouldStartAutopilotCycle approves the turn (POST /prompt or

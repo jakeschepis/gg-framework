@@ -174,8 +174,7 @@ export interface ToolConfirmationRequest {
 }
 
 export type ToolConfirmationDecision =
-  | { readonly approved: true }
-  | { readonly approved: false; readonly reason: string };
+  { readonly approved: true } | { readonly approved: false; readonly reason: string };
 
 export type ToolConfirmationResolver = (
   request: ToolConfirmationRequest,

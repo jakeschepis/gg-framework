@@ -660,8 +660,7 @@ export function useAgentEvents(deps: AgentEventsDeps): AgentEvents {
           const groupId = subagentGroupIdRef.current;
           if (groupId !== null) {
             const endDetails = details as
-              | { durationMs?: number; tokenUsage?: SubAgentLine["tokenUsage"] }
-              | undefined;
+              { durationMs?: number; tokenUsage?: SubAgentLine["tokenUsage"] } | undefined;
             const durationMs = endDetails?.durationMs;
             const finalTokens = endDetails?.tokenUsage;
             setItems((prev) =>

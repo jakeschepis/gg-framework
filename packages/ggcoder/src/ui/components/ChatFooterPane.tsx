@@ -22,6 +22,7 @@ interface ChatFooterPaneProps {
   gitBranch?: string | null;
   thinkingLevel?: ThinkingLevel;
   planMode: boolean;
+  autopilot: boolean;
   exitPending: boolean;
   renderMarkdown: boolean;
 }
@@ -42,6 +43,7 @@ export function ChatFooterPane({
   gitBranch,
   thinkingLevel,
   planMode,
+  autopilot,
   exitPending,
   renderMarkdown,
 }: ChatFooterPaneProps) {
@@ -76,6 +78,7 @@ export function ChatFooterPane({
       gitBranch={gitBranch}
       thinkingLevel={thinkingLevel}
       planMode={planMode}
+      autopilot={autopilot}
       exitPending={exitPending}
       renderMarkdown={renderMarkdown}
     />

@@ -5,6 +5,12 @@ import type { TerminalHistoryContext } from "./terminal-history.js";
 
 export const RESPONSE_LEFT_PADDING = " ";
 export const MAX_OUTPUT_LINES = 4;
+/**
+ * Default surface behind the user-message box, mirroring the themes'
+ * `inputSurface` token. Renderers must read the token from the active theme so
+ * the box tracks theme switches; this constant is kept for consumers that only
+ * need the literal.
+ */
 export const USER_MESSAGE_BACKGROUND = "#374151";
 export const USER_MESSAGE_PREFIX = "> ";
 export const USER_MESSAGE_TOP_FILL = "▄";
@@ -122,9 +128,23 @@ export function color(hex: string, text: string, bold = false): string {
   return bold ? chalk.bold(styled) : styled;
 }
 
-export function userChipSegment(text: string, foregroundHex: string, bold = false): string {
-  const styled = chalk.bgHex(USER_MESSAGE_BACKGROUND).hex(foregroundHex)(text);
-  return bold ? chalk.bold(styled) : styled;
+/**
+ * One run of text inside the user-message box. The box paints its own dark
+ * surface in every theme, so `backgroundHex` is required and must come from the
+ * theme's `inputSurface` token — defaulting it would let a new caller silently
+ * pair page-palette text with the wrong surface, which is what made light mode
+ * render dark-on-dark.
+ */
+export function userChipSegment(
+  text: string,
+  foregroundHex: string,
+  bold: boolean,
+  backgroundHex: string,
+  underline = false,
+): string {
+  const styled = chalk.bgHex(backgroundHex).hex(foregroundHex)(text);
+  const emphasized = bold ? chalk.bold(styled) : styled;
+  return underline ? chalk.underline(emphasized) : emphasized;
 }
 
 export function dim(context: TerminalHistoryContext, text: string): string {

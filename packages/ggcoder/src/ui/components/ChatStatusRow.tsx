@@ -8,10 +8,19 @@ import { toolTonePalette, type ToolTone } from "../transcript/tool-presentation.
 import { formatTokenCount } from "../terminal-history-format.js";
 import { DOWN_ARROW } from "../constants/figures.js";
 
+/** Shown in the status slot while autopilot's reviewer is thinking. */
+export const AUTOPILOT_REVIEW_LABEL = "Ken is reviewing...";
+
 interface ChatStatusRowProps {
   visible: boolean;
   activityVisible: boolean;
   stallStatusVisible: boolean;
+  /**
+   * Autopilot's Ken review is in flight. It outranks `doneStatus` because the
+   * review starts once the turn is already "done" — without this the TUI shows a
+   * finished-run summary while a multi-second model call is still running.
+   */
+  autopilotStatusVisible?: boolean;
   doneStatus: {
     verb: string;
     durationMs: number;
@@ -42,6 +51,7 @@ export function ChatStatusRow({
   visible,
   activityVisible,
   stallStatusVisible,
+  autopilotStatusVisible = false,
   doneStatus,
   columns,
   theme,
@@ -89,6 +99,19 @@ export function ChatStatusRow({
               "⚠ API provider stream interrupted — retries exhausted. Your conversation is preserved."
             }
           </Text>
+        ) : autopilotStatusVisible ? (
+          // Reuses the agent spinner so the review reads as the same kind of
+          // work; meta is off because those counters belong to the finished turn.
+          <ActivityIndicator
+            phase="waiting"
+            elapsedMs={0}
+            thinkingMs={0}
+            isThinking={false}
+            tokenEstimate={0}
+            label={AUTOPILOT_REVIEW_LABEL}
+            showMeta={false}
+            staticDisplay
+          />
         ) : doneStatus ? (
           <Text>
             <Text color={theme.success}>

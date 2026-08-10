@@ -123,6 +123,10 @@ import { useAppUpdate } from "./update";
 import { recoverPromptLabel } from "./prompt-labels";
 import { playSound } from "./sounds";
 import { segmentDoneMarkers, hasDoneMarker, countPlanSteps } from "./plan-steps";
+// Shared with the sidecar/TUI so manual Accept and autopilot's auto-approve can
+// never drift. Deliberately the zero-import leaf, not `autopilot-runtime.ts` —
+// that module reaches `node:fs/promises` and would drag Node code in here.
+import { IMPLEMENT_PLAN_PROMPT } from "../../packages/ggcoder/src/core/plan-prompt";
 import { Paperclip, AtSign } from "lucide-react";
 import { AttachmentBar } from "./AttachmentBar";
 import { EnhancedSegments } from "./PromptEnhancement";
@@ -2090,10 +2094,7 @@ function App(): React.ReactElement {
     // progress before this request resolves. Do not re-seed from stale modal
     // content after the await: the plan file may already have changed.
     await acceptPlanIPC(planReviewPathRef.current);
-    runPlanPrompt(
-      "The plan has been approved. Implement it now, following each step in order.",
-      "\u2713 Plan accepted. Implementing.",
-    );
+    runPlanPrompt(IMPLEMENT_PLAN_PROMPT, "\u2713 Plan accepted. Implementing.");
   }
 
   function sendPlanFeedback(feedback: string): void {

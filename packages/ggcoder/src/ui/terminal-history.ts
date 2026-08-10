@@ -10,8 +10,13 @@ import type { PasteInfo } from "./components/InputArea.js";
 import { BLACK_CIRCLE, RETURN_SYMBOL } from "./constants/figures.js";
 import { SPINNER_FRAMES } from "./spinner-frames.js";
 import type { Theme } from "./theme/theme.js";
-import { getUserMessageDisplayParts } from "./utils/user-message-display.js";
+import {
+  getUserMessageDisplayParts,
+  getUserMessageTeachingNotes,
+} from "./utils/user-message-display.js";
+import type { PromptSegment } from "../utils/prompt-enhancer.js";
 import { buildToolGroupSummary } from "./tool-group-summary.js";
+import { SHORTCUT_HINT_SEPARATOR, layoutShortcutHints } from "./banner-shortcuts.js";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
 import { renderMarkdownToAnsiLines } from "./utils/markdown-renderer.js";
@@ -22,7 +27,6 @@ import { shouldSeparateTranscriptItems } from "./transcript/spacing.js";
 import {
   MAX_OUTPUT_LINES,
   RESPONSE_LEFT_PADDING,
-  USER_MESSAGE_BACKGROUND,
   USER_MESSAGE_BOTTOM_FILL,
   USER_MESSAGE_HORIZONTAL_PADDING,
   USER_MESSAGE_PREFIX,
@@ -299,7 +303,14 @@ export function serializeCompletedItemToTerminalHistory(
     case "banner":
       return renderBanner(context);
     case "user":
-      return renderUser(item.text, item.imageCount, item.videoCount, item.pasteInfo, context);
+      return renderUser(
+        item.text,
+        item.imageCount,
+        item.videoCount,
+        item.pasteInfo,
+        item.enhancements,
+        context,
+      );
     case "queued":
       return renderQueued(item.text, item.imageCount, context);
     case "assistant":
@@ -476,7 +487,17 @@ function renderBanner(context: TerminalHistoryContext): string {
     (lineText) => `${RESPONSE_LEFT_PADDING}${gradientLine(lineText, GRADIENT)}`,
   );
 
-  const shortcuts = `${color(context.theme.primary, "Ctrl+T")} ${dim(context, "tasks · ")}${color(context.theme.primary, "Ctrl+S")} ${dim(context, "skills · ")}${color(context.theme.primary, "Shift+Tab")} ${dim(context, "toggle thinking")}`;
+  // Same hint list + layout rule as the live Ink banner (banner-shortcuts.ts),
+  // so the two renderers can't drift and no row ever soft-wraps.
+  const shortcutRows = layoutShortcutHints(
+    context.columns < SIDE_BY_SIDE_MIN
+      ? context.columns - RESPONSE_LEFT_PADDING.length
+      : context.columns - LOGO_WIDTH - GAP.length - RESPONSE_LEFT_PADDING.length,
+  ).map((row) =>
+    row
+      .map((hint) => `${color(context.theme.primary, hint.key)} ${dim(context, hint.label)}`)
+      .join(dim(context, SHORTCUT_HINT_SEPARATOR)),
+  );
 
   if (context.columns < SIDE_BY_SIDE_MIN) {
     return block([
@@ -485,7 +506,7 @@ function renderBanner(context: TerminalHistoryContext): string {
       "",
       `${RESPONSE_LEFT_PADDING}${color(context.theme.primary, "GG Coder", true)}${dim(context, ` v${context.version}`)}`,
       `${RESPONSE_LEFT_PADDING}${color(context.theme.secondary, modelName)}  ${dim(context, truncatePlain(displayPath, context.columns))}`,
-      `${RESPONSE_LEFT_PADDING}${shortcuts}`,
+      ...shortcutRows.map((row) => `${RESPONSE_LEFT_PADDING}${row}`),
       "",
     ]);
   }
@@ -495,7 +516,7 @@ function renderBanner(context: TerminalHistoryContext): string {
   const infoLines = [
     `${color(context.theme.primary, "GG Coder", true)}${dim(context, ` v${context.version} · By `)}${color(context.theme.text, "Ken Kai", true)}`,
     `${color(context.theme.secondary, modelName)}  ${dim(context, truncatePlain(displayPath, Math.max(10, context.columns - LOGO_WIDTH - GAP.length - stringWidth(modelName) - 2)))}`,
-    shortcuts,
+    ...shortcutRows,
   ];
 
   const rows = logo.map((logoLine, i) => {
@@ -512,46 +533,75 @@ function renderUser(
   imageCount: number | undefined,
   videoCount: number | undefined,
   pasteInfo: PasteInfo | undefined,
+  enhancements: readonly PromptSegment[] | undefined,
   context: TerminalHistoryContext,
 ): string {
+  // The box paints its own dark surface in every theme, so every colour here
+  // comes from the `inputSurface*` tokens. Using the page palette put
+  // dark-on-dark text in the light theme.
+  const surface = context.theme.inputSurface;
+  const userMessageText = context.theme.inputSurfaceText;
+  const chip = (text: string, fg: string, bold = false, underline = false): string =>
+    userChipSegment(text, fg, bold, surface, underline);
   const imageBadges = Array.from({ length: imageCount ?? 0 }, (_, index) =>
-    userChipSegment(`[Image #${index + 1}]`, context.theme.accent),
+    chip(`[Image #${index + 1}]`, context.theme.inputSurfaceAccent),
   );
   const videoBadges = Array.from({ length: videoCount ?? 0 }, (_, index) =>
-    userChipSegment(`[🎬 Video #${index + 1}]`, context.theme.accent),
+    chip(`[🎬 Video #${index + 1}]`, context.theme.inputSurfaceAccent),
   );
-  const userMessageText = context.theme.commandColor;
-  const separator = userChipSegment(" ", userMessageText);
-  const content = [
-    ...getUserMessageDisplayParts(text, pasteInfo).map((part) =>
-      userChipSegment(part.text, part.kind === "paste" ? context.theme.textDim : userMessageText),
-    ),
-    ...imageBadges,
-    ...videoBadges,
-  ]
-    .filter((part) => part.length > 0)
-    .join(separator);
+  const separator = chip(" ", userMessageText);
+  // Mirrors `<UserMessage>`: a leading space is drawn only before parts flagged
+  // `separated` (paste placeholders, media badges). Enhanced-term parts are cut
+  // out of the middle of a sentence and must stay glued to their neighbours.
+  const chips: string[] = [];
+  const push = (rendered: string, separated: boolean): void => {
+    if (rendered.length === 0) return;
+    if (separated && chips.length > 0) chips.push(separator);
+    chips.push(rendered);
+  };
+  for (const part of getUserMessageDisplayParts(text, pasteInfo, enhancements)) {
+    const isTerm = part.kind === "term";
+    const foreground = isTerm
+      ? context.theme.inputSurfaceAccent
+      : part.kind === "paste"
+        ? context.theme.inputSurfaceDim
+        : userMessageText;
+    push(chip(part.text, foreground, isTerm, isTerm), part.separated === true);
+  }
+  for (const badge of [...imageBadges, ...videoBadges]) push(badge, true);
+  const content = chips.join("");
   const messageWidth = Math.max(10, context.columns);
   const contentWidth = Math.max(
     1,
     messageWidth - USER_MESSAGE_HORIZONTAL_PADDING - USER_MESSAGE_PREFIX.length,
   );
-  const wrapped = wrapAnsi(content || userChipSegment("(empty)", userMessageText), contentWidth, {
+  // `trim: false` matches Ink's own `wrapText` (`wrap-ansi` with
+  // `{trim: false, hard: true}`), which keeps the space at a wrap boundary on
+  // the continuation line. With the default `trim: true` every wrapped user
+  // message shifted one column left the moment it flushed to scrollback.
+  const wrapped = wrapAnsi(content || chip("(empty)", userMessageText), contentWidth, {
+    trim: false,
     hard: true,
     wordWrap: true,
   });
-  const top = chalk.hex(USER_MESSAGE_BACKGROUND)(USER_MESSAGE_TOP_FILL.repeat(messageWidth));
-  const bottom = chalk.hex(USER_MESSAGE_BACKGROUND)(USER_MESSAGE_BOTTOM_FILL.repeat(messageWidth));
+  const top = chalk.hex(surface)(USER_MESSAGE_TOP_FILL.repeat(messageWidth));
+  const bottom = chalk.hex(surface)(USER_MESSAGE_BOTTOM_FILL.repeat(messageWidth));
   const rows = wrapped.split("\n").map((lineText, index) => {
     const prefix =
       index === 0
-        ? userChipSegment(USER_MESSAGE_PREFIX, userMessageText, true)
-        : userChipSegment(" ".repeat(USER_MESSAGE_PREFIX.length), userMessageText);
-    const line = `${userChipSegment(" ", userMessageText)}${prefix}${lineText}`;
+        ? chip(USER_MESSAGE_PREFIX, userMessageText, true)
+        : chip(" ".repeat(USER_MESSAGE_PREFIX.length), userMessageText);
+    const line = `${chip(" ", userMessageText)}${prefix}${lineText}`;
     const fillWidth = Math.max(0, messageWidth - stringWidth(stripAnsi(line)));
-    return `${line}${userChipSegment(" ".repeat(fillWidth), userMessageText)}`;
+    return `${line}${chip(" ".repeat(fillWidth), userMessageText)}`;
   });
-  return [top, ...rows, bottom].join("\n");
+  const teachingNotes = getUserMessageTeachingNotes(
+    text,
+    pasteInfo,
+    enhancements,
+    messageWidth,
+  ).map((note) => dim(context, note));
+  return [top, ...rows, bottom, ...teachingNotes].join("\n");
 }
 
 function renderQueued(

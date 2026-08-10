@@ -28,10 +28,26 @@ interface UseChatLayoutMeasurementsOptions {
   displayedCwd: string;
   gitBranch?: string | null;
   thinkingLevel?: ThinkingLevel;
+  /**
+   * Plan/autopilot flags exist here for ONE reason: the footer's one-line vs
+   * two-line decision is width-sensitive to its own segment labels, and the
+   * reserved row count computed here must match what <Footer> actually renders.
+   * Pass the same values you pass to the Footer — omitting them re-introduces
+   * the drift where the budget assumed the "off" labels.
+   */
+  planMode?: boolean;
+  autopilot?: boolean;
   exitPending: boolean;
   taskBarExpanded: boolean;
   /** Current LiveToolPanel feed length; the panel renders min(count, 3) rows. */
   liveToolFeedCount: number;
+  /**
+   * True while autopilot's Ken review is in flight. That model call is NOT
+   * driven by the agent loop, so `agentRunning`/`activityPhase` stay idle and
+   * the normal spinner never appears — this claims the (always-reserved) status
+   * slot instead, which is why it costs zero extra rows.
+   */
+  autopilotReviewing?: boolean;
 }
 
 interface ChatLayoutMeasurements {
@@ -39,6 +55,8 @@ interface ChatLayoutMeasurements {
   activityVisible: boolean;
   stallStatusVisible: boolean;
   doneStatusVisible: boolean;
+  /** Status slot shows the autopilot review spinner this frame. */
+  autopilotStatusVisible: boolean;
   statusSlotVisible: boolean;
   mainControlsRef: (node: DOMElement | null) => void;
   measuredLiveAreaRows: number;
@@ -67,9 +85,12 @@ export function useChatLayoutMeasurements({
   displayedCwd,
   gitBranch,
   thinkingLevel,
+  planMode = false,
+  autopilot = false,
   exitPending,
   taskBarExpanded,
   liveToolFeedCount,
+  autopilotReviewing = false,
 }: UseChatLayoutMeasurementsOptions): ChatLayoutMeasurements {
   const footerStatusLayout = getFooterStatusLayoutDecision({
     columns,
@@ -86,9 +107,18 @@ export function useChatLayoutMeasurements({
   const liveToolPanelRows =
     liveToolPanelVisible && liveToolFeedCount > 0 ? Math.min(liveToolFeedCount, 3) : 0;
   const stallStatusVisible = !activityVisible && !!stallError;
+  // The review runs AFTER the turn, so `doneStatus` is already set — the live
+  // review spinner outranks that frozen summary, otherwise the UI reads "done"
+  // while a model call is still burning seconds.
+  const autopilotStatusVisible = !activityVisible && !stallStatusVisible && autopilotReviewing;
   const doneStatusVisible =
-    !activityVisible && !stallStatusVisible && !!doneStatus && !agentRunning;
-  const statusSlotVisible = activityVisible || stallStatusVisible || doneStatusVisible;
+    !activityVisible &&
+    !stallStatusVisible &&
+    !autopilotStatusVisible &&
+    !!doneStatus &&
+    !agentRunning;
+  const statusSlotVisible =
+    activityVisible || stallStatusVisible || autopilotStatusVisible || doneStatusVisible;
 
   const [controlsHeight, setControlsHeight] = useState(0);
   const controlsObserverRef = useRef<ResizeObserver | null>(null);
@@ -117,6 +147,8 @@ export function useChatLayoutMeasurements({
     cwd: displayedCwd,
     gitBranch,
     thinkingLevel,
+    planMode,
+    autopilot,
   });
   const chatControlsLayout = getChatControlsLayoutDecision({
     rows,
@@ -159,6 +191,7 @@ export function useChatLayoutMeasurements({
     activityVisible,
     stallStatusVisible,
     doneStatusVisible,
+    autopilotStatusVisible,
     statusSlotVisible,
     mainControlsRef,
     measuredLiveAreaRows,

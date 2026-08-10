@@ -3,6 +3,11 @@ import { Box, Text } from "ink";
 import { useTheme } from "../theme/theme.js";
 import { getModel } from "../../core/model-registry.js";
 import { useTerminalSize } from "../hooks/useTerminalSize.js";
+import {
+  SHORTCUT_HINT_SEPARATOR,
+  layoutShortcutHints,
+  type ShortcutHint,
+} from "../banner-shortcuts.js";
 import type { Provider } from "@kenkaiiii/gg-ai";
 
 interface BannerProps {
@@ -55,6 +60,16 @@ export function Banner({ version, model, cwd }: BannerProps) {
   const home = process.env.HOME ?? "";
   const displayPath = home && cwd.startsWith(home) ? "~" + cwd.slice(home.length) : cwd;
 
+  // Hints share the row with nothing when stacked, but sit beside the logo in
+  // the side-by-side layout — budget accordingly so no row ever soft-wraps (a
+  // wrapped row also breaks live/scrollback parity). The block is laid out
+  // across up to two rows so all five hints survive an 80-column terminal.
+  const hintRows = layoutShortcutHints(
+    columns < SIDE_BY_SIDE_MIN
+      ? columns - LEFT_PAD.length
+      : columns - LOGO_WIDTH - GAP.length - LEFT_PAD.length,
+  );
+
   // Static gradient — no animation needed since the banner is rendered once
   // into Ink's Static area. Animating here would waste CPU and could cause
   // visual duplicates on terminal resize.
@@ -90,10 +105,12 @@ export function Banner({ version, model, cwd }: BannerProps) {
           {displayPath}
         </Text>
       </Box>
-      <Box>
-        <Text>{LEFT_PAD}</Text>
-        <ShortcutHints />
-      </Box>
+      {hintRows.map((row, index) => (
+        <Box key={`hint-row-${index}`}>
+          <Text>{LEFT_PAD}</Text>
+          <ShortcutHints hints={row} />
+        </Box>
+      ))}
     </Box>
   );
 
@@ -117,7 +134,9 @@ export function Banner({ version, model, cwd }: BannerProps) {
           {displayPath}
         </Text>
       </Box>
-      <ShortcutHints />
+      {hintRows.map((row, index) => (
+        <ShortcutHints key={`hint-row-${index}`} hints={row} />
+      ))}
     </Box>
   );
 
@@ -143,19 +162,18 @@ export function Banner({ version, model, cwd }: BannerProps) {
   );
 }
 
-function ShortcutHints() {
+function ShortcutHints({ hints }: { hints: ShortcutHint[] }) {
   const theme = useTheme();
 
   return (
     <Box>
-      <Text color={theme.primary}>Ctrl+T</Text>
-      <Text color={theme.textDim}> tasks</Text>
-      <Text color={theme.textDim}> · </Text>
-      <Text color={theme.primary}>Ctrl+S</Text>
-      <Text color={theme.textDim}> skills</Text>
-      <Text color={theme.textDim}> · </Text>
-      <Text color={theme.primary}>Shift+Tab</Text>
-      <Text color={theme.textDim}> toggle thinking</Text>
+      {hints.map((hint, index) => (
+        <React.Fragment key={hint.key}>
+          {index > 0 && <Text color={theme.textDim}>{SHORTCUT_HINT_SEPARATOR}</Text>}
+          <Text color={theme.primary}>{hint.key}</Text>
+          <Text color={theme.textDim}> {hint.label}</Text>
+        </React.Fragment>
+      ))}
     </Box>
   );
 }

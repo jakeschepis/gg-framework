@@ -39,6 +39,9 @@ const SettingsSchema = z.object({
     .default("auto"),
   showTokenUsage: z.boolean().default(true),
   idealReviewEnabled: z.boolean().default(true),
+  /** Autopilot: Ken auto-reviews each finished turn and injects fix prompts
+   *  until clear. Off by default — every review is a real model call. */
+  autopilotEnabled: z.boolean().default(false),
   /** Append LSP diagnostics to edit/write tool results. */
   lspDiagnostics: z.boolean().default(true),
   /** Allow write/edit outside the workspace (cwd, tmpdir, ~/.gg). Off by
@@ -102,6 +105,7 @@ export const DEFAULT_SETTINGS: Settings = {
   theme: "auto",
   showTokenUsage: true,
   idealReviewEnabled: true,
+  autopilotEnabled: false,
   lspDiagnostics: true,
   allowOutsideWorkspaceWrites: false,
   networkMode: "off",

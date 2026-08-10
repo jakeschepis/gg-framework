@@ -35,6 +35,9 @@ export interface SavedSettings {
   thinkingLevel?: ThinkingLevel;
   theme: "auto" | ThemeName;
   idealReviewEnabled: boolean;
+  /** Autopilot: Ken auto-reviews each finished turn and injects fix prompts
+   *  until clear. Off by default — every review is a real model call. */
+  autopilotEnabled: boolean;
   /** Append LSP diagnostics to edit/write tool results. */
   lspDiagnostics: boolean;
   /** Allow write/edit outside the workspace (cwd, tmpdir, ~/.gg). */
@@ -77,6 +80,7 @@ export function loadSavedSettings(settingsFilePath?: string): SavedSettings {
     thinkingEnabled: false,
     theme: "auto",
     idealReviewEnabled: true,
+    autopilotEnabled: false,
     lspDiagnostics: true,
     allowOutsideWorkspaceWrites: false,
     sessionRetentionDays: 30,
@@ -105,6 +109,7 @@ export function loadSavedSettings(settingsFilePath?: string): SavedSettings {
     if (isValidThinkingLevel(raw.thinkingLevel)) result.thinkingLevel = raw.thinkingLevel;
     if (typeof raw.theme === "string" && isValidThemeSetting(raw.theme)) result.theme = raw.theme;
     if (raw.idealReviewEnabled === false) result.idealReviewEnabled = false;
+    if (raw.autopilotEnabled === true) result.autopilotEnabled = true;
     if (raw.lspDiagnostics === false) result.lspDiagnostics = false;
     if (raw.allowOutsideWorkspaceWrites === true) result.allowOutsideWorkspaceWrites = true;
     if (

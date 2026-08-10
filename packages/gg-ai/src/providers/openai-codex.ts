@@ -838,8 +838,7 @@ function codexUsageLimitError(
 ): ProviderError | null {
   const code = String(errorObj?.code ?? errorObj?.type ?? "");
   const rateLimits = errorObj?.rate_limits as
-    | { primary?: { resets_at?: number }; secondary?: { resets_at?: number } }
-    | undefined;
+    { primary?: { resets_at?: number }; secondary?: { resets_at?: number } } | undefined;
   const resetsAtRaw =
     (typeof errorObj?.resets_at === "number" ? (errorObj.resets_at as number) : undefined) ??
     rateLimits?.primary?.resets_at ??

@@ -20,6 +20,8 @@ interface FooterProps {
    */
   thinkingLevel?: ThinkingLevel;
   planMode?: boolean;
+  /** Autopilot state — Ken auto-reviews each finished turn when on (Ctrl+A). */
+  autopilot?: boolean;
   exitPending?: boolean;
   /** Optional left-side status string (e.g. "Connected · DaVinci Resolve"). */
   statusLabel?: string;
@@ -129,11 +131,18 @@ export function getThinkingFooterLabel(thinkingLevel: ThinkingLevel | undefined)
   return thinkingLevel ? `Thinking ${thinkingLevel}` : "Thinking off";
 }
 
+export function getAutopilotFooterLabel(enabled: boolean | undefined): string {
+  return enabled ? "Auto on" : "Auto off";
+}
+
 export function getFooterRightLength({
   barWidth,
   contextPct,
   modelName,
   planText = "Plan off",
+  // Default to the WIDER off-label so a caller that doesn't know the autopilot
+  // state still budgets enough room for the segment (it always renders).
+  autopilotText = getAutopilotFooterLabel(false),
   thinkingText,
   renderMarkdown = true,
 }: {
@@ -141,6 +150,7 @@ export function getFooterRightLength({
   contextPct: number;
   modelName: string;
   planText?: string;
+  autopilotText?: string;
   thinkingText: string;
   renderMarkdown?: boolean;
 }): number {
@@ -153,6 +163,8 @@ export function getFooterRightLength({
     modelName.length +
     3 +
     planText.length +
+    3 +
+    autopilotText.length +
     (renderMarkdown ? 0 : 3 + "raw markdown".length) +
     3 +
     thinkingText.length
@@ -168,6 +180,7 @@ export function doesFooterFitOnOneLine({
   gitBranch,
   thinkingLevel,
   planMode = false,
+  autopilot = false,
   statusBelow,
   renderMarkdown: _renderMarkdown = true,
 }: {
@@ -179,6 +192,7 @@ export function doesFooterFitOnOneLine({
   gitBranch?: string | null;
   thinkingLevel?: ThinkingLevel;
   planMode?: boolean;
+  autopilot?: boolean;
   statusBelow?: boolean;
   renderMarkdown?: boolean;
 }): boolean {
@@ -189,12 +203,14 @@ export function doesFooterFitOnOneLine({
   const modelName = getShortModelName(model);
   const thinkingText = getThinkingFooterLabel(thinkingLevel);
   const planText = planMode ? "Plan on" : "Plan off";
+  const autopilotText = getAutopilotFooterLabel(autopilot);
   const leftLen = displayPath.length + 2 + (gitBranch ? gitBranch.length + 5 : 0);
   const rightLen = getFooterRightLength({
     barWidth: 8,
     contextPct,
     modelName,
     planText,
+    autopilotText,
     thinkingText,
   });
   return leftLen + rightLen <= columns - 2;
@@ -208,6 +224,7 @@ export function Footer({
   gitBranch,
   thinkingLevel,
   planMode = false,
+  autopilot = false,
   exitPending,
   statusLabel,
   statusColor,
@@ -261,6 +278,7 @@ export function Footer({
   // paying for. Off is the only state that stays generic.
   const thinkingText = getThinkingFooterLabel(thinkingLevel);
   const planText = planMode ? "Plan on" : "Plan off";
+  const autopilotText = getAutopilotFooterLabel(autopilot);
   const thinkingColor = getThinkingColor(thinkingLevel, theme);
   const reducedMotion = useReducedMotion();
   const shimmerMaxPower = (thinkingLevel === "xhigh" || thinkingLevel === "max") && !reducedMotion;
@@ -272,6 +290,7 @@ export function Footer({
     contextPct,
     modelName,
     planText,
+    autopilotText,
     thinkingText,
     renderMarkdown,
   });
@@ -285,6 +304,7 @@ export function Footer({
     gitBranch,
     thinkingLevel,
     planMode,
+    autopilot,
     statusBelow,
     renderMarkdown,
   });
@@ -317,6 +337,10 @@ export function Footer({
           {planText}
         </Text>
       )}
+      {sep}
+      <Text color={autopilot ? theme.warning : theme.textDim} bold={autopilot}>
+        {autopilotText}
+      </Text>
       {!renderMarkdown && (
         <>
           {sep}

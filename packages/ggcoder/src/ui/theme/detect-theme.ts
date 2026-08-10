@@ -8,53 +8,55 @@ import type { ThemeName } from "./theme.js";
  * Detection chain for base theme (first match wins):
  * 1. FORCE_THEME env var (explicit override with any ThemeName)
  * 2. VSCODE_THEME_KIND env var (VS Code integrated terminal)
- * 3. macOS system dark mode (defaults read -g AppleInterfaceStyle)
- * 4. OSC 11 escape sequence query (most modern terminals)
- * 5. COLORFGBG env var (rxvt, some other terminals)
+ * 3. OSC 11 escape sequence query (most modern terminals, incl. Warp)
+ * 4. COLORFGBG env var (rxvt, some other terminals)
+ * 5. macOS system appearance (defaults read -g AppleInterfaceStyle)
  * 6. Default to "dark"
  *
- * Auto-selects ANSI fallback variant when truecolor is not supported.
+ * Ordering note: the only thing that actually governs legibility is the
+ * *terminal's* background colour, so OSC 11 is asked before the OS-level
+ * appearance. macOS appearance is a last-resort guess — a user can (and often
+ * does) run a dark terminal profile under a light system theme, or vice versa,
+ * and trusting the OS there paints a light palette onto a dark background.
+ *
+ * Every path falls through to the ANSI-variant selection below; none may
+ * return early, or 16-colour terminals silently get truecolor hex codes.
  */
 export async function detectTheme(): Promise<ThemeName> {
-  // 0. Explicit override
+  // 0. Explicit override — may name an exact variant, so return as-is
   const forceTheme = process.env["FORCE_THEME"];
   if (forceTheme && isValidThemeName(forceTheme)) {
     return forceTheme;
   }
-  // 1. VS Code sets this reliably
+
+  let base: "dark" | "light" | null = null;
+
+  // 1. VS Code sets this reliably for its integrated terminal
   const vscodeTheme = process.env["VSCODE_THEME_KIND"];
   if (vscodeTheme) {
-    return vscodeTheme.includes("light") ? "light" : "dark";
+    base = vscodeTheme.includes("light") ? "light" : "dark";
   }
 
-  // 2. macOS system dark mode — fast, no escape-sequence side effects
-  if (process.platform === "darwin") {
-    try {
-      const result = execFileSync("defaults", ["read", "-g", "AppleInterfaceStyle"], {
-        encoding: "utf-8",
-        timeout: 500,
-        stdio: ["pipe", "pipe", "pipe"],
-      });
-      return result.trim().toLowerCase() === "dark" ? "dark" : "light";
-    } catch {
-      // Command fails when in light mode (key doesn't exist) — that means light
-      return "light";
-    }
+  // 2. OSC 11 — ask the terminal for its actual background colour
+  if (base === null) {
+    base = await queryOSC11();
   }
 
-  // 3. OSC 11 — query actual terminal background color
-  let base: "dark" | "light" | null = await queryOSC11();
-
-  // 4. COLORFGBG — "fg;bg" ANSI color indices
+  // 3. COLORFGBG — "fg;bg" ANSI color indices
   if (base === null) {
     const colorfgbg = process.env["COLORFGBG"];
     if (colorfgbg) {
-      const parts = colorfgbg.split(";");
-      const bg = parseInt(parts[parts.length - 1]!, 10);
+      const bg = parseInt(colorfgbg.split(";").at(-1)!, 10);
       if (!isNaN(bg)) {
         base = bg === 7 || (bg >= 9 && bg <= 15) ? "light" : "dark";
       }
     }
+  }
+
+  // 4. macOS system appearance — heuristic fallback for terminals that
+  //    answer neither OSC 11 nor COLORFGBG (e.g. Apple Terminal).
+  if (base === null && process.platform === "darwin") {
+    base = macOSAppearance();
   }
 
   // 5. Default
@@ -66,6 +68,23 @@ export async function detectTheme(): Promise<ThemeName> {
   }
 
   return base;
+}
+
+/**
+ * Read the macOS system appearance. `AppleInterfaceStyle` is only present when
+ * dark mode is on, so a failed read means light mode.
+ */
+function macOSAppearance(): "dark" | "light" {
+  try {
+    const result = execFileSync("defaults", ["read", "-g", "AppleInterfaceStyle"], {
+      encoding: "utf-8",
+      timeout: 500,
+      stdio: ["pipe", "pipe", "pipe"],
+    });
+    return result.trim().toLowerCase() === "dark" ? "dark" : "light";
+  } catch {
+    return "light";
+  }
 }
 
 const VALID_THEMES = new Set<string>([

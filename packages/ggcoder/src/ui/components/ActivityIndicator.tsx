@@ -153,8 +153,11 @@ function buildStructuredMetaParts(
 const SHIMMER_WIDTH = 3;
 
 export function getThinkingShimmerColor(themeName: string): string {
-  if (themeName.includes("ansi")) return "#55ff55";
-  if (themeName.startsWith("light")) return "#15803d";
+  // Light must be checked before ansi — the bright ANSI ramp is unreadable on
+  // a light background, so light-ansi needs the normal (dark) ANSI green.
+  const isLight = themeName.startsWith("light");
+  if (themeName.includes("ansi")) return isLight ? "#00aa00" : "#55ff55";
+  if (isLight) return "#15803d";
   return "#22c55e";
 }
 
@@ -165,8 +168,9 @@ export function getThinkingShimmerColor(themeName: string): string {
  * own signal — a warm amber/coral.
  */
 export function getWorkingShimmerColor(themeName: string): string {
-  if (themeName.includes("ansi")) return "#ffaf00";
-  if (themeName.startsWith("light")) return "#c2410c";
+  const isLight = themeName.startsWith("light");
+  if (themeName.includes("ansi")) return isLight ? "#aa5500" : "#ffaf00";
+  if (isLight) return "#c2410c";
   return "#fb923c";
 }
 
@@ -277,7 +281,22 @@ interface ActivityIndicatorProps {
   pulseColors?: readonly string[];
   /** Disable decorative per-tick animation so terminal scrollback remains usable. */
   staticDisplay?: boolean;
+  /**
+   * Label the spinner shimmers. Defaults to "Working..." (the agent turn). The
+   * TUI's autopilot review swaps in "Ken is reviewing..." so a model call that
+   * is NOT driven by useAgentLoop still reads as live work, not a hung idle UI.
+   */
+  label?: string;
+  /**
+   * Render the `(duration · tokens · thinking)` tail and the plan-progress tail.
+   * Callers that drive the indicator outside the agent loop (autopilot review)
+   * pass false — those counters belong to the finished turn and would be stale.
+   */
+  showMeta?: boolean;
 }
+
+/** Default label for an agent-loop-driven turn. */
+const DEFAULT_ACTIVITY_LABEL = "Working...";
 
 const RETRY_REASON_LABELS: Record<RetryInfo["reason"], string> = {
   overloaded: "Provider overloaded",
@@ -304,6 +323,8 @@ export function ActivityIndicator({
   planTotal = 0,
   pulseColors: pulseColorsOverride,
   staticDisplay = false,
+  label = DEFAULT_ACTIVITY_LABEL,
+  showMeta = true,
 }: ActivityIndicatorProps) {
   const theme = useTheme();
   const reducedMotion = useReducedMotion();
@@ -403,7 +424,7 @@ export function ActivityIndicator({
   // clock is live: the 100ms tick in full mode, or the 80ms low-churn frame
   // in the (static) status-row mode. Falls back to plain text when idle,
   // unfocused, or reduced-motion so scrollback stays stable.
-  const WORKING_LABEL = "Working...";
+  const WORKING_LABEL = label;
   const workingShimmerFrame = fullAnimationActive ? tick : lowChurnActive ? lowChurnFrame : null;
   const workingShimmerCycle = WORKING_LABEL.length + SHIMMER_WIDTH * 2;
   const workingShimmerPos =
@@ -465,7 +486,7 @@ export function ActivityIndicator({
           {WORKING_LABEL}
         </Text>
       )}
-      {fullAnimationActive && isThinking && legacyMeta.thinking ? (
+      {!showMeta ? null : fullAnimationActive && isThinking && legacyMeta.thinking ? (
         <Text>
           <Text color={theme.textDim}>{"  ("}</Text>
           {legacyMeta.prefix && <Text color={theme.textDim}>{legacyMeta.prefix}</Text>}
@@ -487,7 +508,7 @@ export function ActivityIndicator({
           mutedColor={theme.textDim}
         />
       )}
-      {planTotal > 0 && (
+      {showMeta && planTotal > 0 && (
         <Text>
           {"  "}
           <ShimmerText

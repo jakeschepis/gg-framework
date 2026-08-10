@@ -40,7 +40,12 @@ describe("getThinkingShimmerColor", () => {
     expect(getThinkingShimmerColor("light")).toBe("#15803d");
   });
 
-  it("uses ANSI green on ANSI themes", () => {
-    expect(getThinkingShimmerColor("light-ansi")).toBe("#55ff55");
+  it("uses bright ANSI green on dark ANSI themes", () => {
+    expect(getThinkingShimmerColor("dark-ansi")).toBe("#55ff55");
+  });
+
+  it("uses normal (dark) ANSI green on light ANSI themes", () => {
+    // Bright ANSI green is ~1.3:1 on a white background — unreadable.
+    expect(getThinkingShimmerColor("light-ansi")).toBe("#00aa00");
   });
 });

@@ -98,8 +98,7 @@ import { calculateActiveContextTokens } from "./compaction/active-context.js";
 import { resolveCompactionPolicy } from "./compaction/policy.js";
 import { pruneStaleToolResults } from "./compaction/tool-result-pruner.js";
 import { discoverAgents } from "./agents.js";
-import { enhancePrompt, type EnhanceResult } from "../utils/prompt-enhancer.js";
-import { detectProjectStack } from "./language-detector.js";
+import { enhanceDraft, type EnhanceResult } from "../utils/prompt-enhancer.js";
 import {
   type IdealReviewStats,
   evaluateIdealReview,
@@ -3024,22 +3023,15 @@ export class AgentSession {
     const creds = await this.authStorage.resolveCredentials(this.provider, {
       storageKeys: this.currentAuthStorageKeys(),
     });
-    // Cheap, best-effort stack detection from the project root so terminology is
-    // idiomatic to the user's stack. Never throws (returns "" on any failure).
-    let stack = "";
-    try {
-      stack = detectProjectStack(this.cwd);
-    } catch {
-      /* detection is best-effort — fall back to no stack hint */
-    }
-    return enhancePrompt({
+    return enhanceDraft({
       provider: this.provider,
       model: this.model,
       prompt: text,
-      stack,
+      cwd: this.cwd,
       apiKey: creds.accessToken,
       baseUrl: this.baseUrl ?? creds.baseUrl,
       accountId: creds.accountId,
+      projectId: creds.projectId,
       signal: this.opts.signal,
     });
   }

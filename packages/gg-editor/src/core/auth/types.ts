@@ -17,14 +17,7 @@ export interface OAuthLoginCallbacks {
 
 /** All providers gg-editor supports — mirrors ggcoder's set. */
 export type SupportedAuthProvider =
-  | "anthropic"
-  | "openai"
-  | "glm"
-  | "moonshot"
-  | "xiaomi"
-  | "minimax"
-  | "deepseek"
-  | "openrouter";
+  "anthropic" | "openai" | "glm" | "moonshot" | "xiaomi" | "minimax" | "deepseek" | "openrouter";
 
 /** Providers that use static API keys (no OAuth refresh). */
 export const STATIC_KEY_PROVIDERS = new Set<SupportedAuthProvider>([

@@ -22,9 +22,7 @@ function isForkBuild(version: string): boolean {
 export const checkAndAutoUpdate = (currentVersion: string): string | null =>
   isForkBuild(currentVersion) ? null : updater.checkAndAutoUpdate(currentVersion);
 
-export const getPendingUpdate = (
-  currentVersion: string,
-): { latestVersion: string } | null =>
+export const getPendingUpdate = (currentVersion: string): { latestVersion: string } | null =>
   isForkBuild(currentVersion) ? null : updater.getPendingUpdate(currentVersion);
 
 export const startPeriodicUpdateCheck = (

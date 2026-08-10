@@ -9,6 +9,7 @@ import { extractMediaPaths, readMediaFile, getClipboardImage } from "../../utils
 import { SlashCommandMenu, filterCommands, type SlashCommandInfo } from "./SlashCommandMenu.js";
 import { TaskPickerMenu } from "./TaskPickerMenu.js";
 import { stripTerminalFocusSequences } from "../utils/terminal-input.js";
+import { SPINNER_FRAMES, SPINNER_INTERVAL } from "../spinner-frames.js";
 import type { TaskRecord } from "../../core/tasks-store.js";
 import { log } from "../../core/logger.js";
 import { homedir } from "node:os";
@@ -26,7 +27,6 @@ import {
 const MAX_VISIBLE_LINES = 12;
 const PROMPT = "> ";
 const PLACEHOLDER = "  Type your message or / to run a command";
-const INPUT_BACKGROUND = "#374151";
 const INPUT_TOP_FILL = "▄";
 const INPUT_BOTTOM_FILL = "▀";
 
@@ -214,14 +214,32 @@ interface InputAreaProps {
   /**
    * Text to push into the composer from outside (e.g. queued messages restored
    * after an interrupt). Bumping `nonce` re-triggers injection even when the
-   * text is unchanged. Injected text is appended after any existing draft.
+   * text is unchanged.
+   *
+   * `mode` controls how it lands (default `"append"`, preserving the original
+   * queued-message behaviour): `"append"` adds it after any existing draft,
+   * `"replace"` swaps the whole draft out — used by Ctrl+E prompt enhancement,
+   * where the rewrite IS the draft.
    */
-  injectText?: { text: string; nonce: number } | null;
+  injectText?: { text: string; nonce: number; mode?: "append" | "replace" } | null;
+  /**
+   * Ctrl+E — hand the current draft to the prompt enhancer. Only fired when the
+   * draft is non-empty and no enhancement is already in flight.
+   */
+  onEnhance?: (draft: string) => void;
+  /**
+   * True while an enhancement is in flight. The composer keeps showing the
+   * original draft (so a failure loses nothing) but stops accepting edits: the
+   * text renders dim, the cursor hides, and the `>` glyph becomes a spinner.
+   */
+  enhancing?: boolean;
   disabled?: boolean;
   isActive?: boolean;
   onDownAtEnd?: () => void;
   onShiftTab?: () => void;
   onToggleTasks?: () => void;
+  /** Ctrl+A — toggle autopilot (Ken auto-reviews each finished turn). */
+  onToggleAutopilot?: () => void;
   taskPickerOpen?: boolean;
   tasks?: readonly TaskRecord[];
   onCloseTaskPicker?: () => void;
@@ -327,11 +345,14 @@ export function InputArea({
   onSubmit,
   onAbort,
   injectText,
+  onEnhance,
+  enhancing = false,
   disabled = false,
   isActive = true,
   onDownAtEnd,
   onShiftTab,
   onToggleTasks,
+  onToggleAutopilot,
   taskPickerOpen = false,
   tasks = [],
   onCloseTaskPicker,
@@ -361,13 +382,24 @@ export function InputArea({
   const draftRef = useRef("");
 
   // ── External text injection (e.g. queued messages restored on interrupt) ──
-  // Append injected text to any existing draft and move the cursor to the end.
+  // `append` (default) adds the text after any existing draft; `replace` swaps
+  // the whole draft (prompt enhancement). Cursor lands at the end either way.
   // Keyed on nonce so repeated injections of identical text still fire.
   const lastInjectNonceRef = useRef<number | null>(null);
   useEffect(() => {
     if (!injectText || injectText.text.length === 0) return;
     if (lastInjectNonceRef.current === injectText.nonce) return;
     lastInjectNonceRef.current = injectText.nonce;
+    if (injectText.mode === "replace") {
+      // Paste bookkeeping indexes into the OLD value — stale offsets would paint
+      // a bogus `[Pasted text #N …]` placeholder over the replacement text.
+      setPasteText("");
+      setPasteOffset(0);
+      setSelectionAnchor(null);
+      setValue(injectText.text);
+      setCursor(injectText.text.length);
+      return;
+    }
     setValue((prev) => {
       const next = prev.length > 0 ? `${prev}\n\n${injectText.text}` : injectText.text;
       setCursor(next.length);
@@ -433,11 +465,17 @@ export function InputArea({
   // Disable it while the agent owns the terminal; otherwise the idle input's
   // cursor/border animation keeps repainting the live area during long runs,
   // which makes terminal scrollback snap back to the bottom.
-  const inputAnimationEnabled = !disabled && isActive;
+  // Exception: an in-flight enhancement needs the tick to drive its spinner,
+  // and it's a short, user-initiated state that only repaints one glyph.
+  const inputAnimationEnabled = (!disabled || enhancing) && isActive;
   const { active: inputAnimationActive, tick } = useFocusedAnimation(inputAnimationEnabled);
   const borderFrame = inputAnimationActive ? deriveFrame(tick, 800, borderPulseColors.length) : 0;
-  // Cursor blink: ~530ms period → visible for ~500ms, hidden for ~500ms
-  const cursorVisible = !inputAnimationActive || deriveFrame(tick, 530, 2) === 0;
+  const enhanceFrame = inputAnimationActive
+    ? deriveFrame(tick, SPINNER_INTERVAL, SPINNER_FRAMES.length)
+    : 0;
+  // Cursor blink: ~530ms period → visible for ~500ms, hidden for ~500ms.
+  // Hidden entirely while enhancing — the draft isn't editable then.
+  const cursorVisible = !enhancing && (!inputAnimationActive || deriveFrame(tick, 530, 2) === 0);
 
   // Auto-detect image paths as they're pasted/typed — debounce so full paste arrives
   const extractingRef = useRef(false);
@@ -897,6 +935,16 @@ export function InputArea({
       input = inputWithoutFocusReports;
       const isReturnKey = key.return || input === "\r" || input === "\n";
 
+      // While an enhancement is in flight the composer is frozen: the draft is
+      // about to be replaced wholesale, so letting the user edit (or submit) it
+      // would either lose their keystrokes or fire the un-enhanced draft and
+      // land the rewrite in an empty composer. Only Esc / Ctrl+C get through,
+      // to cancel.
+      if (enhancing) {
+        if (key.escape || (key.ctrl && input === "c")) onAbort();
+        return;
+      }
+
       const isKillKey = key.ctrl && (input === "k" || input === "u" || input === "w");
       if (!isKillKey) lastActionWasKill = false;
       const isYankKey = (key.ctrl && input === "y") || (key.meta && input === "y");
@@ -1018,6 +1066,51 @@ export function InputArea({
       // Ctrl+M toggles rendered/raw markdown mode, matching Gemini's raw markdown affordance.
       if (key.ctrl && input === "m") {
         onToggleMarkdown?.();
+        return;
+      }
+
+      // Ctrl+A toggles autopilot. Handled here, ahead of the emacs bindings, so
+      // plain Ctrl+A no longer means line-start; Ctrl+Shift+A (line-start +
+      // selection), Ctrl+U (kill to start), and the Home key still cover it.
+      if (key.ctrl && !key.shift && input === "a" && onToggleAutopilot) {
+        onToggleAutopilot();
+        return;
+      }
+
+      // Ctrl+E enhances the draft. DELIBERATE, already litigated — don't move it
+      // back without asking the owner first.
+      //
+      // The conflict, stated honestly: Ctrl+E is readline/emacs end-of-line, and
+      // that binding is live on macOS too (zsh, bash, and every NSTextField).
+      // It is NOT the Cmd+E/Cmd+A question — those are untouched. Same trade as
+      // Ctrl+A → autopilot directly above. We take it anyway: enhance is a
+      // top-five action in this composer, end-of-line is not, and this is a
+      // Mac-first TUI whose owner wants the shortest chord on the common action.
+      //
+      // Escape hatches for end-of-line, best first:
+      //   • Ctrl+Shift+E — falls through to the end-of-line branch below via the
+      //     `!key.shift` guard here. Needs a terminal that reports the shift bit
+      //     (kitty keyboard protocol: iTerm2, Ghostty, kitty, WezTerm).
+      //   • The End key — always works where the terminal sends it.
+      //   • Ctrl+K — kill-to-end, when the intent is to delete the tail anyway.
+      //   • Ctrl+E on an empty or whitespace-only draft — there is nothing to
+      //     enhance, so the key keeps its readline meaning (see the guard below).
+      //
+      // Known cost, so nobody rediscovers it as a bug: on macOS Terminal.app
+      // BOTH of the first two fail. It speaks no kitty protocol, and render.ts
+      // disables modifyOtherKeys, so Ctrl+Shift+E arrives as the very same 0x05
+      // byte as Ctrl+E (ink's parse-keypress maps every byte <= 0x1a to
+      // `{ctrl: true, shift: false}`); its End key is also bound to scroll the
+      // buffer by default rather than send a key. Terminal.app users therefore
+      // have only Ctrl+K. Accepted — we target iTerm2/Ghostty, where the
+      // Ctrl+Shift+E hatch genuinely works.
+      //
+      // The decision to enhance is part of the MATCH, not the body: a Ctrl+E we
+      // decline to act on must fall through to end-of-line rather than be
+      // swallowed. Consuming it there made the key silently dead on exactly the
+      // drafts where the user is most likely to be navigating instead.
+      if (key.ctrl && !key.shift && input === "e" && onEnhance && value.trim() && !enhancing) {
+        onEnhance(value);
         return;
       }
 
@@ -1166,8 +1259,13 @@ export function InputArea({
         return;
       }
 
-      // Home / End — Shift extends selection
-      if (key.ctrl && input === "a") {
+      // Home / End — Shift extends selection. Plain Ctrl+A is intercepted above
+      // as the autopilot toggle, so only Ctrl+Shift+A reaches this branch when
+      // an autopilot handler is wired; the Home key itself carries line-start.
+      // Ink already parses \x1b[H / \x1b[1~ / \x1bOH into key.home and blanks
+      // `input` to "", so this MUST test key.home — matching on the raw escape
+      // sequence never fires.
+      if ((key.ctrl && input === "a") || key.home) {
         if (key.shift) {
           if (selectionAnchor === null) setSelectionAnchor(cursor);
         } else {
@@ -1176,7 +1274,12 @@ export function InputArea({
         setCursor(0);
         return;
       }
-      if (key.ctrl && input === "e") {
+      // End-of-line. Plain Ctrl+E is intercepted above as the prompt enhancer,
+      // so on a kitty-protocol terminal only Ctrl+Shift+E reaches this branch
+      // when an enhance handler is wired; the End key itself always carries
+      // line-end. Shift extends the selection, which is what makes Shift+End
+      // work too. See the enhancer handler above for the full trade.
+      if ((key.ctrl && input === "e") || key.end) {
         if (key.shift) {
           if (selectionAnchor === null) setSelectionAnchor(cursor);
         } else {
@@ -1525,9 +1628,25 @@ export function InputArea({
   // Active selection range (absolute character offsets)
   const selection = getSelectionRange(selectionAnchor, cursor);
 
-  const promptColor = disabled ? theme.textDim : theme.commandColor;
+  // Screen-reader mode drops the dark surface, so the box's light-on-dark
+  // tokens would land on the page background. Fall back to the page palette
+  // there; everywhere else the surface owns its own contrast.
+  const onSurface = !isScreenReaderEnabled;
+  const surfaceDim = onSurface ? theme.inputSurfaceDim : theme.textDim;
+  const surfaceAccent = onSurface ? theme.inputSurfaceAccent : theme.accent;
+  const surfaceError = onSurface ? theme.inputSurfaceError : theme.error;
+  // While an enhancement is in flight the draft is frozen and about to be
+  // replaced — render it dim, and swap the `>` glyph for a spinner frame (same
+  // printable width, so no line-wrap math changes).
+  const surfaceText = enhancing
+    ? surfaceDim
+    : onSurface
+      ? theme.inputSurfaceText
+      : theme.commandColor;
+  const promptGlyph = enhancing ? `${SPINNER_FRAMES[enhanceFrame]} ` : PROMPT;
+  const promptColor = enhancing ? surfaceAccent : disabled ? surfaceDim : surfaceText;
   const borderColor = disabled ? theme.textDim : borderPulseColors[borderFrame];
-  const backgroundColor = isScreenReaderEnabled ? undefined : INPUT_BACKGROUND;
+  const backgroundColor = isScreenReaderEnabled ? undefined : theme.inputSurface;
   const renderInputEdge = (fill: string): React.ReactNode => (
     <Box width={columns}>
       <Text color={backgroundColor ?? borderColor}>{fill.repeat(columns)}</Text>
@@ -1555,7 +1674,7 @@ export function InputArea({
         {scopeBadge && <Box marginBottom={0}>{scopeBadge}</Box>}
         {images.length > 0 && (
           <Box>
-            <Text color={theme.accent}>
+            <Text color={surfaceAccent}>
               {(() => {
                 let imageNum = 0;
                 let videoNum = 0;
@@ -1593,7 +1712,7 @@ export function InputArea({
               <Box backgroundColor={backgroundColor} width="100%">
                 {searchMode ? (
                   <Text
-                    color={searchFailed ? theme.error : theme.inputPrompt}
+                    color={searchFailed ? surfaceError : surfaceText}
                     bold
                     backgroundColor={backgroundColor}
                   >
@@ -1601,7 +1720,7 @@ export function InputArea({
                     {`'${searchQuery}': `}
                   </Text>
                 ) : (
-                  renderPromptPrefix(PROMPT)
+                  renderPromptPrefix(promptGlyph)
                 )}
                 {(() => {
                   const beforeCursor = displayStr.slice(0, cursorInDisplay);
@@ -1613,7 +1732,7 @@ export function InputArea({
                       : 0;
                     if (cmdChars >= text.length) {
                       return (
-                        <Text color={theme.commandColor} bold backgroundColor={backgroundColor}>
+                        <Text color={surfaceText} bold backgroundColor={backgroundColor}>
                           {text}
                         </Text>
                       );
@@ -1621,17 +1740,17 @@ export function InputArea({
                     if (cmdChars > 0) {
                       return (
                         <>
-                          <Text color={theme.commandColor} bold backgroundColor={backgroundColor}>
+                          <Text color={surfaceText} bold backgroundColor={backgroundColor}>
                             {text.slice(0, cmdChars)}
                           </Text>
-                          <Text color={theme.commandColor} backgroundColor={backgroundColor}>
+                          <Text color={surfaceText} backgroundColor={backgroundColor}>
                             {text.slice(cmdChars)}
                           </Text>
                         </>
                       );
                     }
                     return (
-                      <Text color={theme.commandColor} backgroundColor={backgroundColor}>
+                      <Text color={surfaceText} backgroundColor={backgroundColor}>
                         {text}
                       </Text>
                     );
@@ -1644,7 +1763,7 @@ export function InputArea({
                   const cursorInCmd = isCommand && cursorInDisplay < commandEndIndex;
                   return (
                     <Text
-                      color={theme.commandColor}
+                      color={surfaceText}
                       bold={cursorInCmd || undefined}
                       inverse={cursorVisible}
                       backgroundColor={backgroundColor}
@@ -1663,7 +1782,7 @@ export function InputArea({
                       : 0;
                     if (cmdChars >= afterCursor.length) {
                       return (
-                        <Text color={theme.commandColor} bold>
+                        <Text color={surfaceText} bold>
                           {afterCursor}
                         </Text>
                       );
@@ -1671,17 +1790,17 @@ export function InputArea({
                     if (cmdChars > 0) {
                       return (
                         <>
-                          <Text color={theme.commandColor} bold>
+                          <Text color={surfaceText} bold>
                             {afterCursor.slice(0, cmdChars)}
                           </Text>
-                          <Text color={theme.commandColor} backgroundColor={backgroundColor}>
+                          <Text color={surfaceText} backgroundColor={backgroundColor}>
                             {afterCursor.slice(cmdChars)}
                           </Text>
                         </>
                       );
                     }
                     return (
-                      <Text color={theme.commandColor} backgroundColor={backgroundColor}>
+                      <Text color={surfaceText} backgroundColor={backgroundColor}>
                         {afterCursor}
                       </Text>
                     );
@@ -1693,15 +1812,11 @@ export function InputArea({
           if (value.length === 0) {
             return (
               <Box backgroundColor={backgroundColor} width="100%">
-                {renderPromptPrefix(PROMPT)}
-                <Text
-                  color={theme.textDim}
-                  inverse={cursorVisible}
-                  backgroundColor={backgroundColor}
-                >
+                {renderPromptPrefix(promptGlyph)}
+                <Text color={surfaceDim} inverse={cursorVisible} backgroundColor={backgroundColor}>
                   {PLACEHOLDER.slice(0, 1)}
                 </Text>
-                <Text color={theme.textDim} backgroundColor={backgroundColor}>
+                <Text color={surfaceDim} backgroundColor={backgroundColor}>
                   {PLACEHOLDER.slice(1)}
                 </Text>
               </Box>
@@ -1757,12 +1872,7 @@ export function InputArea({
 
               if (cmdChars >= text.length) {
                 return (
-                  <Text
-                    color={theme.commandColor}
-                    bold
-                    inverse={inv}
-                    backgroundColor={backgroundColor}
-                  >
+                  <Text color={surfaceText} bold inverse={inv} backgroundColor={backgroundColor}>
                     {text}
                   </Text>
                 );
@@ -1770,26 +1880,17 @@ export function InputArea({
               if (cmdChars > 0) {
                 return (
                   <>
-                    <Text
-                      color={theme.commandColor}
-                      bold
-                      inverse={inv}
-                      backgroundColor={backgroundColor}
-                    >
+                    <Text color={surfaceText} bold inverse={inv} backgroundColor={backgroundColor}>
                       {text.slice(0, cmdChars)}
                     </Text>
-                    <Text
-                      color={theme.commandColor}
-                      inverse={inv}
-                      backgroundColor={backgroundColor}
-                    >
+                    <Text color={surfaceText} inverse={inv} backgroundColor={backgroundColor}>
                       {text.slice(cmdChars)}
                     </Text>
                   </>
                 );
               }
               return (
-                <Text color={theme.commandColor} inverse={inv} backgroundColor={backgroundColor}>
+                <Text color={surfaceText} inverse={inv} backgroundColor={backgroundColor}>
                   {text}
                 </Text>
               );
@@ -1840,7 +1941,7 @@ export function InputArea({
                 segments.push(
                   <Text
                     key="cursor"
-                    color={theme.commandColor}
+                    color={surfaceText}
                     bold={curInCmd}
                     inverse={cursorVisible}
                     backgroundColor={backgroundColor}
@@ -1889,7 +1990,7 @@ export function InputArea({
                 segments.push(
                   <Text
                     key="cursor"
-                    color={theme.commandColor}
+                    color={surfaceText}
                     bold={curInCmd}
                     inverse={cursorVisible}
                     backgroundColor={backgroundColor}
@@ -1925,7 +2026,7 @@ export function InputArea({
                 segments.push(
                   <Text
                     key="cursor"
-                    color={theme.commandColor}
+                    color={surfaceText}
                     bold={cursorInCommand}
                     inverse={cursorVisible}
                     backgroundColor={backgroundColor}
@@ -1945,7 +2046,7 @@ export function InputArea({
 
             return (
               <Box key={i} backgroundColor={backgroundColor} width="100%">
-                {renderPromptPrefix(i === 0 ? PROMPT : "  ")}
+                {renderPromptPrefix(i === 0 ? promptGlyph : "  ")}
                 {segments}
               </Box>
             );

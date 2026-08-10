@@ -206,6 +206,7 @@ function liveElementFor(item: CompletedItem): React.ReactElement | null {
           imageCount={item.imageCount}
           videoCount={item.videoCount}
           pasteInfo={item.pasteInfo}
+          enhancements={item.enhancements}
         />
       );
     case "assistant":
@@ -564,6 +565,54 @@ const supplementalParityCases: CompletedItem[] = [
     result: "Exit code: 0\nhi",
     isError: false,
     durationMs: 1000,
+  },
+  // Ctrl+E prompt enhancement: highlighted terms + teaching footnotes must land
+  // in the live row and the scrollback serializer identically, or the highlights
+  // vanish (or shift) the moment the transcript flushes to scrollback.
+  {
+    kind: "user",
+    id: "user-enhanced",
+    text: "Add debounce to the search box and cache the results.",
+    enhancements: [
+      { kind: "text", text: "Add " },
+      {
+        kind: "term",
+        text: "debounce",
+        original: "wait a bit",
+        note: "delays until input settles",
+      },
+      { kind: "text", text: " to the search box and " },
+      { kind: "term", text: "cache", original: "remember" },
+      { kind: "text", text: " the results." },
+    ],
+  },
+  {
+    kind: "user",
+    id: "user-enhanced-wrapping",
+    text: "Wrap the uploader in a retry with exponential backoff so a flaky network recovers, and memoize the thumbnail so it renders once.",
+    enhancements: [
+      { kind: "text", text: "Wrap the uploader in a " },
+      {
+        kind: "term",
+        text: "retry with exponential backoff",
+        original: "try again slower each time",
+      },
+      { kind: "text", text: " so a flaky network recovers, and " },
+      { kind: "term", text: "memoize", original: "remember", note: "caches the computed value" },
+      { kind: "text", text: " the thumbnail so it renders once." },
+    ],
+  },
+  // Edited after enhancing: the segments no longer reconstruct the text, so
+  // BOTH renderers must fall back to plain — no highlight over the wrong words.
+  {
+    kind: "user",
+    id: "user-enhanced-edited",
+    text: "Add debouncing to the search box.",
+    enhancements: [
+      { kind: "text", text: "Add " },
+      { kind: "term", text: "debounce", original: "wait a bit" },
+      { kind: "text", text: " to the search box." },
+    ],
   },
   {
     kind: "tool_start",

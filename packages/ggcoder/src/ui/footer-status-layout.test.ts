@@ -81,8 +81,9 @@ describe("main footer mode layout", () => {
         contextPct: 12,
         modelName: "Sonnet",
         planText: "Plan on",
+        autopilotText: "Auto off",
         thinkingText: "Thinking off",
       }),
-    ).toBe(withoutModeWidth + 3 + "Plan on".length);
+    ).toBe(withoutModeWidth + 3 + "Plan on".length + 3 + "Auto off".length);
   });
 });

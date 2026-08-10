@@ -106,6 +106,7 @@ export function renderTranscriptItem({
           imageCount={item.imageCount}
           videoCount={item.videoCount}
           pasteInfo={item.pasteInfo}
+          enhancements={item.enhancements}
         />,
       );
     case "style_pack":

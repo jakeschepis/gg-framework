@@ -56,6 +56,7 @@ export interface RenderAppConfig {
   theme?: "auto" | ThemeName;
   showTokenUsage?: boolean;
   idealReviewEnabled?: boolean;
+  autopilotEnabled?: boolean;
   onSlashCommand?: (input: string) => Promise<string | null>;
   loggedInProviders?: Provider[];
   credentialsByProvider?: Record<
@@ -160,6 +161,9 @@ export interface SessionStore {
   planMode?: boolean;
   /** Whether pre-final ideal review is enabled for this UI session. */
   idealReviewEnabled?: boolean;
+  /** Whether autopilot (Ctrl+A) is on. Mirrored here so the toggle survives a
+   *  remount — plan approval rebuilds the whole tree. */
+  autopilotEnabled?: boolean;
 }
 
 export interface ResetUIOptions {
@@ -416,6 +420,7 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
     pendingAction: undefined,
     planMode: config.planModeRef?.current ?? false,
     idealReviewEnabled: config.idealReviewEnabled ?? true,
+    autopilotEnabled: config.autopilotEnabled ?? false,
   };
 
   const terminalHistoryPrinter = createTerminalHistoryPrinter();
@@ -581,6 +586,7 @@ export async function renderApp(config: RenderAppConfig): Promise<void> {
             version: config.version,
             showTokenUsage: config.showTokenUsage,
             idealReviewEnabled: sessionStore.idealReviewEnabled,
+            autopilotEnabled: sessionStore.autopilotEnabled,
             onSlashCommand: config.onSlashCommand,
             loggedInProviders: config.loggedInProviders,
             credentialsByProvider: config.credentialsByProvider,

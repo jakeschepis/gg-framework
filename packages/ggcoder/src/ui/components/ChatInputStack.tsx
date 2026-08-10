@@ -13,6 +13,7 @@ interface ChatInputStackProps {
   statusSlotVisible: boolean;
   activityVisible: boolean;
   stallStatusVisible: boolean;
+  autopilotStatusVisible?: boolean;
   liveToolFeed: readonly LiveToolEntry[];
   doneStatus: {
     verb: string;
@@ -44,6 +45,7 @@ export function ChatInputStack({
   statusSlotVisible,
   activityVisible,
   stallStatusVisible,
+  autopilotStatusVisible,
   liveToolFeed,
   doneStatus,
   activityPhase,
@@ -94,6 +96,7 @@ export function ChatInputStack({
         visible={statusSlotVisible}
         activityVisible={activityVisible}
         stallStatusVisible={stallStatusVisible}
+        autopilotStatusVisible={autopilotStatusVisible}
         doneStatus={doneStatus}
         columns={columns}
         theme={theme}

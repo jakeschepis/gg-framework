@@ -45,5 +45,10 @@
   "subagent6": "#ff5555",
   "subagent7": "#ff55ff",
   "subagent8": "#55ffff",
-  "language": "#55ffff"
+  "language": "#55ffff",
+  "inputSurface": "#000000",
+  "inputSurfaceText": "#55ffff",
+  "inputSurfaceDim": "#aaaaaa",
+  "inputSurfaceAccent": "#55ffff",
+  "inputSurfaceError": "#ff5555"
 }

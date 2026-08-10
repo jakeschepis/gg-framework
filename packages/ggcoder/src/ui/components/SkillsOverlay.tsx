@@ -13,7 +13,9 @@ const SKILL_LOGO = [
   " \u2580\u2584\u2584\u2580 \u2580\u2584\u2584\u2580",
 ];
 
-const GRADIENT = [
+/** Violet→blue sweep for the logo. Light terminals need the darker end of the
+ *  ramp; the dark-theme pastels wash out to ~2:1 on white. */
+const GRADIENT_DARK = [
   "#a78bfa",
   "#b49afa",
   "#c1a9f4",
@@ -24,11 +26,28 @@ const GRADIENT = [
   "#b49afa",
 ];
 
+const GRADIENT_LIGHT = [
+  "#6d28d9",
+  "#5b28d4",
+  "#4c2fcf",
+  "#3f3ac9",
+  "#1d4ed8",
+  "#3f3ac9",
+  "#4c2fcf",
+  "#5b28d4",
+];
+
+function gradientFor(themeName: string): readonly string[] {
+  return themeName.startsWith("light") ? GRADIENT_LIGHT : GRADIENT_DARK;
+}
+
 const GAP = "   ";
 const LOGO_WIDTH = 9;
 const SIDE_BY_SIDE_MIN = LOGO_WIDTH + GAP.length + 20;
 
 function SkillGradientText({ text }: { text: string }) {
+  const theme = useTheme();
+  const gradient = gradientFor(theme.name);
   const chars: React.ReactNode[] = [];
   let colorIdx = 0;
   for (let i = 0; i < text.length; i++) {
@@ -36,7 +55,7 @@ function SkillGradientText({ text }: { text: string }) {
     if (ch === " ") {
       chars.push(ch);
     } else {
-      const color = GRADIENT[colorIdx % GRADIENT.length];
+      const color = gradient[colorIdx % gradient.length];
       chars.push(
         <Text key={i} color={color}>
           {ch}
@@ -129,7 +148,7 @@ export function SkillsOverlay({ cwd, onClose }: SkillsOverlayProps) {
           <SkillGradientText text={SKILL_LOGO[1]} />
           <SkillGradientText text={SKILL_LOGO[2]} />
           <Box marginTop={1}>
-            <Text color="#a78bfa" bold>
+            <Text color={theme.secondary} bold>
               Skills Pane
             </Text>
           </Box>
@@ -137,9 +156,9 @@ export function SkillsOverlay({ cwd, onClose }: SkillsOverlayProps) {
             {displayPath}
           </Text>
           <Text>
-            <Text color="#a78bfa">{projectCount} project</Text>
+            <Text color={theme.secondary}>{projectCount} project</Text>
             <Text color={theme.textDim}> · </Text>
-            <Text color="#60a5fa">{globalCount} global</Text>
+            <Text color={theme.primary}>{globalCount} global</Text>
             <Text color={theme.textDim}> · </Text>
             <Text color={theme.success}>{bundledCount} built-in</Text>
             <Text color={theme.textDim}> · </Text>
@@ -151,7 +170,7 @@ export function SkillsOverlay({ cwd, onClose }: SkillsOverlayProps) {
           <Box>
             <SkillGradientText text={SKILL_LOGO[0]} />
             <Text>{GAP}</Text>
-            <Text color="#a78bfa" bold>
+            <Text color={theme.secondary} bold>
               Skills Pane
             </Text>
           </Box>
@@ -166,9 +185,9 @@ export function SkillsOverlay({ cwd, onClose }: SkillsOverlayProps) {
             <SkillGradientText text={SKILL_LOGO[2]} />
             <Text>{GAP}</Text>
             <Text>
-              <Text color="#a78bfa">{projectCount} project</Text>
+              <Text color={theme.secondary}>{projectCount} project</Text>
               <Text color={theme.textDim}> · </Text>
-              <Text color="#60a5fa">{globalCount} global</Text>
+              <Text color={theme.primary}>{globalCount} global</Text>
               <Text color={theme.textDim}> · </Text>
               <Text color={theme.success}>{bundledCount} built-in</Text>
               <Text color={theme.textDim}> · </Text>
@@ -201,9 +220,9 @@ export function SkillsOverlay({ cwd, onClose }: SkillsOverlayProps) {
           skill.source === "project" ? "local" : skill.source === "global" ? "global" : "built-in";
         const sourceColor =
           skill.source === "project"
-            ? "#a78bfa"
+            ? theme.secondary
             : skill.source === "global"
-              ? "#60a5fa"
+              ? theme.primary
               : theme.success;
         const isExpanded = expandedSkill === skill.name;
 

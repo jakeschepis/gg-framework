@@ -1,14 +1,21 @@
 import { stream, type Message, type Provider, type TextContent } from "@kenkaiiii/gg-ai";
+import { detectProjectStack } from "../core/language-detector.js";
 
 /**
  * One piece of an enhanced prompt. A `text` segment is verbatim prose; a `term`
  * segment is a corrected technical term the model swapped in, carrying the
  * user's `original` phrasing (and an optional `note`) so the UI can teach the
  * difference via a tooltip.
+ *
+ * WIRE TYPE — serialised verbatim by the sidecar's `POST /enhance` handler
+ * (`app-sidecar.ts`) and hand-mirrored in the webview at `gg-app/src/agent.ts`
+ * (~line 392), which cannot import from this package. Change either side and
+ * you MUST change the other in lockstep; the parity guards are
+ * `prompt-enhancer.contract.test.ts` here and
+ * `gg-app/src/prompt-segment-contract.test.ts` there.
  */
 export type PromptSegment =
-  | { kind: "text"; text: string }
-  | { kind: "term"; text: string; original: string; note?: string };
+  { kind: "text"; text: string } | { kind: "term"; text: string; original: string; note?: string };
 
 export interface EnhanceResult {
   /** The plain rewritten prompt — exactly what gets sent to the agent. */
@@ -25,7 +32,9 @@ const OPEN = "\u27E6"; // ⟦
 const CLOSE = "\u27E7"; // ⟧
 const BAR = "\u00A6"; // ¦
 
-export const ENHANCER_SYSTEM_PROMPT = `You rewrite a developer's rough request into a tight, well-structured prompt for a CODING AGENT, and you teach them the correct vocabulary as you go. You only rewrite it — never answer, plan, or implement the request, never ask the user questions, and never add code snippets.
+// Module-local: the only consumer is `enhancePrompt` below. Not exported —
+// the module's public API is `enhanceDraft` / `enhancePrompt` / `parseEnhanced`.
+const ENHANCER_SYSTEM_PROMPT = `You rewrite a developer's rough request into a tight, well-structured prompt for a CODING AGENT, and you teach them the correct vocabulary as you go. You only rewrite it — never answer, plan, or implement the request, never ask the user questions, and never add code snippets.
 
 The teaching part: when the user described something in plain or informal words that has a precise, conventional software-engineering name, use that real name AND wrap it so the user learns the term. This highlighting is the main point — using the right term but failing to wrap it is a miss.
 
@@ -126,6 +135,10 @@ export async function enhancePrompt(opts: {
   apiKey?: string;
   baseUrl?: string;
   accountId?: string;
+  /** Google Cloud / Gemini Code Assist project. Required for Gemini OAuth users
+   *  who have no GOOGLE_CLOUD_PROJECT env var — without it the Code Assist
+   *  request omits `project` entirely and fails. */
+  projectId?: string;
   signal?: AbortSignal;
 }): Promise<EnhanceResult> {
   // Append a one-line, fact-only stack hint so terminology is idiomatic to the
@@ -150,6 +163,7 @@ export async function enhancePrompt(opts: {
     apiKey: opts.apiKey,
     baseUrl: opts.baseUrl,
     accountId: opts.accountId,
+    projectId: opts.projectId,
     signal: opts.signal,
   });
 
@@ -168,4 +182,41 @@ export async function enhancePrompt(opts: {
           .join("");
 
   return parseEnhanced(text);
+}
+
+/**
+ * Enhance a draft with already-resolved credentials, detecting the project's
+ * stack from `cwd` first.
+ *
+ * This is the single seam both hosts run: `AgentSession.enhancePrompt()` (which
+ * the gg-app sidecar's `/enhance` endpoint calls) and the TUI's Ctrl+E handler.
+ * Neither re-implements the empty-draft guard or the best-effort stack sniff, so
+ * the desktop app and the terminal can't drift apart.
+ */
+export async function enhanceDraft(opts: {
+  provider: Provider;
+  model: string;
+  prompt: string;
+  /** Project root — used only for the best-effort stack hint. */
+  cwd: string;
+  apiKey?: string;
+  baseUrl?: string;
+  accountId?: string;
+  /** Google Cloud / Gemini Code Assist project — forwarded via `...rest` below. */
+  projectId?: string;
+  signal?: AbortSignal;
+}): Promise<EnhanceResult> {
+  const { cwd, ...rest } = opts;
+  if (!opts.prompt.trim()) {
+    return { enhanced: opts.prompt, segments: [{ kind: "text", text: opts.prompt }] };
+  }
+  // Cheap, best-effort stack detection so terminology is idiomatic to the
+  // user's stack. Never throws (falls back to no stack hint).
+  let stack = "";
+  try {
+    stack = detectProjectStack(cwd);
+  } catch {
+    /* detection is best-effort — fall back to no stack hint */
+  }
+  return enhancePrompt({ ...rest, stack });
 }

@@ -145,6 +145,13 @@ jobs:
         run: node gg-app/scripts/smoke-sidecar.mjs
         shell: bash
 
+      # The webview typechecks independently of the sidecar package, so its
+      # compile-time guards (e.g. the /enhance wire-shape pins in
+      # src/prompt-segment-contract.test.ts) only fire under tsc — vitest does
+      # not typecheck. Without this step that drift would surface at release.
+      - name: Frontend typecheck
+        run: pnpm --filter gg-app check
+
       - name: Frontend platform-class test
         run: pnpm --filter gg-app test
 

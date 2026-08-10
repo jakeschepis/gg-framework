@@ -2,9 +2,12 @@ import React from "react";
 import { Text, Box, useStdout } from "ink";
 import { useTheme } from "../theme/theme.js";
 import type { PasteInfo } from "./InputArea.js";
-import { getUserMessageDisplayParts } from "../utils/user-message-display.js";
+import type { PromptSegment } from "../../utils/prompt-enhancer.js";
+import {
+  getUserMessageDisplayParts,
+  getUserMessageTeachingNotes,
+} from "../utils/user-message-display.js";
 
-const USER_MESSAGE_BACKGROUND = "#374151";
 const USER_MESSAGE_PREFIX = "> ";
 const USER_MESSAGE_TOP_FILL = "▄";
 const USER_MESSAGE_BOTTOM_FILL = "▀";
@@ -14,16 +17,29 @@ export function UserMessage({
   imageCount,
   videoCount,
   pasteInfo,
+  enhancements,
 }: {
   text: string;
   imageCount?: number;
   videoCount?: number;
   pasteInfo?: PasteInfo;
+  /**
+   * Ctrl+E prompt-enhancer segments for this message. Honoured only when they
+   * still reconstruct `text` exactly, so an edited-after-enhance send renders
+   * plain — see `getUserMessageDisplayParts`.
+   */
+  enhancements?: readonly PromptSegment[];
 }) {
   const theme = useTheme();
   const { stdout } = useStdout();
 
-  const parts = getUserMessageDisplayParts(text, pasteInfo);
+  // This row paints its own dark surface in every theme, so its text comes from
+  // the `inputSurface*` tokens rather than the page palette — the light palette
+  // is dark-on-white and would be invisible on top of it.
+  const surfaceBackground = theme.inputSurface;
+  const surfaceText = theme.inputSurfaceText;
+
+  const parts = getUserMessageDisplayParts(text, pasteInfo, enhancements);
   const imageLabels =
     imageCount != null && imageCount > 0
       ? Array.from({ length: imageCount }, (_, i) => `[Image #${i + 1}]`)
@@ -34,10 +50,11 @@ export function UserMessage({
       : [];
   const mediaLabels = [...imageLabels, ...videoLabels];
   const messageWidth = Math.max(1, stdout.columns ?? 80);
+  const teachingNotes = getUserMessageTeachingNotes(text, pasteInfo, enhancements, messageWidth);
 
   const renderUserMessageEdge = (fill: string): React.ReactNode => (
     <Box width={messageWidth}>
-      <Text color={USER_MESSAGE_BACKGROUND}>{fill.repeat(messageWidth)}</Text>
+      <Text color={surfaceBackground}>{fill.repeat(messageWidth)}</Text>
     </Box>
   );
 
@@ -50,34 +67,40 @@ export function UserMessage({
         paddingRight={1}
         flexGrow={0}
         flexShrink={0}
-        backgroundColor={USER_MESSAGE_BACKGROUND}
+        backgroundColor={surfaceBackground}
         width={messageWidth}
       >
         <Box width={USER_MESSAGE_PREFIX.length} flexShrink={0}>
-          <Text color={theme.commandColor} bold backgroundColor={USER_MESSAGE_BACKGROUND}>
+          <Text color={surfaceText} bold backgroundColor={surfaceBackground}>
             {USER_MESSAGE_PREFIX}
           </Text>
         </Box>
-        <Box flexGrow={1} backgroundColor={USER_MESSAGE_BACKGROUND}>
-          <Text wrap="wrap" color={theme.commandColor} backgroundColor={USER_MESSAGE_BACKGROUND}>
+        <Box flexGrow={1} backgroundColor={surfaceBackground}>
+          <Text wrap="wrap" color={surfaceText} backgroundColor={surfaceBackground}>
             {parts.map((part, index) => (
               <React.Fragment key={index}>
-                {index > 0 ? (
-                  <Text color={theme.commandColor} backgroundColor={USER_MESSAGE_BACKGROUND}>
+                {part.separated && index > 0 ? (
+                  <Text color={surfaceText} backgroundColor={surfaceBackground}>
                     {" "}
                   </Text>
                 ) : null}
                 <Text
-                  color={theme.commandColor}
+                  color={part.kind === "term" ? theme.inputSurfaceAccent : surfaceText}
+                  bold={part.kind === "term"}
+                  underline={part.kind === "term"}
                   dimColor={part.kind === "paste"}
-                  backgroundColor={USER_MESSAGE_BACKGROUND}
+                  backgroundColor={surfaceBackground}
                 >
                   {part.text}
                 </Text>
               </React.Fragment>
             ))}
             {mediaLabels.map((label) => (
-              <Text key={label} color={theme.accent} backgroundColor={USER_MESSAGE_BACKGROUND}>
+              <Text
+                key={label}
+                color={theme.inputSurfaceAccent}
+                backgroundColor={surfaceBackground}
+              >
                 {` ${label}`}
               </Text>
             ))}
@@ -85,6 +108,11 @@ export function UserMessage({
         </Box>
       </Box>
       {renderUserMessageEdge(USER_MESSAGE_BOTTOM_FILL)}
+      {teachingNotes.map((note) => (
+        <Text key={note} color={theme.textDim}>
+          {note}
+        </Text>
+      ))}
     </Box>
   );
 }

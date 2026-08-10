@@ -23,11 +23,16 @@ import type { BackgroundProcess } from "../../core/process-manager.js";
 interface ChatInputControls {
   onSubmit: (value: string, images: ImageAttachment[], paste?: PasteInfo) => void;
   onAbort: () => void;
-  injectText?: { text: string; nonce: number } | null;
+  injectText?: { text: string; nonce: number; mode?: "append" | "replace" } | null;
   inputActive: boolean;
+  /** Ctrl+E — rewrite the current draft via the prompt enhancer. */
+  onEnhance: (draft: string) => void;
+  /** True while that rewrite is in flight (composer frozen, spinner shown). */
+  enhancing: boolean;
   onDownAtEnd: () => void;
   onShiftTab: () => void;
   onToggleTasks: () => void;
+  onToggleAutopilot: () => void;
   onToggleSkills: () => void;
   onToggleMarkdown: () => void;
   cwd: string;
@@ -76,6 +81,8 @@ interface ChatScreenProps {
   statusSlotVisible: boolean;
   activityVisible: boolean;
   stallStatusVisible: boolean;
+  /** Autopilot's Ken review is in flight (not driven by the agent loop). */
+  autopilotStatusVisible?: boolean;
   liveToolFeed: readonly LiveToolEntry[];
   doneStatus: { verb: string; durationMs: number } | null;
   activityPhase: ActivityPhase;
@@ -108,6 +115,7 @@ interface ChatScreenProps {
   displayedCwd: string;
   gitBranch?: string | null;
   planMode: boolean;
+  autopilot: boolean;
   exitPending: boolean;
   footerStatusLayout: FooterStatusLayoutDecision;
   backgroundTasks: BackgroundProcess[];
@@ -145,6 +153,7 @@ export function ChatScreen({
   statusSlotVisible,
   activityVisible,
   stallStatusVisible,
+  autopilotStatusVisible,
   liveToolFeed,
   doneStatus,
   activityPhase,
@@ -177,6 +186,7 @@ export function ChatScreen({
   displayedCwd,
   gitBranch,
   planMode,
+  autopilot,
   exitPending,
   footerStatusLayout,
   backgroundTasks,
@@ -222,6 +232,7 @@ export function ChatScreen({
           statusSlotVisible={statusSlotVisible}
           activityVisible={activityVisible}
           stallStatusVisible={stallStatusVisible}
+          autopilotStatusVisible={autopilotStatusVisible}
           liveToolFeed={liveToolFeed}
           doneStatus={doneStatus}
           activityPhase={activityPhase}
@@ -245,11 +256,14 @@ export function ChatScreen({
           onSubmit={inputControls.onSubmit}
           onAbort={inputControls.onAbort}
           injectText={inputControls.injectText}
+          onEnhance={inputControls.onEnhance}
+          enhancing={inputControls.enhancing}
           disabled={isRunning}
           isActive={inputControls.inputActive}
           onDownAtEnd={inputControls.onDownAtEnd}
           onShiftTab={inputControls.onShiftTab}
           onToggleTasks={inputControls.onToggleTasks}
+          onToggleAutopilot={inputControls.onToggleAutopilot}
           taskPickerOpen={taskPicker.open}
           tasks={taskPicker.tasks}
           onCloseTaskPicker={taskPicker.onClose}
@@ -279,6 +293,7 @@ export function ChatScreen({
           gitBranch={gitBranch}
           thinkingLevel={thinkingLevel}
           planMode={planMode}
+          autopilot={autopilot}
           exitPending={exitPending}
           renderMarkdown={renderMarkdown}
         />

@@ -503,8 +503,7 @@ function* synthesizeEventsFromCompletion(
 
   // Tool calls
   const toolCalls = msg.tool_calls as
-    | Array<{ id: string; function: { name: string; arguments: string } }>
-    | undefined;
+    Array<{ id: string; function: { name: string; arguments: string } }> | undefined;
   if (toolCalls) {
     for (const tc of toolCalls) {
       const argsJson = tc.function?.arguments ?? "";
@@ -554,8 +553,7 @@ function completionToResponse(
     }
 
     const toolCalls = msg.tool_calls as
-      | Array<{ id: string; function: { name: string; arguments: string } }>
-      | undefined;
+      Array<{ id: string; function: { name: string; arguments: string } }> | undefined;
     if (toolCalls) {
       for (const tc of toolCalls) {
         const args = parseToolArguments(tc.function?.arguments ?? "");

@@ -92,8 +92,7 @@ export function createPreRenderCheckTool(
 
       // Loudness verdict (when source supplied)
       let loudness:
-        | { i: number; tp: number; lra: number; verdict: "ok" | "off-target" }
-        | undefined;
+        { i: number; tp: number; lra: number; verdict: "ok" | "off-target" } | undefined;
       if (loudnessSource) {
         if (!checkFfmpeg()) {
           issues.push({

@@ -32,6 +32,24 @@ describe("loadSavedSettings", () => {
     expect(settings.compactThreshold).toBe(0.85);
   });
 
+  it("defaults autopilot off", () => {
+    expect(loadSavedSettings(tempSettingsPath()).autopilotEnabled).toBe(false);
+  });
+
+  it("honors an explicit autopilot enable", () => {
+    const settingsPath = tempSettingsPath();
+    fs.writeFileSync(settingsPath, JSON.stringify({ autopilotEnabled: true }), "utf-8");
+
+    expect(loadSavedSettings(settingsPath).autopilotEnabled).toBe(true);
+  });
+
+  it("ignores a non-boolean autopilot value", () => {
+    const settingsPath = tempSettingsPath();
+    fs.writeFileSync(settingsPath, JSON.stringify({ autopilotEnabled: "yes" }), "utf-8");
+
+    expect(loadSavedSettings(settingsPath).autopilotEnabled).toBe(false);
+  });
+
   it("honors an explicit ideal review disable", () => {
     const settingsPath = tempSettingsPath();
     fs.writeFileSync(settingsPath, JSON.stringify({ idealReviewEnabled: false }), "utf-8");

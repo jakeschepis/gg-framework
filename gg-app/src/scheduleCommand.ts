@@ -76,8 +76,7 @@ export interface ScheduleParseError {
 }
 
 export type ScheduleParseResult =
-  | { ok: true; value: ParsedSchedule }
-  | { ok: false; error: ScheduleParseError };
+  { ok: true; value: ParsedSchedule } | { ok: false; error: ScheduleParseError };
 
 interface Segment {
   /** Trimmed segment text. */

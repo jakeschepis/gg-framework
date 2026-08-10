@@ -1,10 +1,12 @@
-import { describe, expect, it, vi } from "vitest";
+import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
 import stringWidth from "string-width";
+import chalk from "chalk";
 import {
   createTerminalHistoryPrinter,
   serializeCompletedItemToTerminalHistory,
 } from "./terminal-history.js";
 import type { CompletedItem } from "./app-items.js";
+import { SHORTCUT_HINTS } from "./banner-shortcuts.js";
 import { loadTheme } from "./theme/theme.js";
 import type * as figures from "./constants/figures.js";
 
@@ -165,6 +167,45 @@ describe("terminal history", () => {
     expect(rendered).not.toContain("line two");
     expect(rendered).not.toContain("\nline");
     expect(rendered.match(/>/g)).toHaveLength(1);
+  });
+
+  it("keeps Ctrl+E corrected terms and their teaching footnotes in scrollback", () => {
+    const item: CompletedItem = {
+      kind: "user",
+      text: "Add debounce to the search box.",
+      enhancements: [
+        { kind: "text", text: "Add " },
+        { kind: "term", text: "debounce", original: "wait a bit" },
+        { kind: "text", text: " to the search box." },
+      ],
+      id: "user-1",
+    };
+
+    const rendered = serializeCompletedItemToTerminalHistory(item, context);
+    const lines = stripAnsi(rendered).split("\n");
+
+    // The term is glued to its neighbours, and the footnote sits below the box.
+    expect(lines[1]).toContain("> Add debounce to the search box.");
+    expect(lines.at(-1)).toBe("  ↳ debounce — you said “wait a bit”");
+  });
+
+  it("drops the highlights when the enhanced draft was edited before sending", () => {
+    const item: CompletedItem = {
+      kind: "user",
+      text: "Add debouncing to the search box.",
+      enhancements: [
+        { kind: "text", text: "Add " },
+        { kind: "term", text: "debounce", original: "wait a bit" },
+        { kind: "text", text: " to the search box." },
+      ],
+      id: "user-1",
+    };
+
+    const rendered = serializeCompletedItemToTerminalHistory(item, context);
+
+    expect(stripAnsi(rendered)).toContain("> Add debouncing to the search box.");
+    expect(stripAnsi(rendered)).not.toContain("you said");
+    expect(stripAnsi(rendered).split("\n")).toHaveLength(3);
   });
 
   it("serializes tool rows with status dots and the response gutter", () => {
@@ -376,6 +417,33 @@ describe("terminal history", () => {
     expect(rendered).toMatch(/toggle thinking\n\n▄+/);
     expect(rendered).toContain("> hello");
     expect(rendered).not.toMatch(/toggle thinking\n\n\n▄+/);
+  });
+
+  it("shows every shortcut hint at 80 columns, wrapping instead of dropping", () => {
+    let output = "";
+    const stream = {
+      write(chunk: string) {
+        output += chunk;
+        return true;
+      },
+    } as NodeJS.WriteStream;
+    const printer = createTerminalHistoryPrinter({ stream });
+
+    printer.print([{ kind: "banner", id: "banner" }], context);
+
+    const rendered = stripAnsi(output);
+    for (const hint of SHORTCUT_HINTS) {
+      expect(rendered, `missing hint ${hint.key}`).toContain(`${hint.key} ${hint.label}`);
+    }
+    // ...and none of the hint rows may overflow the terminal, which is what a
+    // single row would do if it held all five.
+    const hintRows = rendered
+      .split("\n")
+      .filter((line) => SHORTCUT_HINTS.some((hint) => line.includes(hint.key)));
+    expect(hintRows.length).toBeGreaterThan(0);
+    for (const line of hintRows) {
+      expect(stringWidth(line), line).toBeLessThanOrEqual(context.columns);
+    }
   });
 
   it("prints one trailing newline after finalized assistant rows", () => {
@@ -653,5 +721,94 @@ describe("terminal history", () => {
     printer.print([item], context);
 
     expect(output.match(/again/g)).toHaveLength(2);
+  });
+});
+
+/**
+ * The user row is drawn twice: live by <UserMessage>, then serialized here for
+ * native scrollback. Only the component was fixed at first, so the transcript
+ * copy kept painting the page palette on the box's dark surface and the light
+ * theme showed unreadable purple text.
+ */
+describe("user row box colours", () => {
+  let previousChalkLevel: typeof chalk.level;
+
+  beforeAll(() => {
+    // Vitest runs with chalk.level 0, which strips colour entirely and would
+    // make every assertion below pass vacuously.
+    previousChalkLevel = chalk.level;
+    chalk.level = 3;
+  });
+
+  afterAll(() => {
+    chalk.level = previousChalkLevel;
+  });
+
+  /** Truecolor SGR foreground sequence for a hex colour. */
+  function fg(hex: string): string {
+    const [r, g, b] = [1, 3, 5].map((i) => parseInt(hex.slice(i, i + 2), 16));
+    return `38;2;${r};${g};${b}`;
+  }
+
+  const userItem: CompletedItem = { kind: "user", text: "morning", id: "user-colour" };
+
+  it("emits colour at all", () => {
+    // Canary: the assertions below would pass vacuously on uncoloured output.
+    const rendered = serializeCompletedItemToTerminalHistory(userItem, context);
+    expect(rendered).toContain("38;2;");
+  });
+
+  it.each(["light", "light-daltonized", "dark", "dark-daltonized"] as const)(
+    "%s uses the surface token for the prompt text",
+    (name) => {
+      const theme = loadTheme(name);
+      const rendered = serializeCompletedItemToTerminalHistory(userItem, { ...context, theme });
+
+      expect(rendered).toContain(fg(theme.inputSurfaceText));
+    },
+  );
+
+  it("never paints light-mode page text onto the dark box", () => {
+    const theme = loadTheme("light");
+    const rendered = serializeCompletedItemToTerminalHistory(userItem, { ...context, theme });
+
+    // commandColor (#4f46e5) on the #374151 surface is 1.64:1 — the purple bug.
+    expect(rendered).not.toContain(fg(theme.commandColor));
+  });
+
+  it("highlights a Ctrl+E corrected term with the surface accent, bold and underlined", () => {
+    const theme = loadTheme("dark");
+    const item: CompletedItem = {
+      kind: "user",
+      text: "Add debounce here.",
+      enhancements: [
+        { kind: "text", text: "Add " },
+        { kind: "term", text: "debounce", original: "wait a bit" },
+        { kind: "text", text: " here." },
+      ],
+      id: "user-enhanced",
+    };
+
+    const rendered = serializeCompletedItemToTerminalHistory(item, { ...context, theme });
+
+    // Same emphasis the live `<UserMessage>` row draws (bold + underline), so
+    // the highlight survives the flush to scrollback.
+    expect(rendered).toContain("\u001b[4m\u001b[1m");
+    expect(rendered).toContain(fg(theme.inputSurfaceAccent));
+  });
+
+  it("uses the surface accent for media badges", () => {
+    const theme = loadTheme("light");
+    const item: CompletedItem = {
+      kind: "user",
+      text: "look",
+      imageCount: 1,
+      id: "user-image",
+    };
+
+    const rendered = serializeCompletedItemToTerminalHistory(item, { ...context, theme });
+
+    expect(rendered).toContain(fg(theme.inputSurfaceAccent));
+    expect(rendered).not.toContain(fg(theme.accent));
   });
 });

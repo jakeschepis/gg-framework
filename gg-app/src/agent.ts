@@ -92,12 +92,7 @@ export type WorkspaceMode = "code" | "chat";
 export type ChatAgentId = "general" | "therapist" | "research";
 
 export type MemoryCategory =
-  | "identity"
-  | "preference"
-  | "project"
-  | "relationship"
-  | "health"
-  | "other";
+  "identity" | "preference" | "project" | "relationship" | "health" | "other";
 
 export interface Memory {
   id: string;
@@ -115,12 +110,7 @@ export interface MemorySnapshot {
 }
 
 export type JiwaCategory =
-  | "identity"
-  | "voice"
-  | "interaction"
-  | "boundaries"
-  | "workflow"
-  | "other";
+  "identity" | "voice" | "interaction" | "boundaries" | "workflow" | "other";
 
 export interface JiwaEntry {
   id: string;
@@ -397,11 +387,17 @@ export async function getSubscriptionUsage(
  * One piece of an enhanced prompt. A `text` segment is verbatim prose; a `term`
  * segment is a corrected technical term the model swapped in, carrying the
  * user's `original` phrasing (and an optional `note`) so the UI can teach the
- * difference via a tooltip. Mirrors the sidecar's PromptSegment.
+ * difference via a tooltip.
+ *
+ * WIRE TYPE — hand-mirrored from the canonical declarations in
+ * `packages/ggcoder/src/utils/prompt-enhancer.ts`, which the sidecar's
+ * `POST /enhance` handler serialises verbatim. Change either side and you MUST
+ * change the other in lockstep; the parity guards are
+ * `prompt-segment-contract.test.ts` here and
+ * `packages/ggcoder/src/utils/prompt-enhancer.contract.test.ts` there.
  */
 export type PromptSegment =
-  | { kind: "text"; text: string }
-  | { kind: "term"; text: string; original: string; note?: string };
+  { kind: "text"; text: string } | { kind: "term"; text: string; original: string; note?: string };
 
 export interface EnhanceResult {
   /** The plain rewritten prompt — exactly what gets sent to the agent. */

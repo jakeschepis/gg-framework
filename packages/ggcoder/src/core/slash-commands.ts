@@ -275,6 +275,22 @@ export function createBuiltinCommands(): SlashCommand[] {
       },
     },
     {
+      name: "autopilot",
+      aliases: ["ap"],
+      description: "Let Ken review each finished turn and drive the fixes (Ctrl+A)",
+      usage: "/autopilot [on|off]",
+      execute(args) {
+        // The real toggle lives in App.tsx (it owns the useAutopilot hook and
+        // React state) and intercepts before the registry, so this body only
+        // runs where no TUI toggle exists — today that's the gg-app sidecar.
+        const arg = args.trim().toLowerCase();
+        if (arg && arg !== "on" && arg !== "off") return "Usage: /autopilot [on|off]";
+        return isGgApp()
+          ? "Autopilot is toggled with the Autopilot switch in the desktop app's header, not by command."
+          : "Autopilot must be toggled from the interactive TUI — /autopilot [on|off] or Ctrl+A.";
+      },
+    },
+    {
       name: "quit",
       aliases: ["q", "exit"],
       description: "Exit the agent",
