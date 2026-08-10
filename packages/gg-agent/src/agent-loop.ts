@@ -2128,11 +2128,22 @@ function sanitizeOrphanedServerTools(messages: Message[]): void {
  * Ensure every assistant message with tool_call blocks is immediately followed
  * by a tool message with matching tool_result entries. This prevents Anthropic
  * API 400 errors ("tool_use ids found without tool_result blocks immediately
- * after") that can occur after compaction, session restore, or abort recovery.
+ * after", and its mirror "unexpected `tool_use_id` found in `tool_result`
+ * blocks") that can occur after compaction, session restore, or abort recovery.
  *
- * Repairs in-place by inserting synthetic tool_result messages where needed.
+ * Anthropic pairing is strictly *adjacent*: every tool_result must live in the
+ * message immediately following its tool_use. So this repairs three shapes:
+ *   1. consecutive tool messages are merged into one (a late result appended
+ *      after the turn moved on lands in its own message otherwise),
+ *   2. missing results are filled with a synthetic interrupted marker,
+ *   3. results that are not adjacent to their tool_call -- or that duplicate an
+ *      id already answered -- are dropped.
+ *
+ * Repairs in-place.
  */
-function repairToolPairingAdjacent(messages: Message[]): void {
+export function repairToolPairingAdjacent(messages: Message[]): void {
+  mergeConsecutiveToolMessages(messages);
+
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
     if (msg.role !== "assistant") continue;
@@ -2172,28 +2183,63 @@ function repairToolPairingAdjacent(messages: Message[]): void {
     }
   }
 
-  // Reverse repair: strip tool_result entries whose tool_use_id has no matching
-  // tool_call in the preceding assistant message. This can happen when compaction
-  // or stall recovery removes an assistant message but leaves its tool_result behind.
-  const toolCallIdSet = new Set<string>();
+  // Reverse repair: a tool_result is only valid when its tool_call sits in the
+  // *immediately preceding* assistant message and no earlier result already
+  // answered that id. Anything else (compaction dropping an assistant message,
+  // a tool finishing after its turn was interrupted and already closed out with
+  // a synthetic result) is stripped rather than sent to a guaranteed 400.
+  const answered = new Set<string>();
   for (let i = 0; i < messages.length; i++) {
     const msg = messages[i]!;
-    if (msg.role === "assistant" && Array.isArray(msg.content)) {
-      for (const p of msg.content as ContentPart[]) {
-        if (p.type === "tool_call") toolCallIdSet.add((p as ToolCall).id);
+    if (msg.role !== "tool" || !Array.isArray(msg.content)) continue;
+
+    const prev = messages[i - 1];
+    const adjacentIds = new Set<string>();
+    if (prev?.role === "assistant" && Array.isArray(prev.content)) {
+      for (const p of prev.content as ContentPart[]) {
+        if (p.type === "tool_call") adjacentIds.add((p as ToolCall).id);
       }
     }
-    if (msg.role === "tool" && Array.isArray(msg.content)) {
-      const results = msg.content as ToolResult[];
-      const filtered = results.filter((r) => toolCallIdSet.has(r.toolCallId));
-      if (filtered.length === 0) {
-        // Entire tool message is orphaned — remove it
-        messages.splice(i, 1);
-        i--;
-      } else if (filtered.length < results.length) {
-        (msg as { content: ToolResult[] }).content = filtered;
-      }
+
+    const results = msg.content as ToolResult[];
+    const filtered = results.filter(
+      (r) => adjacentIds.has(r.toolCallId) && !answered.has(r.toolCallId),
+    );
+    for (const r of filtered) answered.add(r.toolCallId);
+
+    if (filtered.length === 0) {
+      // Entire tool message is orphaned — remove it
+      messages.splice(i, 1);
+      i--;
+    } else if (filtered.length < results.length) {
+      (msg as { content: ToolResult[] }).content = filtered;
     }
+  }
+}
+
+/**
+ * Collapse runs of consecutive `tool` messages into the first of the run.
+ * Two tool messages in a row can never be valid on the wire (the second has no
+ * assistant tool_use in the message before it), and they appear when a tool
+ * result is appended after the turn already moved on. Merging first gives the
+ * adjacency check a chance to keep a genuinely-late result whose tool_call is
+ * still the nearest assistant message.
+ */
+function mergeConsecutiveToolMessages(messages: Message[]): void {
+  for (let i = 0; i < messages.length - 1; i++) {
+    const head = messages[i]!;
+    if (head.role !== "tool" || !Array.isArray(head.content)) continue;
+    const merged = [...(head.content as ToolResult[])];
+    let j = i + 1;
+    while (j < messages.length) {
+      const next = messages[j]!;
+      if (next.role !== "tool" || !Array.isArray(next.content)) break;
+      merged.push(...(next.content as ToolResult[]));
+      j++;
+    }
+    if (j === i + 1) continue;
+    (head as { content: ToolResult[] }).content = merged;
+    messages.splice(i + 1, j - i - 1);
   }
 }
 
