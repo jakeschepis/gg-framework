@@ -6,6 +6,16 @@ import { ProcessManager } from "../core/process-manager.js";
 import { createTaskSendTool } from "./task-send.js";
 import { createTaskOutputTool } from "./task-output.js";
 
+/**
+ * A throwaway background-log directory per manager.
+ *
+ * `start()` writes AND prunes inside `bgDir`, so a manager built without one
+ * sweeps the developer's real `~/.gg/bg` when the suite runs.
+ */
+async function bgTempDir(): Promise<string> {
+  return fs.mkdtemp(path.join(os.tmpdir(), "gg-bg-task-send-"));
+}
+
 async function waitForOutput(
   manager: ProcessManager,
   id: string,
@@ -29,7 +39,7 @@ describe("interactive background processes (task_send)", () => {
   });
 
   it("answers an interactive prompt and completes", async () => {
-    manager = new ProcessManager();
+    manager = new ProcessManager({ bgDir: await bgTempDir() });
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "gg-task-send-"));
 
     // Programs that print their prompt explicitly (echo) are visible over a
@@ -46,7 +56,7 @@ describe("interactive background processes (task_send)", () => {
   }, 15_000);
 
   it("drives a REPL across multiple inputs", async () => {
-    manager = new ProcessManager();
+    manager = new ProcessManager({ bgDir: await bgTempDir() });
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "gg-task-send-repl-"));
 
     // A tiny line-reading loop that echoes back, then exits on EOF.
@@ -76,7 +86,7 @@ describe("interactive background processes (task_send)", () => {
   }, 15_000);
 
   it("returns a clear message when the process has already exited", async () => {
-    manager = new ProcessManager();
+    manager = new ProcessManager({ bgDir: await bgTempDir() });
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "gg-task-send-dead-"));
 
     const started = await manager.start('echo "done"', tmpDir);
@@ -89,13 +99,13 @@ describe("interactive background processes (task_send)", () => {
   }, 15_000);
 
   it("reports unknown process ids", async () => {
-    manager = new ProcessManager();
+    manager = new ProcessManager({ bgDir: await bgTempDir() });
     const result = await manager.sendInput("nope", "hi");
     expect(result).toContain('No background process with id "nope"');
   });
 
   it("exposes a task_send tool that pairs with task_output", async () => {
-    manager = new ProcessManager();
+    manager = new ProcessManager({ bgDir: await bgTempDir() });
     const tmpDir = await fs.mkdtemp(path.join(os.tmpdir(), "gg-task-send-tool-"));
     const sendTool = createTaskSendTool(manager);
     const outputTool = createTaskOutputTool(manager);
@@ -115,7 +125,7 @@ describe("interactive background processes (task_send)", () => {
   }, 15_000);
 
   it("guards against empty sends", async () => {
-    manager = new ProcessManager();
+    manager = new ProcessManager({ bgDir: await bgTempDir() });
     const sendTool = createTaskSendTool(manager);
     const ctx = { signal: new AbortController().signal } as never;
     const result = await sendTool.execute({ id: "x", enter: false }, ctx);

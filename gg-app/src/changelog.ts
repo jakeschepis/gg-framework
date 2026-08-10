@@ -22,6 +22,49 @@ export interface ChangelogEntry {
 /** Newest first. Prepended by the `/release` flow. */
 export const CHANGELOG: ChangelogEntry[] = [
   {
+    version: "0.45.1",
+    date: "2026-08-10",
+    items: [
+      "Your code map got a serious cleanup. Ask for a file's structure and you get a clean list that reads straight down the file, real declarations only. On one of my own files that took the outline from `89` cluttered entries to the `17` that actually matter.",
+      "Now you can just say the name. No hunting for a line number first: give `code_nav` any function or class and it goes straight to where that lives and every place it gets used.",
+    ],
+  },
+  {
+    version: "0.45.0",
+    date: "2026-08-10",
+    items: [
+      "Your agent now understands your code the way your editor does. It can `go to definition` and `find all references` across your whole project instead of guessing from text matches. Renames catch every caller and edits land where they should.",
+      "Search stopped missing your files. It now looks inside folders like `.github` that it used to skip completely, leaves out the build junk your project already ignores, and runs nearly twice as fast while doing it.",
+      "Smart code search finally speaks your language. I taught it `five` more: Python, Go, Rust, Java and C#. Describe what a function does and it finds the right one, even when you cannot recall the name.",
+      "Every conversation got cheaper. I stripped out invisible baggage riding along with your requests and cut billed input by `15%` in my testing, and your agent still reaches for every tool it needs.",
+    ],
+  },
+  {
+    version: "0.44.0",
+    date: "2026-08-09",
+    items: [
+      "Your agent now has a real crew. `Six` specialists ship with every install: `bee` builds things, `owl` maps your codebase, `researcher` digs through real docs, `worker` opens PRs, plus an auditor and a skeptic for security passes. They arrive ready to go and quietly refresh themselves with each update, so you never get stuck with a stale copy.",
+      "Delegated work comes back sharper. Helpers used to get silently dropped onto the cheap model and handed a stripped down brief, so they missed things you would never accept from your main agent. Now they inherit your model by default and keep your project rules, tools, and environment, and I stretched their time budget so long jobs actually finish.",
+      "Quitting means quitting. Closing a terminal or hitting `Ctrl+C` no longer leaves a stubborn background process clinging to its port when a slow plugin refuses to let go. Shutdown gets `5` seconds, then it exits for real.",
+    ],
+  },
+  {
+    version: "0.43.0",
+    date: "2026-08-08",
+    items: [
+      "You can now sign in to `Grok` with your SuperGrok or `X Premium` subscription. No API key, no per-token bill, just log in and start building. Add a key as well and I will always spend your subscription first, then slide over to the key the moment your plan usage runs dry, and back again once it resets.",
+      "Long sessions stay rock solid. I sealed a slow leak that ate system resources every time GG Coder reopened your archived chats, and background logs in `~/.gg` now tidy up after themselves instead of quietly growing on your disk forever.",
+    ],
+  },
+  {
+    version: "0.42.0",
+    date: "2026-08-08",
+    items: [
+      "Your rank no longer stops at the top. I stretched the ladder from `50` levels all the way to `1000`, with `145` fresh rank names waiting past Singularity, from Starforge and Voidwalker to Omega and Origin. Every level you already earned stays exactly where it is, so you just keep climbing.",
+      "The stat bars on your scorecard actually mean something now. Instead of sitting pinned at full forever, each one chases your next real milestone and empties the moment you smash it. Glance at your card and you can see exactly how close you are to `1K` commits or your next `60` day streak.",
+    ],
+  },
+  {
     version: "0.41.2",
     date: "2026-08-07",
     items: [

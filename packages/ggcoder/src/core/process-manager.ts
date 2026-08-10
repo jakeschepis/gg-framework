@@ -42,6 +42,19 @@ export interface ReadOutputResult {
 
 const BG_DIR = path.join(os.homedir(), ".gg", "bg");
 
+/**
+ * How long a background process log survives after its last write.
+ *
+ * Every `start()` opens a new `<id>.log` and nothing ever removed them, so the
+ * directory grew without bound for the lifetime of the install — measured at
+ * 14,358 files / 494MB on a single developer machine, with entries dating back
+ * five months. These are debugging aids for a process the agent started; once
+ * the run is long over, so is their value.
+ */
+const BG_LOG_RETENTION_MS = 7 * 24 * 60 * 60 * 1000;
+/** Throttle between prune sweeps, so a burst of `start()` calls scans once. */
+const BG_PRUNE_INTERVAL_MS = 60 * 60 * 1000;
+
 /** Delay before a running process may first report progress. */
 const WATCH_INTERVAL_MS = 5_000;
 /** Ceiling on the progress interval as it backs off between reports. */
@@ -99,6 +112,15 @@ export interface ProcessManagerOps {
    * instead of waiting to be polled with `task_output`.
    */
   notifications?: AgentNotificationQueue;
+  /**
+   * Directory for background process logs. Defaults to the real `~/.gg/bg`.
+   *
+   * Injectable because this manager both writes AND prunes here: a test that
+   * calls `start()` without an override operates on the developer's own log
+   * history. That is not hypothetical — running the suite once deleted ~12.7k
+   * real logs off a machine before this parameter existed.
+   */
+  bgDir?: string;
 }
 
 function stopProcessTree(pid: number, ops: ProcessManagerOps = {}): void {
@@ -117,14 +139,57 @@ export class ProcessManager {
   private watchers = new Map<string, ReturnType<typeof setTimeout>>();
   /** Log size at the last emitted checkpoint, so a quiet process stays quiet. */
   private watchedSizes = new Map<string, number>();
+  /** Timestamp of the last retention sweep; 0 means "never swept". */
+  private lastPruneAt = 0;
 
   constructor(private readonly ops: ProcessManagerOps = {}) {}
 
+  private get bgDir(): string {
+    return this.ops.bgDir ?? BG_DIR;
+  }
+
+  /**
+   * Delete background logs whose last write is older than the retention window.
+   *
+   * Deliberately best-effort and never awaited by `start()`: losing an old log
+   * is harmless, but failing to launch the user's process because a stale log
+   * couldn't be unlinked is not. Logs belonging to processes this manager still
+   * tracks are skipped regardless of age — a quiet long-running dev server can
+   * easily go a week without writing a line, and its log must stay readable.
+   */
+  private async pruneOldLogs(): Promise<void> {
+    const now = Date.now();
+    if (now - this.lastPruneAt < BG_PRUNE_INTERVAL_MS) return;
+    this.lastPruneAt = now;
+
+    let entries: string[];
+    try {
+      entries = await fsp.readdir(this.bgDir);
+    } catch {
+      return; // Directory missing or unreadable; nothing to prune.
+    }
+
+    const live = new Set([...this.processes.keys()].map((id) => `${id}.log`));
+    const cutoff = now - BG_LOG_RETENTION_MS;
+    for (const entry of entries) {
+      if (!entry.endsWith(".log") || live.has(entry)) continue;
+      const file = path.join(this.bgDir, entry);
+      try {
+        const stat = await fsp.stat(file);
+        if (stat.mtimeMs >= cutoff) continue;
+        await fsp.unlink(file);
+      } catch {
+        // Raced with another sweep or held open elsewhere; try again next time.
+      }
+    }
+  }
+
   async start(command: string, cwd: string, launch?: ShellResolution): Promise<StartResult> {
-    await fsp.mkdir(BG_DIR, { recursive: true });
+    await fsp.mkdir(this.bgDir, { recursive: true });
+    void this.pruneOldLogs();
 
     const id = crypto.randomUUID().slice(0, 8);
-    const logFile = path.join(BG_DIR, `${id}.log`);
+    const logFile = path.join(this.bgDir, `${id}.log`);
     const fd = fs.openSync(logFile, "w");
 
     // Cross-platform shell (see core/shell.ts): bash on POSIX, Git Bash on

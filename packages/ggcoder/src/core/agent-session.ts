@@ -27,9 +27,10 @@ import { PROMPT_COMMANDS, getPromptCommand } from "./prompt-commands.js";
 import { loadCustomCommands } from "./custom-commands.js";
 import { SettingsManager } from "./settings-manager.js";
 import { AuthStorage } from "./auth-storage.js";
-import { MOONSHOT_OAUTH_KEY } from "@kenkaiiii/gg-core";
+import { dualAuthProvider } from "@kenkaiiii/gg-core";
 import { getClaudeCliUserAgent } from "./claude-code-version.js";
 import { kimiCodingHeaders, isKimiCodingEndpoint } from "./oauth/kimi.js";
+import { isGrokCliEndpoint } from "./oauth/xai.js";
 import {
   SessionManager,
   KEN_TURN_CUSTOM_KIND,
@@ -69,13 +70,18 @@ import {
 } from "./model-registry.js";
 import { discoverSkills, type Skill } from "./skills.js";
 import { ensureAppDirs } from "../config.js";
-import { buildSystemPrompt, type SystemPromptEnvironment } from "../system-prompt.js";
+import {
+  buildSubAgentSystemPrompt,
+  buildSystemPrompt,
+  type SystemPromptEnvironment,
+} from "../system-prompt.js";
 import {
   createTools,
   createWebSearchTool,
   type LspManager,
   type ProcessManager,
 } from "../tools/index.js";
+import { partitionToolsByTier } from "../tools/tool-tiers.js";
 import type { BackgroundProcess } from "./process-manager.js";
 import { buildProcessCompletionFollowUp } from "./process-gate.js";
 import { buildSubAgentCompletionFollowUp, type SubAgentManager } from "./subagent-manager.js";
@@ -154,7 +160,21 @@ export interface AgentSessionOptions {
   model: string;
   cwd: string;
   baseUrl?: string;
+  /** Replaces the whole system prompt — nothing else is rendered. */
   systemPrompt?: string;
+  /**
+   * A sub-agent definition's body, COMPOSED with the standard scaffolding
+   * (Tools, project context, return contract, Environment) instead of replacing
+   * it — see `buildSubAgentSystemPrompt`.
+   *
+   * Prefer this over `systemPrompt` for delegated children: a bare replacement
+   * leaves the child with no Tools section and no Environment facts, which is
+   * precisely how a sub-agent ends up misusing tools it was never told it had.
+   * Ignored when `systemPrompt` is set.
+   */
+  agentPrompt?: string;
+  /** Whether `agentPrompt` composition includes project instruction files. Default `"project"`. */
+  agentContext?: "project" | "none";
   /** Synchronous volatile prompt suffix, refreshed immediately before every run. */
   getSystemPromptTail?: () => string;
   sessionId?: string;
@@ -432,8 +452,14 @@ export class AgentSession {
     void this.subAgentManager?.interruptAll();
   };
   private mcpManager?: MCPClientManager;
-  /** Deferred MCP tools awaiting discovery via tool_search (bench A win). */
+  /** Deferred MCP tools awaiting discovery via tool_search. */
   private mcpCatalog?: DeferredToolCatalog;
+  /**
+   * Built-in tools held in the catalog instead of the live toolset. Their names
+   * still render as one-line hints in the prompt's Tools section, so the model
+   * can discover and promote them; a promoted name drops out of this list.
+   */
+  private deferredBuiltinToolNames: string[] = [];
   /** Live (connected) MCP tools by name — the reconcile target for cached stubs. */
   private liveMcpTools = new Map<string, AgentTool>();
   /** Server name for each cached-only tool, so a stub knows what to wait on. */
@@ -451,6 +477,8 @@ export class AgentSession {
   private maxTokens: number;
   private thinkingLevel?: ThinkingLevel;
   private customSystemPrompt?: string;
+  /** Sub-agent definition body composed into the standard prompt scaffolding. */
+  private agentPrompt?: string;
   /** Stable prompt prefix retained separately from the volatile uncached tail. */
   private baseSystemPrompt = "";
   /** Shared with the tool layer so plan-mode restrictions read live state. */
@@ -514,6 +542,7 @@ export class AgentSession {
     this.maxTokens = this.resolveMaxTokens(options.model);
     this.thinkingLevel = options.thinkingLevel;
     this.customSystemPrompt = options.systemPrompt;
+    this.agentPrompt = options.agentPrompt;
   }
 
   /**
@@ -608,6 +637,7 @@ export class AgentSession {
         additionalRoots: this.additionalRoots,
         allowOutsideWorkspaceWrites: this.settingsManager.get("allowOutsideWorkspaceWrites"),
       }),
+      getUseExternalGrep: () => this.settingsManager.get("grepUseRipgrep"),
       authStorage: this.authStorage,
       onFileRead: (filePath) => this.reviewCoverage.recordRead(filePath),
       onFileMutated: (filePath) => {
@@ -645,6 +675,23 @@ export class AgentSession {
     // a hallucinated call can't mutate the repo — and buildSystemPrompt below is
     // fed the same filtered names so the Tools section matches exactly.
     this.tools = this.opts.allowedTools ? tools.filter((t) => this.isToolAllowed(t.name)) : tools;
+    // Tier the built-ins: rarely reached schemas move into the tool_search
+    // catalog and cost one hint line each instead of a full parameter schema on
+    // every request. Allow-listed sessions keep the eager path — their fixed
+    // tool expectations predate the catalog, and tool_search isn't allow-listed.
+    if (!this.opts.allowedTools && this.settingsManager.get("deferredBuiltinTools")) {
+      const { core, deferred } = partitionToolsByTier(this.tools);
+      if (deferred.length > 0) {
+        // Append-only: `core` preserves the original relative order and
+        // tool_search is pushed after it, so the serialized tool block that
+        // sits inside the cached prefix stays byte-stable across turns.
+        this.tools = core;
+        this.deferredBuiltinToolNames = deferred.map((t) => t.name);
+        this.mcpCatalog ??= new DeferredToolCatalog();
+        this.mcpCatalog.add(deferred);
+        this.ensureToolSearchTool();
+      }
+    }
     this.rebuildReadTool = rebuildReadTool;
     this.processManager = processManager;
     this.lspManager = lspManager;
@@ -669,18 +716,7 @@ export class AgentSession {
       await this.connectMcpServers();
     }
 
-    const basePrompt =
-      this.customSystemPrompt ??
-      (await buildSystemPrompt(
-        this.cwd,
-        this.skills,
-        false,
-        undefined,
-        this.tools.map((tool) => tool.name),
-        undefined,
-        this.provider,
-        this.promptEnvironment(),
-      ));
+    const basePrompt = await this.buildBasePrompt(false, undefined);
     this.baseSystemPrompt = basePrompt;
     this.messages = [{ role: "system", content: this.withSystemPromptTail(basePrompt) }];
 
@@ -874,8 +910,8 @@ export class AgentSession {
 
   /**
    * Route freshly connected MCP tools: deferred into the tool_search catalog
-   * (default — keeps ~8k tokens of schema out of every cache-miss turn, see
-   * bench/RESULTS.md bench A) or pushed eagerly when the user opted out.
+   * (default — keeps ~8k tokens of schema out of every cache-miss turn) or
+   * pushed eagerly when the user opted out.
    * Allow-listed sessions (Ken) always get the eager path — their fixed tool
    * expectations predate the catalog, and tool_search isn't allow-listed.
    * Promotion pushes onto the live `this.tools` array the running agent loop
@@ -905,9 +941,13 @@ export class AgentSession {
    * Register `tool_search` once. Promotion of a cached-only entry waits for its
    * server so the model is told immediately when that capability turns out to
    * be unreachable, instead of promoting a tool that fails on first call.
+   *
+   * The catalog is created on demand rather than required up front: deferred
+   * built-in tools populate it with zero MCP servers connected, so gating
+   * registration on an existing catalog would leave those tools unreachable.
    */
   private ensureToolSearchTool(): void {
-    if (!this.mcpCatalog) return;
+    this.mcpCatalog ??= new DeferredToolCatalog();
     if (this.tools.some((t) => t.name === "tool_search")) return;
     this.tools.push(
       createToolSearchTool(
@@ -1881,28 +1921,46 @@ export class AgentSession {
       if (isAbortError(err) || this.opts.signal?.aborted) {
         return;
       }
-      // Kimi OAuth plan ran out of usage (hard usage-limit stop, or an HTTP 402
-      // billing stop). If the user ALSO configured a Moonshot API key, mark
-      // the OAuth credential usage-exhausted (honoring the provider-stated
-      // reset time when present) and retry this turn on the API key — OAuth
-      // stays the preferred credential and resumes automatically once the mark
-      // lapses. A generic 429 is deliberately excluded: it may be a transient
-      // rate limit and must not silently switch the user to a billed API key.
-      // Guarded on the Kimi managed endpoint actually being in use: if the API
-      // key was already active, the same error means BOTH are out and must surface.
+      // A subscription OAuth plan ran out of usage (hard usage-limit stop, or an
+      // HTTP 402 billing stop). If the user ALSO configured that provider's API
+      // key, mark the OAuth credential usage-exhausted (honoring the
+      // provider-stated reset time when present) and retry this turn on the API
+      // key — OAuth stays the preferred credential and resumes automatically once
+      // the mark lapses. A generic 429 is deliberately excluded: it may be a
+      // transient rate limit and must not silently switch the user to a billed
+      // API key.
+      //
+      // Grok adds one case Kimi doesn't have: xAI gates its CLI chat proxy by
+      // subscription tier, so an entitled-looking account can be refused outright
+      // with a 403. That means "OAuth cannot serve this", not a transient error,
+      // so it counts as exhausted too — otherwise a dual-configured user would
+      // hard-fail while holding a perfectly good API key.
+      //
+      // Guarded on the subscription endpoint actually being in use: if the API key
+      // was already active, the same error means BOTH are out and must surface.
+      const dualAuth = dualAuthProvider(this.provider);
+      const onSubscriptionEndpoint =
+        (this.provider === "moonshot" && isKimiCodingEndpoint(creds.baseUrl)) ||
+        (this.provider === "xai" && isGrokCliEndpoint(creds.baseUrl));
+      const tierRefusal =
+        this.provider === "xai" && err instanceof ProviderError && err.statusCode === 403;
+      const oauthIsOut =
+        isUsageLimitError(err) ||
+        (err instanceof ProviderError && err.statusCode === 402) ||
+        tierRefusal;
       if (
-        this.provider === "moonshot" &&
+        dualAuth &&
         !this.baseUrl &&
-        isKimiCodingEndpoint(creds.baseUrl) &&
-        (isUsageLimitError(err) || (err instanceof ProviderError && err.statusCode === 402)) &&
-        (await this.authStorage.hasCredentials("moonshot"))
+        onSubscriptionEndpoint &&
+        oauthIsOut &&
+        (await this.authStorage.hasCredentials(dualAuth.provider))
       ) {
         const resetsAt = err instanceof ProviderError ? err.resetsAt : undefined;
-        await this.authStorage.markUsageExhausted(MOONSHOT_OAUTH_KEY, resetsAt);
+        await this.authStorage.markUsageExhausted(dualAuth.oauthKey, resetsAt);
         log(
           "WARN",
           "auth",
-          "Kimi OAuth usage limit reached — retrying this turn on the Moonshot API key",
+          `${dualAuth.oauthLabel} usage limit reached — retrying this turn on the ${dualAuth.apiKeyLabel}`,
           { resetsAt: resetsAt !== undefined ? String(resetsAt) : "unknown" },
         );
         creds = await this.authStorage.resolveCredentials(this.provider, {
@@ -1910,7 +1968,8 @@ export class AgentSession {
         });
         this.lastAccountId = creds.accountId;
         // The runAgentLoop closure re-reads `creds`, so the retry picks up the
-        // API key's baseUrl (api.moonshot.ai) and drops the Kimi coding headers.
+        // API key's public baseUrl (api.moonshot.ai / api.x.ai) and drops the
+        // subscription endpoint's client-identity headers.
         try {
           await runAgentLoop(creds.accessToken, creds.accountId, creds.projectId);
         } catch (fallbackErr) {
@@ -1923,9 +1982,9 @@ export class AgentSession {
       } else if (err instanceof ProviderError && err.statusCode === 401) {
         // Static API-key providers (GLM, Moonshot API key, etc.) have no refresh
         // mechanism — retrying with the same key is pointless. Clear the
-        // credential and surface the error so the user re-logins. Kimi OAuth
-        // (active for `moonshot` when present) is refreshable, so it falls
-        // through to the force-refresh path below.
+        // credential and surface the error so the user re-logins. Subscription
+        // OAuth (active for `moonshot`/`xai` when present) is refreshable, so it
+        // falls through to the force-refresh path below.
         if (await clearInvalidStaticApiKey(err)) throw err;
 
         log("INFO", "auth", "Got 401, force-refreshing token and retrying");
@@ -2358,18 +2417,7 @@ export class AgentSession {
     this.autopilotMarkers = [];
     this.appMarkers = [];
     this.turnMetrics = [];
-    const basePrompt =
-      this.customSystemPrompt ??
-      (await buildSystemPrompt(
-        this.cwd,
-        this.skills,
-        false,
-        undefined,
-        this.tools.map((tool) => tool.name),
-        undefined,
-        this.provider,
-        this.promptEnvironment(),
-      ));
+    const basePrompt = await this.buildBasePrompt(false, undefined);
     this.baseSystemPrompt = basePrompt;
     this.messages = [{ role: "system", content: this.withSystemPromptTail(basePrompt) }];
     // Fresh conversation — new entries must not chain onto the old DAG's leaf.
@@ -2678,6 +2726,17 @@ export class AgentSession {
     return { ok: true, root: resolved };
   }
 
+  /**
+   * Names to advertise as available-on-demand. A tool the model already
+   * promoted lives in `this.tools` and carries its own schema, so it drops out
+   * of the index rather than being listed twice.
+   */
+  private deferredToolNamesForPrompt(liveNames: readonly string[]): string[] {
+    if (this.deferredBuiltinToolNames.length === 0) return [];
+    const live = new Set(liveNames);
+    return this.deferredBuiltinToolNames.filter((name) => !live.has(name));
+  }
+
   /** Environment facts that vary per session rather than per host. */
   private promptEnvironment(): SystemPromptEnvironment {
     const networkAllow =
@@ -2687,19 +2746,46 @@ export class AgentSession {
     return { additionalRoots: this.additionalRoots, networkAllow };
   }
 
-  /** Rebuild messages[0] from current plan-mode + approved-plan state. */
-  private async rebuildSystemPromptInPlace(): Promise<void> {
-    if (this.customSystemPrompt) return;
-    const rebuilt = await buildSystemPrompt(
+  /**
+   * Build the stable system-prompt prefix for the current tool set and state.
+   *
+   * Three modes, in precedence order: a full replacement (`systemPrompt`), a
+   * composed sub-agent prompt (`agentPrompt` — agent body plus Tools, project
+   * context, return contract and Environment), or the standard prompt.
+   */
+  private async buildBasePrompt(planMode: boolean, approvedPlanPath?: string): Promise<string> {
+    if (this.customSystemPrompt) return this.customSystemPrompt;
+    const toolNames = this.tools.map((tool) => tool.name);
+    const deferredToolNames = this.deferredToolNamesForPrompt(toolNames);
+    if (this.agentPrompt !== undefined) {
+      return buildSubAgentSystemPrompt(this.agentPrompt, {
+        cwd: this.cwd,
+        toolNames,
+        deferredToolNames,
+        context: this.opts.agentContext,
+        environment: this.promptEnvironment(),
+      });
+    }
+    return buildSystemPrompt(
       this.cwd,
       this.skills,
-      this.planModeRef.current,
-      this.approvedPlanPath,
-      this.tools.map((tool) => tool.name),
+      planMode,
+      approvedPlanPath,
+      toolNames,
       undefined,
       this.provider,
       this.promptEnvironment(),
+      deferredToolNames,
     );
+  }
+
+  /** Rebuild messages[0] from current plan-mode + approved-plan state. */
+  private async rebuildSystemPromptInPlace(): Promise<void> {
+    // A full replacement is verbatim by contract — there is nothing to rebuild.
+    // A composed agent prompt still must be: its Tools section has to follow
+    // late-arriving MCP tools, or a compacted child loses tools it can call.
+    if (this.customSystemPrompt) return;
+    const rebuilt = await this.buildBasePrompt(this.planModeRef.current, this.approvedPlanPath);
     this.baseSystemPrompt = rebuilt;
     const content = this.withSystemPromptTail(rebuilt);
     if (this.messages[0]?.role === "system") {

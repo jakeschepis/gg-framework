@@ -89,9 +89,10 @@ import { cleanupToolOutputs } from "./tools/overflow.js";
 import { readCappedBody } from "./utils/http-body.js";
 import {
   fetchSubscriptionUsage,
-  MOONSHOT_OAUTH_KEY,
   SubscriptionUsageError,
   XIAOMI_CREDITS_KEY,
+  dualAuthProvider,
+  oauthStorageKey,
   discoverLocalModels,
   findProbedModel,
   formatLocalModelId,
@@ -114,8 +115,16 @@ import { loginAnthropic } from "./core/oauth/anthropic.js";
 import { loginOpenAI } from "./core/oauth/openai.js";
 import { loginGemini } from "./core/oauth/gemini.js";
 import { loginKimi } from "./core/oauth/kimi.js";
+import { loginXai } from "./core/oauth/xai.js";
 import type { OAuthCredentials, OAuthLoginCallbacks } from "./core/oauth/types.js";
-import { AUTH_PROVIDERS, type AuthProviderMeta } from "./core/auth-providers.js";
+import {
+  AUTH_PROVIDERS,
+  authPriorityNote,
+  describeAuthMethods,
+  type AuthMethod,
+  type AuthMethodMeta,
+  type AuthProviderMeta,
+} from "./core/auth-providers.js";
 import { ensureAppDirs, loadSavedSettings } from "./config.js";
 import { SettingsManager, type Settings } from "./core/settings-manager.js";
 import {
@@ -152,6 +161,7 @@ import {
   markTaskInProgress,
 } from "./core/tasks-store.js";
 import { initLogger, log } from "./core/logger.js";
+import { installTerminationHandlers } from "./core/shutdown.js";
 import {
   RADIO_STATIONS,
   getCurrentStation,
@@ -720,6 +730,8 @@ async function runJsonModeIfRequested(): Promise<boolean> {
       model: { type: "string" },
       "max-turns": { type: "string" },
       "system-prompt": { type: "string" },
+      "agent-prompt": { type: "string" },
+      "agent-context": { type: "string" },
       tools: { type: "string" },
       "mcp-servers": { type: "string" },
       "prompt-cache-key": { type: "string" },
@@ -753,6 +765,8 @@ async function runJsonModeIfRequested(): Promise<boolean> {
     model: values.model ?? "claude-opus-5",
     cwd: process.cwd(),
     systemPrompt: values["system-prompt"],
+    agentPrompt: values["agent-prompt"],
+    agentContext: values["agent-context"] === "none" ? "none" : undefined,
     maxTurns: maxTurnsRaw ? parseInt(maxTurnsRaw, 10) : undefined,
     allowedTools,
     allowedMcpServers,
@@ -949,7 +963,7 @@ async function main(): Promise<void> {
       provider === "anthropic" ? "Anthropic" : provider === "openai" ? "Codex" : "Kimi";
     // Kimi plan usage is tracked on the OAuth credential specifically — the
     // Moonshot platform API key is metered per-token, not per plan window.
-    const authKey = provider === "moonshot" ? MOONSHOT_OAUTH_KEY : provider;
+    const authKey = oauthStorageKey(provider) ?? provider;
     if (!(await auth.hasProviderAuth(authKey))) {
       // Logged out: drop the replay cache so a later login on a DIFFERENT
       // account can never inherit the previous one's numbers.
@@ -1198,22 +1212,31 @@ async function main(): Promise<void> {
   });
 
   const shellPid = process.ppid;
-  let shuttingDown = false;
-  async function shutdown(): Promise<void> {
-    if (shuttingDown) return;
-    shuttingDown = true;
-    clearInterval(parentWatch);
-    // Radio playback is app-wide (one stream across all windows), so it stops
-    // at the daemon level, not per session.
-    stopRadio();
-    // Close the ~/.gg progress fs.watch handle (baseline #8 leak fix).
-    progress.dispose();
-    await Promise.all([...sessions.values()].map((c) => c.dispose().catch(() => {})));
-    server.close();
-    process.exit(0);
-  }
-  process.on("SIGINT", () => void shutdown());
-  process.on("SIGTERM", () => void shutdown());
+  // Session teardown awaits MCP servers, LSP servers and third-party extension
+  // `deactivate()` hooks. Any of those can hang, and an unbounded await here
+  // means the daemon never exits: the app looks quit while this process keeps
+  // the port and the radio stream alive. The deadline exits regardless.
+  const shutdown = installTerminationHandlers({
+    scope: "app-sidecar",
+    teardown: async () => {
+      clearInterval(parentWatch);
+      // Radio playback is app-wide (one stream across all windows), so it stops
+      // at the daemon level, not per session.
+      stopRadio();
+      // Close the ~/.gg progress fs.watch handle (baseline #8 leak fix).
+      progress.dispose();
+      await Promise.all([...sessions.values()].map((c) => c.dispose().catch(() => {})));
+      server.close();
+    },
+    onTimeout: (timeoutMs) => {
+      // Radio is audible, so it must stop even when the rest is wedged.
+      stopRadio();
+      log("WARN", "app-sidecar", "daemon teardown hung; exiting on deadline", {
+        timeoutMs: String(timeoutMs),
+        sessions: String(sessions.size),
+      });
+    },
+  });
   process.once("exit", stopRadio);
 
   // Tauri can disappear without delivering a signal (force-quit, dev runner
@@ -1228,7 +1251,7 @@ async function main(): Promise<void> {
         parentAlive = (error as NodeJS.ErrnoException).code === "EPERM";
       }
     }
-    if (!parentAlive) void shutdown();
+    if (!parentAlive) shutdown();
   }, 1_000);
   parentWatch.unref?.();
 }
@@ -2774,13 +2797,65 @@ async function createSession(
   }
 
   async function authStatusPayload(): Promise<{
-    providers: (AuthProviderMeta & { connected: boolean })[];
+    providers: (AuthProviderMeta & {
+      connected: boolean;
+      connectedMethods: AuthMethod[];
+      activeMethod?: AuthMethod;
+      oauthExhaustedUntil?: number;
+      priorityNote?: string;
+      methodGuidance: AuthMethodMeta[];
+    })[];
   }> {
     const providers = await Promise.all(
-      AUTH_PROVIDERS.map(async (p) => ({
-        ...p,
-        connected: await auth.hasProviderAuth(p.value),
-      })),
+      AUTH_PROVIDERS.map(async (p) => {
+        const dual = dualAuthProvider(p.value);
+        // Which methods hold a credential right now. Dual-auth providers can hold
+        // both at once, and the app needs them separately: one "connected" bit
+        // cannot express "OAuth signed in, key also on file as backup", nor offer
+        // a per-method disconnect.
+        const oauthKey = dual?.oauthKey;
+        const hasOAuth = oauthKey ? await auth.hasCredentials(oauthKey) : false;
+        const apiKeyKeys = p.apiKeyVariants?.map((v) => v.key) ?? [p.value];
+        const hasApiKey = p.methods.includes("apikey")
+          ? (await Promise.all(apiKeyKeys.map((k) => auth.hasCredentials(k)))).some(Boolean)
+          : false;
+        const connectedMethods: AuthMethod[] = [];
+        // OAuth-only providers (Anthropic/OpenAI/Gemini) store under the provider
+        // id itself, so `hasProviderAuth` is what proves their OAuth connection.
+        if (
+          p.methods.includes("oauth") &&
+          (hasOAuth || (!dual && (await auth.hasCredentials(p.value))))
+        )
+          connectedMethods.push("oauth");
+        if (hasApiKey) connectedMethods.push("apikey");
+
+        // Which one a request would actually use, mirroring AuthStorage's
+        // resolution: OAuth wins unless its usage window is exhausted AND a key
+        // is configured to cover it.
+        const exhaustedUntil = oauthKey
+          ? ((await auth.getCredentials(oauthKey))?.usageExhaustedUntil ?? 0)
+          : 0;
+        const oauthSidelined = hasOAuth && Date.now() < exhaustedUntil && hasApiKey;
+        const activeMethod = connectedMethods.includes("oauth")
+          ? oauthSidelined
+            ? ("apikey" as const)
+            : ("oauth" as const)
+          : connectedMethods[0];
+
+        // `methodDetails` is the server-side lookup table behind
+        // `methodGuidance` — shipping both would duplicate every string on the
+        // wire for no consumer.
+        const { methodDetails: _table, ...wireMeta } = p;
+        return {
+          ...wireMeta,
+          connected: await auth.hasProviderAuth(p.value),
+          connectedMethods,
+          ...(activeMethod ? { activeMethod } : {}),
+          ...(oauthSidelined ? { oauthExhaustedUntil: exhaustedUntil } : {}),
+          ...(authPriorityNote(p.value) ? { priorityNote: authPriorityNote(p.value)! } : {}),
+          methodGuidance: describeAuthMethods(p.value),
+        };
+      }),
     );
     return { providers };
   }
@@ -4546,9 +4621,11 @@ async function createSession(
             if (provider === "anthropic") creds = await loginAnthropic(cb);
             else if (provider === "openai") creds = await loginOpenAI(cb);
             else if (provider === "gemini") creds = await loginGemini(cb);
-            else if (provider === "moonshot") {
-              creds = await loginKimi(cb);
-              storageKey = MOONSHOT_OAUTH_KEY;
+            else if (provider === "moonshot" || provider === "xai") {
+              // Subscription OAuth (Kimi plan / SuperGrok-X Premium) stores under
+              // a distinct key so it can coexist with the provider's API key.
+              creds = provider === "moonshot" ? await loginKimi(cb) : await loginXai(cb);
+              storageKey = dualAuthProvider(provider)!.oauthKey;
             } else {
               throw new Error(`OAuth not implemented for ${provider}`);
             }
@@ -4641,19 +4718,32 @@ async function createSession(
       void readBody(req, res).then(async (raw) => {
         if (raw === null) return;
         let provider: string;
+        let logoutMethod: AuthMethod | undefined;
         try {
-          provider = (JSON.parse(raw) as { provider?: string }).provider ?? "";
+          const body = JSON.parse(raw) as { provider?: string; method?: string };
+          provider = body.provider ?? "";
+          logoutMethod =
+            body.method === "oauth" || body.method === "apikey" ? body.method : undefined;
         } catch {
           json(res, 400, { error: "invalid JSON body" });
           return;
         }
-        await auth.clearCredentials(provider);
-        // Moonshot's OAuth credential lives under a distinct key — clear both so
-        // "disconnect" fully removes Kimi OAuth and the API key.
-        if (provider === "moonshot") await auth.clearCredentials(MOONSHOT_OAUTH_KEY);
-        // Xiaomi's API Credits credential lives under a distinct key — clear it
-        // too so "disconnect" fully removes both the Token Plan and Credits keys.
-        if (provider === "xiaomi") await auth.clearCredentials(XIAOMI_CREDITS_KEY);
+        const dual = dualAuthProvider(provider);
+        // A dual-auth provider can be disconnected one method at a time: dropping
+        // a spent API key should not sign the user out of their subscription, and
+        // vice versa. Omitting `method` still clears everything (the plain
+        // "Disconnect" action).
+        if (logoutMethod !== "apikey") {
+          await auth.clearCredentials(dual ? dual.oauthKey : provider);
+        }
+        if (logoutMethod !== "oauth") {
+          // Non-dual providers store their only credential under the provider id,
+          // so this covers both them and a dual provider's API key.
+          await auth.clearCredentials(provider);
+          // Xiaomi's API Credits credential lives under a distinct key — clear it
+          // too so "disconnect" fully removes both the Token Plan and Credits keys.
+          if (provider === "xiaomi") await auth.clearCredentials(XIAOMI_CREDITS_KEY);
+        }
         broadcast("auth_done", { provider });
         json(res, 200, { ok: true });
       });

@@ -1106,8 +1106,8 @@ export async function* agentLoop(
           // Preserve partial output: everything streamed before the drop is
           // already paid for (output tokens) and already shown to the user.
           // Keep it as a completed assistant message + continuation instruction
-          // instead of replaying the whole turn from scratch (bench/RESULTS.md,
-          // bench C — replay re-bills 100% of pre-drop output). Skipped when a
+          // instead of replaying the whole turn from scratch (a replay re-bills
+          // 100% of the pre-drop output). Skipped when a
           // tool call was mid-stream: partial tool-call JSON is unusable, and
           // the model must re-issue the call intact on the replay.
           let preservedChars = 0;
@@ -2201,11 +2201,15 @@ export function repairToolPairingAdjacent(messages: Message[]): void {
       }
     }
 
+    // Mark ids answered as we go, not after the pass: merging can put two
+    // results for the same call in one message (a synthetic interrupted marker
+    // plus the late real one), and only the first may survive.
     const results = msg.content as ToolResult[];
-    const filtered = results.filter(
-      (r) => adjacentIds.has(r.toolCallId) && !answered.has(r.toolCallId),
-    );
-    for (const r of filtered) answered.add(r.toolCallId);
+    const filtered = results.filter((r) => {
+      if (!adjacentIds.has(r.toolCallId) || answered.has(r.toolCallId)) return false;
+      answered.add(r.toolCallId);
+      return true;
+    });
 
     if (filtered.length === 0) {
       // Entire tool message is orphaned — remove it

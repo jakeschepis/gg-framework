@@ -148,19 +148,70 @@ function renderCodeQualitySection(): string {
   );
 }
 
-function renderToolsSection(toolNames: readonly string[] | undefined): string | null {
+/**
+ * How to delegate, rendered only when a delegation tool is actually active.
+ *
+ * Per-tool schema text says what each tool does; nothing said when delegating
+ * is worth its cost, or that the child starts from zero — the single most
+ * common failure is a brief like "fix the thing we discussed", which the child
+ * cannot see.
+ */
+function renderDelegationSection(toolNames: readonly string[] | undefined): string | null {
+  const activeTools = new Set(toolNames ?? DEFAULT_TOOL_NAMES);
+  const blocking = activeTools.has("subagent");
+  const async = activeTools.has("spawn_agent");
+  if (!blocking && !async) return null;
+
+  const lines = [
+    `Delegate when a task needs its own context: wide search, an independent workstream, or work you'd otherwise interleave badly. Don't delegate what you can finish inline — a child costs a process, a cold cache, and a round trip.`,
+    `**A child sees none of this conversation.** Its task brief is all it gets, so state the objective, the concrete paths/symbols involved, the constraints, and what to return. "Continue what we discussed" gets you nothing back.`,
+    `One agent per independent unit of work. Overlapping briefs produce duplicated effort and contradictory answers.`,
+    `Pick the named agent whose description matches the work; leave \`agent\` unset only when none fits.`,
+    `You own the result: a child's report is evidence, not truth. Verify anything you're about to act on.`,
+  ];
+  if (async && blocking) {
+    lines.push(
+      `\`subagent\` blocks until the child answers; \`spawn_agent\` returns immediately and the child announces its own completion — use it to fan out, then keep working.`,
+    );
+  }
+  return `## Delegation\n\n${lines.map((line) => `- ${line}`).join("\n")}`;
+}
+
+/**
+ * Render the Tools section.
+ *
+ * `deferredToolNames` are tools that exist but whose parameter schemas are held
+ * out of the request until `tool_search` promotes them. They get a one-line
+ * capability hint under their own sub-heading: without it the model cannot
+ * search for what it does not know exists, and deferral would trade tokens for
+ * capability blindness. Steering clauses see both tiers, since a preference
+ * like "use X rather than Y" stays true while X is one `tool_search` away.
+ */
+function renderToolsSection(
+  toolNames: readonly string[] | undefined,
+  deferredToolNames?: readonly string[],
+): string | null {
   const activeTools = toolNames ?? DEFAULT_TOOL_NAMES;
+  const deferred = (deferredToolNames ?? []).filter((name) => !activeTools.includes(name));
   const toolLines: string[] = [];
   for (const name of activeTools) {
     const hint = TOOL_PROMPT_HINTS[name];
     if (hint) toolLines.push(`- **${name}**: ${hint}`);
   }
+  const deferredLines: string[] = [];
+  for (const name of deferred) {
+    const hint = TOOL_PROMPT_HINTS[name];
+    if (hint) deferredLines.push(`- **${name}**: ${hint}`);
+  }
   // Cross-tool steering: each clause renders only when its tools are active.
   // Per-tool hints only exist for tools with non-obvious usage (see prompt-hints).
-  const steering = buildToolSteering(activeTools);
+  const steering = buildToolSteering([...activeTools, ...deferred]);
   const parts: string[] = [];
   if (steering) parts.push(steering);
   if (toolLines.length > 0) parts.push(toolLines.join("\n"));
+  if (deferredLines.length > 0) {
+    parts.push(`Available on demand (call \`tool_search\` to load):\n${deferredLines.join("\n")}`);
+  }
   return parts.length > 0 ? `## Tools\n\n${parts.join("\n\n")}` : null;
 }
 
@@ -279,6 +330,78 @@ function renderUncachedDateSuffix(): string {
 }
 
 /**
+ * What every sub-agent owes its parent.
+ *
+ * Appended by `buildSubAgentSystemPrompt`, so user-authored agent files inherit
+ * it without repeating it. The parent pays context for whatever comes back, and
+ * it cannot see the child's transcript — so the reply has to be the answer, not
+ * a narration of the search that produced it.
+ */
+export const SUBAGENT_RETURN_CONTRACT =
+  `## Report\n\n` +
+  `You are a sub-agent. Your reply is the ONLY thing your caller receives — it never sees your tool calls, your reasoning, or the files you opened.\n\n` +
+  `- Lead with the answer or the outcome. No preamble, no recap of your process.\n` +
+  `- Cite evidence as \`file:line\`. Point at paths; never paste file bodies or command output the caller can re-read.\n` +
+  `- State what you actually verified and how (command run, test executed, file read). Never claim a check you did not run.\n` +
+  `- Name blockers, assumptions, and anything you could not confirm, plainly.\n` +
+  `- Stay under ~400 words. If the finding is genuinely larger, write it to a file and return the path.`;
+
+/**
+ * Build a sub-agent's system prompt: its own definition PLUS the scaffolding
+ * that teaches correct tool use.
+ *
+ * An agent definition body replaces the parent's Identity/Talk/Work sections —
+ * that is the point of a specialized agent. It must NOT also cost the child its
+ * Tools section, project conventions, or Environment facts (cwd, platform,
+ * shell, date), which is what a bare prompt override did: children ran blind to
+ * their own toolset and re-derived basics every session.
+ *
+ * @param agentBody — the agent definition's markdown body (its identity + method).
+ * @param opts.toolNames — exactly the tools this child can call, so the Tools
+ *   section never advertises something the allow-list strips.
+ * @param opts.context — `"none"` skips project instruction files, for recon
+ *   agents where conventions are dead weight.
+ */
+export async function buildSubAgentSystemPrompt(
+  agentBody: string,
+  opts: {
+    cwd: string;
+    toolNames?: readonly string[];
+    /** Tools available via `tool_search` but not carrying a schema this turn. */
+    deferredToolNames?: readonly string[];
+    context?: "project" | "none";
+    environment?: SystemPromptEnvironment;
+  },
+): Promise<string> {
+  const sections: string[] = [agentBody.trim()];
+
+  const toolsSection = renderToolsSection(opts.toolNames, opts.deferredToolNames);
+  if (toolsSection) sections.push(toolsSection);
+
+  // A child may itself delegate (up to the nesting limit), so it needs the same
+  // briefing rules whenever a delegation tool survived its allow-list.
+  const delegationSection = renderDelegationSection(opts.toolNames);
+  if (delegationSection) sections.push(delegationSection);
+
+  if ((opts.context ?? "project") === "project") {
+    const projectContextSection = renderProjectContextSection(
+      await collectProjectContext(opts.cwd),
+    );
+    if (projectContextSection) sections.push(projectContextSection);
+  }
+
+  sections.push(
+    SUBAGENT_RETURN_CONTRACT,
+    // Environment + date stay last so the cached prefix matches the parent's
+    // layout: everything above is stable, the date suffix is the uncached tail.
+    renderEnvironmentSection(opts.cwd, opts.environment),
+    renderUncachedDateSuffix(),
+  );
+
+  return sections.join("\n\n");
+}
+
+/**
  * Build the system prompt dynamically based on cwd and context.
  *
  * @param toolNames — if provided, the Tools section only lists these tools.
@@ -289,6 +412,9 @@ function renderUncachedDateSuffix(): string {
  * @param environment — extra Environment-section facts (additional workspace
  *   roots, network allowlist). This sits in the cached prefix, so changing it
  *   costs exactly one cache-miss turn.
+ * @param deferredToolNames — tools the model can call only after `tool_search`
+ *   promotes them. Listed as one-line hints so the capability stays discoverable
+ *   while its parameter schema stays out of the request.
  */
 export async function buildSystemPrompt(
   cwd: string,
@@ -299,6 +425,7 @@ export async function buildSystemPrompt(
   activeLanguages?: Set<LanguageId>,
   provider?: Provider,
   environment?: SystemPromptEnvironment,
+  deferredToolNames?: readonly string[],
 ): Promise<string> {
   const sections: string[] = [
     renderIdentitySection(provider),
@@ -313,8 +440,11 @@ export async function buildSystemPrompt(
 
   sections.push(renderResearchSection(toolNames, provider), renderCodeQualitySection());
 
-  const toolsSection = renderToolsSection(toolNames);
+  const toolsSection = renderToolsSection(toolNames, deferredToolNames);
   if (toolsSection) sections.push(toolsSection);
+
+  const delegationSection = renderDelegationSection(toolNames);
+  if (delegationSection) sections.push(delegationSection);
 
   const projectContextSection = renderProjectContextSection(await collectProjectContext(cwd));
   if (projectContextSection) sections.push(projectContextSection);

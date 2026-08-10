@@ -1,5 +1,4 @@
 packages:
   - "packages/*"
-  - "Matey"
   - "experiments/*"
   - "gg-app"

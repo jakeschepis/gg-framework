@@ -582,13 +582,19 @@ async function readFirstFromGgcoderDir(
   files.sort((a, b) => b.mtime - a.mtime);
   for (const file of files) {
     try {
-      const { stream } = await openSessionReadStream(file.path);
+      const { stream, close } = await openSessionReadStream(file.path);
       const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
-      let lines = 0;
-      for await (const line of rl) {
-        if (++lines > 200) break;
-        const value = extractor(line);
-        if (value) return value;
+      try {
+        let lines = 0;
+        for await (const line of rl) {
+          if (++lines > 200) break;
+          const value = extractor(line);
+          if (value) return value;
+        }
+      } finally {
+        // Always via close(): destroying the gunzip alone strands the source fd.
+        rl.close();
+        close();
       }
     } catch {
       // A corrupt archive must not hide otherwise valid projects in this store.
@@ -841,7 +847,7 @@ interface ParsedRecentSession extends RecentSession {
 /** Single-pass parse of one session file: identity + count + activity + preview. */
 async function readSessionSummary(file: string): Promise<ParsedRecentSession | null> {
   try {
-    const { path: resolvedPath, stream } = await openSessionReadStream(file);
+    const { path: resolvedPath, stream, close } = await openSessionReadStream(file);
     const rl = readline.createInterface({ input: stream, crlfDelay: Infinity });
     let id = "";
     let conversationId = "";
@@ -852,42 +858,48 @@ async function readSessionSummary(file: string): Promise<ParsedRecentSession | n
     let label = "";
     let valid = false;
 
-    for await (const line of rl) {
-      if (!line) continue;
-      try {
-        const entry = JSON.parse(line) as {
-          type?: string;
-          id?: string;
-          conversationId?: string;
-          preview?: unknown;
-          timestamp?: string;
-          label?: unknown;
-          message?: { role?: string; content?: unknown };
-        };
-        if (!valid) {
-          if (entry.type !== "session") return null;
-          valid = true;
-          id = entry.id ?? "";
-          conversationId = entry.conversationId ?? id;
-          if (typeof entry.preview === "string") {
-            headerPreview = entry.preview.replace(/\s+/g, " ").trim().slice(0, 80);
+    try {
+      for await (const line of rl) {
+        if (!line) continue;
+        try {
+          const entry = JSON.parse(line) as {
+            type?: string;
+            id?: string;
+            conversationId?: string;
+            preview?: unknown;
+            timestamp?: string;
+            label?: unknown;
+            message?: { role?: string; content?: unknown };
+          };
+          if (!valid) {
+            if (entry.type !== "session") return null;
+            valid = true;
+            id = entry.id ?? "";
+            conversationId = entry.conversationId ?? id;
+            if (typeof entry.preview === "string") {
+              headerPreview = entry.preview.replace(/\s+/g, " ").trim().slice(0, 80);
+            }
+            if (entry.timestamp) lastActivity = entry.timestamp;
+            continue;
           }
-          if (entry.timestamp) lastActivity = entry.timestamp;
-          continue;
-        }
-        if (entry.type === "label" && typeof entry.label === "string" && entry.label.trim()) {
-          label = entry.label.replace(/\s+/g, " ").trim().slice(0, 80);
-        } else if (entry.type === "message") {
-          messageCount += 1;
-          if (entry.timestamp) lastActivity = entry.timestamp;
-          if (!preview && entry.message?.role === "user") {
-            const text = getUserSessionPrompt(entry.message.content);
-            if (text) preview = text.replace(/\s+/g, " ").trim().slice(0, 80);
+          if (entry.type === "label" && typeof entry.label === "string" && entry.label.trim()) {
+            label = entry.label.replace(/\s+/g, " ").trim().slice(0, 80);
+          } else if (entry.type === "message") {
+            messageCount += 1;
+            if (entry.timestamp) lastActivity = entry.timestamp;
+            if (!preview && entry.message?.role === "user") {
+              const text = getUserSessionPrompt(entry.message.content);
+              if (text) preview = text.replace(/\s+/g, " ").trim().slice(0, 80);
+            }
           }
+        } catch {
+          // Skip malformed lines; archive migration preserves them byte-for-byte.
         }
-      } catch {
-        // Skip malformed lines; archive migration preserves them byte-for-byte.
       }
+    } finally {
+      // `return null` above exits mid-stream; close() destroys gunzip + source.
+      rl.close();
+      close();
     }
     return valid
       ? {

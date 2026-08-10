@@ -26,7 +26,6 @@ test_*.js
 Thumbs.db
 
 # Editor
-CLAUDE.md
 .vscode/
 .idea/
 
@@ -55,23 +54,25 @@ packages/gg-editor/src/skills.ts
 .goal-evidence/
 artifacts/
 packages/ggcoder/.goal-evidence/
-scripts/goal-deep-audit/*.json
-scripts/goal-deep-audit/*.log
-.gg/ideal-sim/
 packages/ggcoder/ideal-sim/
 
 # prompt-bench scratch sandboxes
 experiments/prompt-bench/.bench-sandbox-*
 
-# Local benchmark experiments and raw samples (may contain provider metadata)
-bench/benchmark-results/
-bench/LATENCY_RESULTS.md
-bench/latency-matrix.ts
-bench/api-benchmark.test.ts
+# Local agent config, benchmarks and one-off tooling. These are personal working
+# directories, not shipped source: no CI job, package build or npm script reads
+# them, so a fresh clone is unaffected by their absence.
+/.gg/
+/.claude/
+/bench/
+/benchmarks/
+/experiments/bench-mark/
+/scripts/
+CLAUDE.md
+packages/*/.bench-*.mjs
 
-# scratch — top coding agents scan
-top-coding-agents.md
-coding-agent-72h-adoption-report.md
-
-# Local research scratch
-coding-agents.md
+# Local research/strategy notes
+/*-vs-*.md
+/*-report.md
+/fixes.md
+/*coding-agent*.md

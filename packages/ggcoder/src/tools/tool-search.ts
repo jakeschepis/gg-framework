@@ -36,7 +36,8 @@ export function createToolSearchTool(
   return {
     name: "tool_search",
     description:
-      "Search the extended tool catalog (MCP servers and integrations) by capability. " +
+      "Load a tool that is listed as available on demand. Searches the catalog of " +
+      "built-in capabilities and connected integrations (MCP servers) by capability. " +
       "Matching tools become available immediately — call them on your next step. " +
       "Use this when you need a capability not in your current toolset.",
     parameters: ToolSearchParams,

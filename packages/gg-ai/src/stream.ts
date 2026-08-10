@@ -19,6 +19,23 @@ const GLM_CODING_BASE_URL = "https://api.z.ai/api/coding/paas/v4";
  */
 const KIMI_CODE_USER_AGENT = `kimi-code-cli/${process.env.KIMI_CODE_VERSION ?? "1.0.11"}`;
 
+/**
+ * Grok CLI chat proxy — the endpoint a Grok subscription OAuth token is valid
+ * against (gg-core's `grokCliBaseUrl()` persists it on the credential). Matched
+ * by host so an env override of that base URL still gets the identity headers.
+ */
+const GROK_CLI_PROXY_HOST = "cli-chat-proxy.grok.com";
+
+/**
+ * Client identity the Grok CLI chat proxy requires. It hard-gates on this: with
+ * no version it answers "Your Grok CLI version (none) is outdated. Please update
+ * to version 0.1.202 or later", so the value must look like a real Grok CLI build
+ * (they ship 0.1.x/0.2.x) rather than a placeholder. Overridable via
+ * GROK_CLI_VERSION. Keep in sync with gg-core's `grokCliHeaders()`, the
+ * login-side source of truth.
+ */
+const GROK_CLI_VERSION = process.env.GROK_CLI_VERSION ?? "0.2.101";
+
 // ── Register built-in providers ────────────────────────────
 
 providerRegistry.register("anthropic", {
@@ -104,14 +121,27 @@ providerRegistry.register("xai", {
   // xAI's public API (console.x.ai key) is OpenAI-compatible — ride the Chat
   // Completions transport like Moonshot/DeepSeek. Grok reasoning models take
   // top-level `reasoning_effort` (low/medium/high), which the shared thinking
-  // path already sends. xAI's OAuth path exists but only via the Grok CLI's
-  // private Responses proxy (cli-chat-proxy.grok.com) with reverse-engineered
-  // attribution headers and account-tier gating — intentionally not wired.
-  stream: (options) =>
-    streamOpenAI({
-      ...options,
-      baseUrl: options.baseUrl ?? "https://api.x.ai/v1",
-    }),
+  // path already sends.
+  //
+  // Subscription OAuth (SuperGrok / X Premium) routes to the Grok CLI chat proxy
+  // instead, which speaks the same Chat Completions wire but gates on Grok-CLI
+  // client identity. Inject those headers centrally here — exactly as the Kimi
+  // endpoint above — so EVERY stream (agent loop, compaction, title-gen,
+  // sub-agents) is accepted rather than depending on each call site to thread
+  // headers. Caller-provided headers still win on collision.
+  stream: (options) => {
+    const baseUrl = options.baseUrl ?? "https://api.x.ai/v1";
+    const defaultHeaders = baseUrl.includes(GROK_CLI_PROXY_HOST)
+      ? {
+          "X-XAI-Token-Auth": "xai-grok-cli",
+          "x-grok-client-version": GROK_CLI_VERSION,
+          "x-grok-client-identifier": "ggcoder",
+          "x-grok-model-override": options.model,
+          ...options.defaultHeaders,
+        }
+      : options.defaultHeaders;
+    return streamOpenAI({ ...options, baseUrl, defaultHeaders });
+  },
 });
 
 providerRegistry.register("minimax", {
